@@ -144,6 +144,9 @@ void nv2a_pb_scan_report(void)
     fflush(stderr);
 }
 
+/* RECOMP_PB_SCAN, read once: the scan runs per segment. */
+static int s_scan_on = -1;
+
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -152,7 +155,9 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    if (!(getenv("RECOMP_PB_SCAN") || s_exec_enabled) || end_va <= start_va)
+    if (s_scan_on < 0)
+        s_scan_on = getenv("RECOMP_PB_SCAN") != NULL;
+    if (!(s_scan_on || s_exec_enabled) || end_va <= start_va)
         return;
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
@@ -176,7 +181,10 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m);
+                /* The survey's table is searched linearly: only when asked
+                 * for, not on every method the executor runs. */
+                if (s_scan_on)
+                    note(subch, m);
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */

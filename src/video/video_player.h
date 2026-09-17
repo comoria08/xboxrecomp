@@ -61,6 +61,12 @@ int  video_dump_frame_bmp(const char *path);
 void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 void xbox_FramebufferWindowLatch(void);   /* copy the finished frame */
+/* One game logic update, for the "updates/s" in the window title. Optional:
+ * the title shows only FPS until a project calls it. */
+void xbox_FramebufferWindowCountTick(void);
+/* The name in the window title, UTF-8. Call before xbox_FramebufferWindowStart;
+ * without it the name comes from the XBE certificate. */
+void xbox_FramebufferWindowSetName(const char *utf8);
 /* Tell the window the surface's real geometry instead of letting it infer the
  * pixel size from pitch/width, which a multisampled surface breaks. bpp is
  * bytes per sample; xscale is how many samples across make one pixel. */

@@ -525,6 +525,7 @@ static void fence_mirrors_tick(void)
 }
 
 static int s_nv2a_trace = 0;
+static int s_nv2a_verbose = 0;   /* RECOMP_NV2A_TRACE alone */
 
 /* The display framebuffer, as reported by AvSetDisplayMode. Checksummed once a
  * second so a run can answer the only question that matters before building a
@@ -611,6 +612,15 @@ static void framebuffer_probe_tick(void)
 #define NV2A_PTIMER_TIME_1     0x009410u
 #define NV2A_PTIMER_ALARM_0    0x009420u
 
+/* RECOMP_PTIMER_TRACE, read once: the clock is ticked in tight loops. */
+static int ptimer_trace(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_PTIMER_TRACE") != NULL;
+    return on;
+}
+
 /* Time the guest has not been allowed to see, in ns. See the alarm below. */
 static volatile LONG64 s_ptimer_skew_ns;
 
@@ -689,7 +699,7 @@ static void nv2a_ptimer_tick(volatile uint32_t *regs)
      * that happened. That is the difference between "the title stopped arming
      * the alarm" and "the alarm stopped firing", which is otherwise
      * indistinguishable from the outside. */
-    if (getenv("RECOMP_PTIMER_TRACE")) {
+    if (ptimer_trace()) {
         static uint32_t last_alarm, last_en;
         static unsigned arms;
         uint32_t alarm = *(volatile uint32_t *)((char *)regs + NV2A_PTIMER_ALARM_0);
@@ -819,7 +829,7 @@ int xbox_Nv2aPtimerAlarmDue(void)
      * deadline as "period minus how late the last one was" stops re-arming as
      * soon as that lateness exceeds the period, so this number decides whether
      * a periodic callback survives. */
-    if (getenv("RECOMP_PTIMER_TRACE")) {
+    if (ptimer_trace()) {
         static unsigned n;
         if (n++ < 8 || (n % 60) == 0)
             fprintf(stderr, "  [PTIMER] alarm delivered %lld ns late\n",
@@ -1000,14 +1010,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * in its device struct rather than assuming 0xFD800000, and
                  * mirroring the wrong block leaves it spinning on a GET that
                  * never moves. */
-                if (s_nv2a_trace) {
+                /* One line per submission: only when the NV2A trace itself
+                 * was asked for. RECOMP_PB_EXEC arms s_nv2a_trace too, and
+                 * this line was then 12% of the thread that draws. */
+                if (s_nv2a_verbose) {
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
                             "0x%08X%s\n", put, g,
                             g == put ? "" : "  (GPU behind)");
+                    fflush(stderr);
                 }
-                fflush(stderr);
             }
         }
         if (s_nv2a_trace) {
@@ -1925,7 +1938,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         );
         /* The pushbuffer survey rides on the same poll, so either
          * variable arms it. */
-        s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
+        s_nv2a_verbose = getenv("RECOMP_NV2A_TRACE") != NULL;
+        s_nv2a_trace = s_nv2a_verbose
                     || getenv("RECOMP_PB_SCAN") != NULL
                     || getenv("RECOMP_PB_EXEC") != NULL;
         if (g_nv2a_memory) {

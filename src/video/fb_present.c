@@ -74,10 +74,54 @@ static uint8_t      *s_latch;
 static size_t        s_latch_size;
 static volatile LONG s_latched;
 
+/* What the title bar reports: frames the title swapped, and -- if the project
+ * says what one is -- game logic updates, both counted since the last second. */
+static volatile LONG s_flips;
+static volatile LONG s_ticks;
+static volatile LONG s_ticks_known;
+
+void xbox_FramebufferWindowCountTick(void)
+{
+    InterlockedIncrement(&s_ticks);
+    if (!s_ticks_known)
+        InterlockedExchange(&s_ticks_known, 1);
+}
+
+/* Someone else presents (the D3D11 fill path draws on the GPU and shows the
+ * result through its own swap chain). The window then only pumps messages,
+ * and the guest framebuffer is only current when a screenshot asks for it:
+ * the window requests pixels, the presenter reads them back into guest memory
+ * and latches, and the window writes the file once that latch has happened. */
+static HWND          s_hwnd;
+static volatile LONG s_external;
+static volatile LONG s_want_pixels, s_serving, s_served;
+
+void *xbox_FramebufferWindowHwnd(void)
+{
+    return s_hwnd;
+}
+
+void xbox_FramebufferWindowExternal(void)
+{
+    InterlockedExchange(&s_external, 1);
+}
+
+int xbox_FramebufferWindowPixelsWanted(void)
+{
+    if (InterlockedExchange(&s_want_pixels, 0)) {
+        InterlockedExchange(&s_serving, 1);
+        return 1;
+    }
+    return 0;
+}
+
 void xbox_FramebufferWindowLatch(void)
 {
     size_t bytes;
 
+    InterlockedIncrement(&s_flips);
+    if (s_external && !InterlockedExchange(&s_serving, 0))
+        return;
     if (!s_fb_va || !s_fb_pitch || !InterlockedCompareExchange(&s_fb_running, 1, 1))
         return;
     bytes = (size_t)s_fb_pitch * s_fb_height;
@@ -93,6 +137,8 @@ void xbox_FramebufferWindowLatch(void)
         InterlockedExchange(&s_latched, 1);
     }
     ReleaseSRWLockExclusive(&s_latch_lock);
+    if (s_external)
+        InterlockedIncrement(&s_served);
 }
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -193,14 +239,86 @@ int xbox_FramebufferDumpBmp(const char *path)
     return 0;
 }
 
+/* A name the project chose, which wins over the certificate's: some titles
+ * carry only an abbreviation there (Def Jam: Fight for NY says "DJFFNY"). */
+static wchar_t s_fb_name[64];
+
+void xbox_FramebufferWindowSetName(const char *utf8)
+{
+    if (!utf8 || !MultiByteToWideChar(CP_UTF8, 0, utf8, -1, s_fb_name,
+                                      (int)(sizeof s_fb_name / sizeof s_fb_name[0])))
+        s_fb_name[0] = 0;
+}
+
+/* The title's name, from the certificate of the XBE the loader mapped at
+ * 0x00010000: header +0x118 holds the certificate's address, and the
+ * certificate carries the name at +0x0C, 40 UTF-16 characters. Empty if the
+ * header does not look like one. */
+static void fb_title_name(wchar_t *out, size_t cap)
+{
+    const uint8_t *hdr = (const uint8_t *)((uintptr_t)0x00010000u + xbox_GetMemoryOffset());
+    uint32_t hdr_size, cert;
+    size_t i;
+
+    out[0] = 0;
+    if (memcmp(hdr, "XBEH", 4) != 0)
+        return;
+    memcpy(&hdr_size, hdr + 0x108, 4);
+    memcpy(&cert, hdr + 0x118, 4);
+    if (hdr_size > 0x10000 || cert < 0x00010000u || cert + 0x0C + 80 > 0x00010000u + hdr_size)
+        return;
+    for (i = 0; i + 1 < cap && i < 40; i++) {
+        uint16_t c;
+        memcpy(&c, hdr + (cert - 0x00010000u) + 0x0C + i * 2, 2);
+        if (!c)
+            break;
+        out[i] = (wchar_t)c;
+    }
+    out[i] = 0;
+}
+
+/* "<name> - <n> FPS - <n> updates/s", refreshed once a second. */
+static void fb_update_title(HWND hwnd, const wchar_t *name)
+{
+    static ULONGLONG last;
+    ULONGLONG now = GetTickCount64();
+    wchar_t text[160];
+    LONG flips, ticks;
+    double secs;
+
+    if (!last) {
+        last = now;
+        return;
+    }
+    if (now - last < 1000)
+        return;
+    secs  = (double)(now - last) / 1000.0;
+    last  = now;
+    flips = InterlockedExchange(&s_flips, 0);
+    ticks = InterlockedExchange(&s_ticks, 0);
+    if (s_ticks_known)
+        swprintf(text, 160, L"%ls - %.0f FPS - %.0f updates/s",
+                 name, flips / secs, ticks / secs);
+    else
+        swprintf(text, 160, L"%ls - %.0f FPS", name, flips / secs);
+    SetWindowTextW(hwnd, text);
+}
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     HWND hwnd;
     HDC hdc;
     BITMAPINFO bi;
     RECT r;
+    wchar_t name[64];
 
     (void)unused;
+    if (s_fb_name[0])
+        wcscpy(name, s_fb_name);
+    else
+        fb_title_name(name, sizeof name / sizeof name[0]);
+    if (!name[0])
+        wcscpy(name, L"Xbox Recomp");
 
     {
         WNDCLASSA wc;
@@ -213,7 +331,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     }
     r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
+    hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                            CW_USEDEFAULT, CW_USEDEFAULT,
                            r.right - r.left, r.bottom - r.top,
@@ -223,6 +341,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         return 0;
     }
     hdc = GetDC(hwnd);
+    SetWindowTextW(hwnd, name);
+    s_hwnd = hwnd;
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
@@ -243,7 +363,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        if (s_fb_va && s_fb_pitch && s_rgb) {
+        fb_update_title(hwnd, name);
+        if (s_fb_va && s_fb_pitch && s_rgb && !s_external) {
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             uint32_t bpp = s_fb_bpp ? s_fb_bpp : s_fb_pitch / s_fb_width;
@@ -266,8 +387,12 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             const char *snap = getenv("RECOMP_FB_SNAP");
             const char *every = getenv("RECOMP_FB_SNAP_EVERY");
             static int frames;
+            static char pending[512];
+            static LONG served_at;
+            char path[512];
+            path[0] = 0;
             ++frames;
-            if (dump && frames == 600)
+            if (dump && frames == 600 && !s_external)
                 xbox_FramebufferDumpBmp(dump);
             /* RECOMP_FB_SNAP=<prefix> with RECOMP_FB_SNAP_EVERY=N: the window
              * as <prefix>NNN.bmp every N frames, to follow a title past its
@@ -276,16 +401,30 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             /* F10: a snapshot on demand, numbered separately. */
             if ((GetAsyncKeyState(VK_F10) & 1) && GetForegroundWindow() == hwnd) {
                 static int f10;
-                char path[512];
                 snprintf(path, sizeof path, "%sF10_%03d.bmp",
                          snap ? snap : "capture_", ++f10);
-                xbox_FramebufferDumpBmp(path);
-            }
-            if (snap && every && atoi(every) > 0 && frames % atoi(every) == 0) {
-                char path[512];
+            } else if (snap && every && atoi(every) > 0 && frames % atoi(every) == 0) {
                 snprintf(path, sizeof path, "%s%03d.bmp", snap,
                          frames / atoi(every));
-                xbox_FramebufferDumpBmp(path);
+            }
+            if (path[0]) {
+                if (!s_external) {
+                    xbox_FramebufferDumpBmp(path);
+                } else if (!pending[0]) {
+                    /* Ask the presenter for pixels; written once served. */
+                    strcpy(pending, path);
+                    served_at = s_served;
+                    InterlockedExchange(&s_want_pixels, 1);
+                }
+            }
+            if (pending[0] && s_served != served_at && s_fb_va && s_fb_pitch && s_rgb) {
+                uint32_t bpp = s_fb_bpp ? s_fb_bpp : s_fb_pitch / s_fb_width;
+                AcquireSRWLockShared(&s_latch_lock);
+                if (s_latch && s_latch_size == (size_t)s_fb_pitch * s_fb_height)
+                    fb_convert(s_latch, bpp);
+                ReleaseSRWLockShared(&s_latch_lock);
+                xbox_FramebufferDumpBmp(pending);
+                pending[0] = 0;
             }
         }
         Sleep(16);
@@ -320,4 +459,9 @@ void xbox_FramebufferWindowFormat(uint32_t width, uint32_t height,
 { (void)width; (void)height; (void)bpp; (void)xscale; }
 void xbox_FramebufferWindowStart(void) {}
 void xbox_FramebufferWindowLatch(void) {}
+void xbox_FramebufferWindowCountTick(void) {}
+void xbox_FramebufferWindowSetName(const char *utf8) { (void)utf8; }
+void *xbox_FramebufferWindowHwnd(void) { return 0; }
+void xbox_FramebufferWindowExternal(void) {}
+int xbox_FramebufferWindowPixelsWanted(void) { return 0; }
 #endif
