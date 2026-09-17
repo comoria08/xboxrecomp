@@ -96,6 +96,43 @@ static HWND          s_hwnd;
 static volatile LONG s_external;
 static volatile LONG s_want_pixels, s_serving, s_served;
 
+/* How many times the title's size the window opens at (the GPU path draws
+ * at that internal resolution). Call before the window opens. */
+static uint32_t s_win_scale = 1;
+
+void xbox_FramebufferWindowScale(uint32_t scale)
+{
+    s_win_scale = scale ? scale : 1;
+}
+
+/* F11: borderless full screen on the window's monitor, and back. */
+static void fb_toggle_fullscreen(HWND hwnd)
+{
+    static int full;
+    static WINDOWPLACEMENT wp = { sizeof(WINDOWPLACEMENT) };
+    DWORD style = (DWORD)GetWindowLongPtrA(hwnd, GWL_STYLE);
+
+    if (!full) {
+        MONITORINFO mi = { sizeof(mi) };
+        if (GetWindowPlacement(hwnd, &wp)
+                && GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            SetWindowLongPtrA(hwnd, GWL_STYLE, (LONG_PTR)(style & ~WS_OVERLAPPEDWINDOW));
+            SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                         mi.rcMonitor.right - mi.rcMonitor.left,
+                         mi.rcMonitor.bottom - mi.rcMonitor.top,
+                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            full = 1;
+        }
+    } else {
+        SetWindowLongPtrA(hwnd, GWL_STYLE, (LONG_PTR)(style | WS_OVERLAPPEDWINDOW));
+        SetWindowPlacement(hwnd, &wp);
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER
+                     | SWP_FRAMECHANGED);
+        full = 0;
+    }
+}
+
 void *xbox_FramebufferWindowHwnd(void)
 {
     return s_hwnd;
@@ -143,6 +180,14 @@ void xbox_FramebufferWindowLatch(void)
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    if (m == WM_SIZE) {
+        static int said;
+        if (said++ < 20)
+            fprintf(stderr, "  [FBWIN] client %ux%u (%s)\n",
+                    (unsigned)LOWORD(l), (unsigned)HIWORD(l),
+                    w == SIZE_MAXIMIZED ? "maximized" : w == SIZE_MINIMIZED ? "minimized"
+                    : "restored");
+    }
     if (m == WM_CLOSE || m == WM_DESTROY) {
         InterlockedExchange(&s_fb_running, 0);
         return 0;
@@ -311,6 +356,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     BITMAPINFO bi;
     RECT r;
     wchar_t name[64];
+    int win_x = CW_USEDEFAULT, win_y = CW_USEDEFAULT;
 
     (void)unused;
     if (s_fb_name[0])
@@ -329,11 +375,27 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         wc.lpszClassName = "XboxRecompFramebuffer";
         RegisterClassA(&wc);
     }
-    r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
+    {
+        /* The title's size times the internal scale, shrunk (keeping the
+         * aspect) to what fits the desktop work area, frame included. */
+        RECT work;
+        LONG cw = (LONG)(s_fb_width * s_win_scale), ch = (LONG)(s_fb_height * s_win_scale);
+        RECT frame = { 0, 0, 0, 0 };
+        AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
+        if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0)) {
+            LONG maxw = (work.right - work.left) - (frame.right - frame.left);
+            LONG maxh = (work.bottom - work.top) - (frame.bottom - frame.top);
+            if (cw > maxw) { ch = ch * maxw / cw; cw = maxw; }
+            if (ch > maxh) { cw = cw * maxh / ch; ch = maxh; }
+            win_x = work.left + ((work.right - work.left) - (cw + frame.right - frame.left)) / 2;
+            win_y = work.top;
+        }
+        r.left = 0; r.top = 0; r.right = cw; r.bottom = ch;
+    }
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                           CW_USEDEFAULT, CW_USEDEFAULT,
+                           win_x, win_y,
                            r.right - r.left, r.bottom - r.top,
                            NULL, NULL, GetModuleHandleA(NULL), NULL);
     if (!hwnd) {
@@ -364,6 +426,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             DispatchMessageA(&msg);
         }
         fb_update_title(hwnd, name);
+        if ((GetAsyncKeyState(VK_F11) & 1) && GetForegroundWindow() == hwnd)
+            fb_toggle_fullscreen(hwnd);
         if (s_fb_va && s_fb_pitch && s_rgb && !s_external) {
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
@@ -445,6 +509,11 @@ void xbox_FramebufferWindowStart(void)
         return;
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;
+    /* Real pixels. Without this, on a display scaled to 150% Windows gives
+     * the window a smaller logical size and stretches its image, so a
+     * 1920x1440 internal resolution reached the screen blurred. Fails
+     * harmlessly if the process already chose. */
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     th = CreateThread(NULL, 0, fb_thread, NULL, 0, NULL);
     if (th)
         CloseHandle(th);
@@ -462,6 +531,7 @@ void xbox_FramebufferWindowLatch(void) {}
 void xbox_FramebufferWindowCountTick(void) {}
 void xbox_FramebufferWindowSetName(const char *utf8) { (void)utf8; }
 void *xbox_FramebufferWindowHwnd(void) { return 0; }
+void xbox_FramebufferWindowScale(uint32_t scale) { (void)scale; }
 void xbox_FramebufferWindowExternal(void) {}
 int xbox_FramebufferWindowPixelsWanted(void) { return 0; }
 #endif
