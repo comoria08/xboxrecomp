@@ -989,7 +989,14 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * The contiguous window IS the physical-address view, so
                      * OR-ing its base is the documented round trip, not a
                      * guess. */
-                    if (last_put && put > last_put)
+                    /* Any move, not only forward: when the buffer is full
+                     * the title writes a jump back to its start and PUT
+                     * moves backwards. Scanning only forward moves dropped
+                     * the tail and the head of the buffer on every wrap --
+                     * every 54 frames in Def Jam's menus -- and with them
+                     * state changes: a frame drawn with blending off came
+                     * out white. nv2a_pb_scan follows the jump. */
+                    if (last_put && put != last_put)
                         nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
                     /* Periodic, because what the title submits at init is not

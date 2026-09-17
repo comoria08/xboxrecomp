@@ -45,6 +45,7 @@ typedef struct {
 
 /* Non-zero once RECOMP_D3D11 is set and the device came up. */
 int  nvd3d_active(void);
+int  nvd3d_trace(void);                 /* RECOMP_D3D11_TRACE */
 
 /* The colour surface being drawn into: its guest address and size in samples.
  * A surface is known by address and width; its height only grows. Returns the

@@ -157,19 +157,40 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
     if (s_scan_on < 0)
         s_scan_on = getenv("RECOMP_PB_SCAN") != NULL;
-    if (!(s_scan_on || s_exec_enabled) || end_va <= start_va)
+    if (!(s_scan_on || s_exec_enabled) || end_va == start_va)
         return;
-    if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
-        end_va = start_va + 0x400000u;
 
-    while (va < end_va && words < 0x100000u) {
+    /* The walk runs from start to end, and follows one jump: that is how
+     * the title wraps its buffer back to the start. Before the jump, end is
+     * only a bound if it lies ahead (no wrap); after it, the walk stops on
+     * reaching end. */
+    {
+        int jumped = 0;
+        uint32_t limit = start_va < end_va ? end_va : 0xFFFFFFFFu;
+
+        if (start_va < end_va && end_va - start_va > 0x400000u)
+            limit = end_va = start_va + 0x400000u;   /* a sane single-frame bound */
+
+    while (va < limit && words < 0x100000u
+           && (jumped || va - start_va < 0x400000u)) {
         uint32_t w = *(const uint32_t *)(mem + va);
         va += 4;
         words++;
 
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
+            /* Old-style jump: the address with the low bits as the tag;
+             * new-style: 29 bits of address. Both are DMA (physical)
+             * offsets, reached through the contiguous window like PUT. */
+            uint32_t target = ((w & 3u) == 1u) ? (w & ~3u) : (w & 0x1FFFFFFCu);
             jumps++;
-            break;                            /* a jump ends this segment */
+            if (jumped)
+                break;
+            jumped = 1;
+            va = (end_va & 0xF0000000u) | (target & 0x0FFFFFFFu);
+            if (va > end_va)
+                break;                        /* not the wrap we expected */
+            limit = end_va;
+            continue;
         }
         if ((w & 3u) == 2u || (w & 0xFFFF0003u) == 0x00020000u)
             continue;
@@ -179,7 +200,7 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
-            for (uint32_t i = 0; i < count && va < end_va; i++) {
+            for (uint32_t i = 0; i < count && va < limit; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 /* The survey's table is searched linearly: only when asked
                  * for, not on every method the executor runs. */
@@ -197,6 +218,7 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             continue;
         }
         unknown++;
+    }
     }
 
     s_tot_words += words;

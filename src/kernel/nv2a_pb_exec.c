@@ -889,6 +889,15 @@ static void clear_surface(uint32_t param)
                     (float)(s_gpu.zclear >> 8) / 16777215.0f,
                     (uint8_t)(s_gpu.zclear & 0xFF), rect);
         if (param & NV097_CLEAR_COLOR_MASK) {
+            if (nvd3d_trace()) {
+                static uint32_t last = 0xFFFFFFFFu;
+                static int said;
+                uint32_t b = dma_resolve(s_gpu.color_offset);
+                if (b != last && said++ < 200)
+                    fprintf(stderr, "  [D3D11] f%u colour clear 0x%08X pitch %u clip %ux%u fmt 0x%08X\n",
+                            s_gpu.flips, b, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h, s_gpu.format);
+                last = b;
+            }
             s_gpu.clears++;
             s_gpu.color_base = dma_resolve(s_gpu.color_offset);
             s_d3d_show_base = s_gpu.color_base;
@@ -1560,8 +1569,16 @@ static int32_t d3d_texture(void)
     memcpy(last_key, key, sizeof key);
     last_flip = s_gpu.flips;
     last = -1;
-    if (!sample_texture(0, 0, &probe))
+    if (!sample_texture(0, 0, &probe)) {
+        if (nvd3d_trace()) {
+            static int said;
+            if (said++ < 100)
+                fprintf(stderr, "  [D3D11] texture 0x%08X fmt 0x%02X %ux%u pitch %u refused"
+                        " (sampler lacks the format)\n", s_gpu.tex.offset, s_gpu.tex.color,
+                        s_gpu.tex.width, s_gpu.tex.height, s_gpu.tex.pitch);
+        }
         return -1;                          /* a format the sampler lacks */
+    }
     bytes = d3d_tex_bytes();
     if (!bytes || bytes > 64u * 1024 * 1024)
         return -1;

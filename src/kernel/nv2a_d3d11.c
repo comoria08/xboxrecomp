@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 #include "nv2a_d3d11.h"
 
@@ -256,6 +257,14 @@ static int init(void)
     }
     fprintf(stderr, "  [D3D11] device ready: triangles are filled on the GPU\n");
     return 1;
+}
+
+int nvd3d_trace(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_D3D11_TRACE") != NULL;
+    return on;
 }
 
 int nvd3d_active(void)
@@ -536,9 +545,11 @@ int nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t width, uint32_t
         const Target *r = &s_rt[i];
         if (mem_base < r->base + r->w * 4 * r->h && mem_base + mem_bytes > r->base) {
             static int said;
-            if (said++ < 4)
-                fprintf(stderr, "  [D3D11] texture 0x%08X is render target 0x%08X\n",
-                        mem_base, r->base);
+            if (said++ < 4 || (nvd3d_trace() && said < 200))
+                fprintf(stderr, "  [D3D11] texture 0x%08X fmt 0x%02X %ux%u (%u bytes) is render"
+                        " target 0x%08X %ux%u; drawing into 0x%08X\n",
+                        mem_base, key[1], width, height, mem_bytes, r->base, r->w, r->h,
+                        s_cur >= 0 ? s_rt[s_cur].base : 0);
             return 0x10000 + i;
         }
     }
@@ -630,6 +641,26 @@ static ID3D11ShaderResourceView *texture_view(int32_t handle)
     return NULL;
 }
 
+/* ── Frame log (RECOMP_D3D11_TRACE) ─────────────────────────────────────
+ *
+ * Everything drawn in the current frame, one line per batch or clear, kept in
+ * memory and printed only when the presented image turns out to be (almost)
+ * all white -- the flash the title shows for a frame or two -- plus a few
+ * ordinary frames to compare against. */
+#define FRAMELOG_LINES 1024
+static char     s_framelog[FRAMELOG_LINES][200];
+static unsigned s_framelog_n;
+
+static void framelog(const char *fmt, ...)
+{
+    va_list ap;
+    if (!nvd3d_trace() || s_framelog_n >= FRAMELOG_LINES)
+        return;
+    va_start(ap, fmt);
+    vsnprintf(s_framelog[s_framelog_n++], sizeof s_framelog[0], fmt, ap);
+    va_end(ap);
+}
+
 /* ── Drawing ────────────────────────────────────────────────────────── */
 
 static void flush(void)
@@ -703,6 +734,24 @@ static void flush(void)
     ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
     ID3D11DeviceContext_Draw(s_ctx, s_nverts, 0);
+    {
+        const NvD3DVertex *v = s_verts;
+        const uint32_t *k = (st->texture >= 0 && st->texture < s_tex_count)
+                          ? s_tex[st->texture].key : NULL;
+        framelog("draw %5u v  pos(%.1f %.1f %.4f %.2f) col(%.2f %.2f %.2f %.2f) uv(%.1f %.1f)"
+                 " tex %d%s 0x%08X f%02X %ux%u  z%u%u f%X  st%u f%X r%u op%X/%X/%X"
+                 "  bl%u %X/%X eq%X c%08X  cm%08X  at%u f%X r%u",
+                 s_nverts, v->pos[0], v->pos[1], v->pos[2], v->pos[3],
+                 v->col[0], v->col[1], v->col[2], v->col[3], v->uv[0], v->uv[1],
+                 st->texture, st->texture >= 0x10000 ? "(rt)" : "",
+                 k ? k[0] : 0, k ? k[1] : 0, st->tex_w, st->tex_h,
+                 st->depth_enable, st->depth_write, st->depth_func,
+                 st->stencil_enable, st->stencil_func, st->stencil_ref,
+                 st->stencil_fail, st->stencil_zfail, st->stencil_zpass,
+                 st->blend_enable, st->blend_src, st->blend_dst, st->blend_eq,
+                 st->blend_color, st->color_mask,
+                 st->alpha_test, st->alpha_func, st->alpha_ref);
+    }
     s_nverts = 0;
 }
 
@@ -729,6 +778,8 @@ void nvd3d_clear(uint32_t what, uint32_t argb, float depth, uint8_t stencil,
         return;
     flush();
     t = &s_rt[s_cur];
+    framelog("clear what %u argb %08X depth %.4f stencil %u rect %u,%u %ux%u",
+             what, argb, depth, stencil, rect[0], rect[1], rect[2], rect[3]);
     if (what & 3) {
         ID3D11DepthStencilView *dsv = depth_for(t->w, t->h);
         UINT f = ((what & 1) ? D3D11_CLEAR_DEPTH : 0) | ((what & 2) ? D3D11_CLEAR_STENCIL : 0);
@@ -811,6 +862,55 @@ static int swap_ready(void)
     return 1;
 }
 
+/* Five pixels of the presented image, read back: all near white is a flash. */
+static void framelog_check(const Target *t)
+{
+    static ID3D11Texture2D *probe;
+    static unsigned frames, dumped_white, dumped_plain;
+    D3D11_MAPPED_SUBRESOURCE m;
+    unsigned white = 0, k, i;
+    static const float at[5][2] = { {0.5f, 0.5f}, {0.3f, 0.4f}, {0.7f, 0.4f},
+                                    {0.3f, 0.7f}, {0.7f, 0.7f} };
+
+    frames++;
+    if (!probe) {
+        D3D11_TEXTURE2D_DESC td;
+        memset(&td, 0, sizeof td);
+        td.Width = 5; td.Height = 1; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &probe)))
+            return;
+    }
+    for (k = 0; k < 5; k++) {
+        D3D11_BOX b;
+        b.left = (UINT)(at[k][0] * t->w); b.right = b.left + 1;
+        b.top = (UINT)(at[k][1] * t->h);  b.bottom = b.top + 1;
+        b.front = 0; b.back = 1;
+        ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)probe, 0, k, 0, 0,
+                                                  (ID3D11Resource *)t->tex, 0, &b);
+    }
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)probe, 0,
+                                          D3D11_MAP_READ, 0, &m))) {
+        const uint8_t *px = (const uint8_t *)m.pData;
+        for (k = 0; k < 5; k++)
+            if (px[k * 4] > 0xE0 && px[k * 4 + 1] > 0xE0 && px[k * 4 + 2] > 0xE0)
+                white++;
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)probe, 0);
+    }
+    if ((white >= 4 && dumped_white < 6) || (frames % 1500 == 0 && dumped_plain < 3)) {
+        if (white >= 4) dumped_white++; else dumped_plain++;
+        fprintf(stderr, "[FRAMELOG] frame %u %s, %u lines\n", frames,
+                white >= 4 ? "WHITE" : "normal", s_framelog_n);
+        for (i = 0; i < s_framelog_n; i++)
+            fprintf(stderr, "[FRAMELOG]   %s\n", s_framelog[i]);
+        fflush(stderr);
+    }
+    s_framelog_n = 0;
+}
+
 void nvd3d_present(uint32_t base, const uint32_t rect[4],
                    uint32_t disp_w, uint32_t disp_h)
 {
@@ -823,6 +923,14 @@ void nvd3d_present(uint32_t base, const uint32_t rect[4],
             if (src < 0 || s_rt[i].used > s_rt[src].used)
                 src = i;
         }
+    if (nvd3d_trace()) {
+        static uint32_t last = 0xFFFFFFFFu;
+        static int said;
+        if (base != last && said++ < 200)
+            fprintf(stderr, "  [D3D11] present 0x%08X (rect %u,%u %ux%u)%s\n", base,
+                    rect[0], rect[1], rect[2], rect[3], src < 0 ? " -- no such target" : "");
+        last = base;
+    }
     if (src < 0 || !swap_ready())
         return;
     {
@@ -863,6 +971,8 @@ void nvd3d_present(uint32_t base, const uint32_t rect[4],
         ID3D11DeviceContext_Draw(s_ctx, 3, 0);
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
         IDXGISwapChain1_Present(s_swap, 0, 0);
+        if (nvd3d_trace())
+            framelog_check(t);
     }
     /* Put the title's target back. */
     s_cur = -1;
