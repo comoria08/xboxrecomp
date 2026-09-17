@@ -823,6 +823,43 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         ebo = seg_len - 1;
     }
 
+    /* Where this voice reads from, and what is there. Zero samples with a
+     * plausible address means the title has not filled the buffer (or we are
+     * looking at the wrong memory); zero samples with a zero address means
+     * the voice was never pointed anywhere. */
+    if (apu_trace_on()) {
+        static uint64_t next_ms;
+        static int shown;
+        uint64_t now = (uint64_t)qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
+        if (now >= next_ms) {
+            next_ms = now + 1000;
+            shown = 0;
+        }
+        if (shown < 6) {
+            uint32_t base = stream ? (uint32_t)segment_offset : ba;
+            const uint8_t *p = d->ram_ptr ? &d->ram_ptr[base & 0x03FFFFFF] : NULL;
+            shown++;
+            {   /* the voice's own registers, as the title left them */
+                hwaddr vbase = d->regs[NV_PAPU_VPVADDR] + v * NV_PAVS_SIZE;
+                int k;
+                fprintf(stderr, "[APU] voice %3u regs @0x%08X:", v, (uint32_t)vbase);
+                for (k = 0; k < 32; k++)
+                    fprintf(stderr, "%s %08X", (k % 8 == 0) ? "\n       " : "",
+                            (uint32_t)ldl_le_phys(address_space_memory, vbase + k * 4));
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "[APU] voice %3u data: %s base 0x%08X cbo %u ebo %u"
+                    " cs %u ss %u spb %u%s  bytes %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                    v, stream ? "stream" : "buffer", base, cbo, ebo,
+                    container_size_index, sample_size, samples_per_block,
+                    loop ? " loop" : "",
+                    p ? p[0] : 0, p ? p[1] : 0, p ? p[2] : 0, p ? p[3] : 0,
+                    p ? p[4] : 0, p ? p[5] : 0, p ? p[6] : 0, p ? p[7] : 0);
+            fflush(stderr);
+        }
+    }
+
     bool adpcm =
         (container_size_index == NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM);
 
@@ -972,6 +1009,8 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
  * Voice processing (main per-voice function)
  * ============================================================ */
 
+static int apu_trace_on(void);
+
 static void voice_process(MCPXAPUState *d,
                           float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
                           float sample_buf[NUM_SAMPLES_PER_FRAME][2],
@@ -1090,6 +1129,37 @@ static void voice_process(MCPXAPUState *d,
         dbg->vol[i] = vol[i];
     }
 
+    /* What this voice actually produced, and with what gain, once a second
+     * for the first few voices. Silence at this point means the decode read
+     * nothing; silence after it means volume or routing. */
+    if (apu_trace_on()) {
+        static uint64_t next_ms;
+        static int shown;
+        uint64_t now = (uint64_t)qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        float peak = 0.0f;
+        int i, c;
+
+        for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+            for (c = 0; c < 2; c++) {
+                float a = samples[i][c] < 0 ? -samples[i][c] : samples[i][c];
+                if (a > peak) peak = a;
+            }
+        if (now >= next_ms) {
+            next_ms = now + 1000;
+            shown = 0;
+        }
+        if (shown < 8) {
+            shown++;
+            fprintf(stderr, "[APU] voice %3u: peak %.4f  ea %.3f  vol %u/%u"
+                    "  bin %d/%d  rate %.3f  %s%s%s\n",
+                    v, peak, ea_value, vol[0], vol[1], bin[0], bin[1], rate,
+                    stereo ? "stereo " : "mono ",
+                    multipass ? "multipass " : "",
+                    voice_should_mute(v) ? "MUTED" : "");
+            fflush(stderr);
+        }
+    }
+
     if (voice_should_mute(v)) return;
 
     /* Low-pass filter */
@@ -1169,9 +1239,24 @@ static void voice_process(MCPXAPUState *d,
  * Simplified single-threaded version (no worker threads initially)
  * ============================================================ */
 
+/* What the voice processor is actually being given, once a second under
+ * RECOMP_APU_TRACE: how many voices the title chained into its three lists,
+ * how many of those say they are active, and how loud the result is. Silence
+ * with no voices means the title never programmed any; silence with voices
+ * means the decode or the mix is where to look. */
+static int apu_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_APU_TRACE") != NULL;
+    return on;
+}
+
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    int seen = 0, active = 0;
+
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     for (int list = 0; list < 3; list++) {
@@ -1192,14 +1277,42 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
 
+            seen++;
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
                 fe_method(d, SE2FE_IDLE_VOICE, v);
             } else {
+                active++;
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
             }
             d->regs[current] = d->regs[next];
+        }
+    }
+
+    if (apu_trace_on()) {
+        static uint64_t next_ms;
+        static int max_seen, max_active;
+        static float peak;
+        static unsigned frames;
+        uint64_t now = (uint64_t)qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        int i, ch;
+
+        frames++;
+        if (seen > max_seen) max_seen = seen;
+        if (active > max_active) max_active = active;
+        for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+            for (ch = 0; ch < 2; ch++) {
+                float a = d->vp.sample_buf[i][ch];
+                if (a < 0) a = -a;
+                if (a > peak) peak = a;
+            }
+        if (now >= next_ms) {
+            next_ms = now + 1000;
+            fprintf(stderr, "[APU] %u frames/s, voices chained %d, active %d,"
+                    " peak %.4f\n", frames, max_seen, max_active, peak);
+            fflush(stderr);
+            frames = 0; max_seen = 0; max_active = 0; peak = 0.0f;
         }
     }
 

@@ -274,37 +274,61 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
+    /* XAudio2 path: submit what this frame produced.
+     *
+     * The frame buffer already holds the hardware voices: mcpx_apu_dsp_frame
+     * writes the front-left and front-right mixbins into it, one 32-sample
+     * slice per VP frame, and this runs once the eight slices are in. It used
+     * to be wiped here and refilled with the test tone and the software mixer
+     * alone -- so every voice the title played was thrown away one step before
+     * the sound card, which is why Def Jam: Fight for NY was silent. The tone
+     * and the mixer are added on top of it instead. */
     if (xa2_is_active()) {
-        int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
+        int16_t out[MIXER_FRAME_SAMPLES][2];
 
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        if (g_audio_muted)
+            memset(out, 0, sizeof(out));
+        else
+            memcpy(out, d->monitor.frame_buf, sizeof(out));
 
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
-                }
+        if (g_test_tone.active && !g_audio_muted) {
+            for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                int32_t l = out[i][0] + s, r = out[i][1] + s;
+                out[i][0] = (int16_t)(l > 32767 ? 32767 : l < -32768 ? -32768 : l);
+                out[i][1] = (int16_t)(r > 32767 ? 32767 : r < -32768 ? -32768 : r);
+                g_test_tone.phase += g_test_tone.phase_inc;
+                if (g_test_tone.phase >= 2.0 * M_PI)
+                    g_test_tone.phase -= 2.0 * M_PI;
             }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
         }
 
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
+        if (!g_audio_muted)
+            mixer_render(out, MIXER_FRAME_SAMPLES);
+
+        xa2_submit_samples((const int16_t *)out, MIXER_FRAME_SAMPLES);
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+
+        /* How loud what reached the sound card was, once a second. */
+        if (getenv("RECOMP_APU_TRACE")) {
+            static uint64_t next_ms;
+            static int peak;
+            static unsigned buffers;
+            uint64_t now = (uint64_t)qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            int i;
+            buffers++;
+            for (i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+                int a = out[i][0] < 0 ? -out[i][0] : out[i][0];
+                if (a > peak) peak = a;
+            }
+            if (now >= next_ms) {
+                next_ms = now + 1000;
+                fprintf(stderr, "[APU] output: %u buffers/s, peak %d/32767\n",
+                        buffers, peak);
+                fflush(stderr);
+                buffers = 0; peak = 0;
+            }
+        }
         return;
     }
 

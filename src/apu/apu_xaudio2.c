@@ -24,8 +24,10 @@
 
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
-#define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-#define XA2_NUM_BUFS      3
+#define XA2_BUF_SAMPLES   1024   /* the largest submission accepted */
+/* The APU hands over 256 samples (5.3 ms) at a time, so the queue needs
+ * enough entries to cover a hitch: eight of them is about 43 ms. */
+#define XA2_NUM_BUFS      8
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
