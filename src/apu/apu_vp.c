@@ -196,6 +196,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case NV1BA0_PIO_VOICE_ON: {
+        if (apu_trace_on())
+            fprintf(stderr, "[APU] method VOICE_ON: voice %u (arg 0x%08X)\n",
+                    (unsigned)(argument & NV1BA0_PIO_VOICE_ON_HANDLE), argument);
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
@@ -402,6 +405,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        (argument & NV1BA0_PIO_SET_VOICE_TAR_PITCH_STEP) >> 16);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_BASE:
+        /* The buffer the title points this voice at: the one value that says
+         * whether it will ever decode anything. */
+        if (apu_trace_on())
+            fprintf(stderr, "[APU] method BUF_BASE: voice %u <- 0x%08X\n",
+                    (unsigned)d->regs[NV_PAPU_FECV], argument);
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
                        NV_PAVS_VOICE_CUR_PSL_START,
                        NV_PAVS_VOICE_CUR_PSL_START_BA, argument);
@@ -837,7 +845,16 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             shown = 0;
         }
         if (shown < 6) {
-            uint32_t base = stream ? (uint32_t)segment_offset : ba;
+            /* For a buffer voice the register holds an offset into the
+             * title's scatter-gather pages; translate it the way the read
+             * path does, otherwise the bytes below are read from nowhere. */
+            uint32_t base = stream ? (uint32_t)segment_offset
+                          : (uint32_t)get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
+                                                   0xFFFFFFFF,
+                                                   ba + cbo * (uint32_t)(
+                                                       (container_size_index ==
+                                                        NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM)
+                                                       ? 36 : container_size) * samples_per_block);
             const uint8_t *p = d->ram_ptr ? &d->ram_ptr[base & 0x03FFFFFF] : NULL;
             shown++;
             {   /* the voice's own registers, as the title left them */
@@ -849,9 +866,9 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                             (uint32_t)ldl_le_phys(address_space_memory, vbase + k * 4));
                 fprintf(stderr, "\n");
             }
-            fprintf(stderr, "[APU] voice %3u data: %s base 0x%08X cbo %u ebo %u"
+            fprintf(stderr, "[APU] voice %3u data: %s ba 0x%08X -> 0x%08X cbo %u ebo %u"
                     " cs %u ss %u spb %u%s  bytes %02X %02X %02X %02X %02X %02X %02X %02X\n",
-                    v, stream ? "stream" : "buffer", base, cbo, ebo,
+                    v, stream ? "stream" : "buffer", ba, base, cbo, ebo,
                     container_size_index, sample_size, samples_per_block,
                     loop ? " loop" : "",
                     p ? p[0] : 0, p ? p[1] : 0, p ? p[2] : 0, p ? p[3] : 0,

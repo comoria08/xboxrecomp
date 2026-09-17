@@ -3841,6 +3841,22 @@ static void mutant_trace(void)
     if (!on)
         return;
     site = g_xbox_kernel_caller;           /* the guest's return address */
+    {   /* the first few times, who called the wrapper that called us */
+        static int traced;
+        if (traced++ < 3) {
+            int k, shown = 0;
+            fprintf(stderr, "  [MUTANT] guest stack:");
+            for (k = 0; k < 64 && shown < 8; k++) {
+                uint32_t w = BRIDGE_MEM32(g_esp + k * 4);
+                if (w >= 0x00011000u && w < 0x00300000u) {
+                    fprintf(stderr, " 0x%08X", w);
+                    shown++;
+                }
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+    }
     handle = STACK_ARG(0);
     for (i = 0; i < n; i++)
         if (top[i].site == site && top[i].handle == handle) {
