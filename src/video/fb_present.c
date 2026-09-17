@@ -189,8 +189,15 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                     : "restored");
     }
     if (m == WM_CLOSE || m == WM_DESTROY) {
+        /* Closing the window ends the run. The window belongs to the runtime
+         * rather than to the title, so merely hiding it left the title going
+         * and the next frame opened another one. exit() rather than
+         * ExitProcess: the atexit handlers (the indirect-call dump) still
+         * get to run. */
         InterlockedExchange(&s_fb_running, 0);
-        return 0;
+        fprintf(stderr, "  [FBWIN] window closed, exiting\n");
+        fflush(stderr);
+        exit(0);
     }
     return DefWindowProcA(h, m, w, l);
 }
