@@ -428,6 +428,7 @@ extern RECOMP_TLS uint32_t g_fs_base;
  * Thread-safe: no (single-threaded recompiled code).
  */
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
+uint32_t xbox_HeapFreeBytes(void);
 
 /**
  * Free a block from the Xbox heap. Currently a no-op (bump allocator).

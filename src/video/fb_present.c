@@ -28,6 +28,27 @@ static volatile LONG s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 
+/* Pixel size and multisample factor, when the caller knows them.
+ *
+ * Inferring the pixel size as pitch/width only holds for a surface whose row
+ * is exactly one pixel per column. It is not true of a multisampled one:
+ * Def Jam: Fight for NY renders 640x480 with 2x horizontal multisampling, so
+ * its rows are 1280 samples of 4 bytes and pitch/width came out as 8 -- a size
+ * the converter has no branch for, so it filled the window with black while
+ * the title was rendering perfectly well. Zero means "not told", and the old
+ * inference is used. */
+static uint32_t      s_fb_bpp;        /* bytes per sample */
+static uint32_t      s_fb_xscale = 1; /* samples per displayed pixel, across */
+
+void xbox_FramebufferWindowFormat(uint32_t width, uint32_t height,
+                                  uint32_t bpp, uint32_t xscale)
+{
+    if (width)  s_fb_width  = width;
+    if (height) s_fb_height = height;
+    s_fb_bpp    = bpp;
+    s_fb_xscale = xscale ? xscale : 1;
+}
+
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
     /* RECOMP_FB_VA pins the window to one guest address instead of following
@@ -39,6 +60,39 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
     s_fb_va = pin ? (uint32_t)strtoul(pin, NULL, 0) : fb_va;
     if (pitch)
         s_fb_pitch = pitch;
+}
+
+/* The last completed frame.
+ *
+ * Reading the surface live shows whatever the title is in the middle of
+ * drawing: a title that clears and redraws one buffer every frame shows up
+ * half painted, with the triangle currently being filled cutting diagonally
+ * across the picture. The executor latches a copy when the title swaps, and
+ * the window shows that instead once one exists. */
+static SRWLOCK       s_latch_lock = SRWLOCK_INIT;
+static uint8_t      *s_latch;
+static size_t        s_latch_size;
+static volatile LONG s_latched;
+
+void xbox_FramebufferWindowLatch(void)
+{
+    size_t bytes;
+
+    if (!s_fb_va || !s_fb_pitch || !InterlockedCompareExchange(&s_fb_running, 1, 1))
+        return;
+    bytes = (size_t)s_fb_pitch * s_fb_height;
+    AcquireSRWLockExclusive(&s_latch_lock);
+    if (s_latch_size != bytes) {
+        free(s_latch);
+        s_latch = (uint8_t *)malloc(bytes);
+        s_latch_size = s_latch ? bytes : 0;
+    }
+    if (s_latch) {
+        memcpy(s_latch, (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset()),
+               bytes);
+        InterlockedExchange(&s_latched, 1);
+    }
+    ReleaseSRWLockExclusive(&s_latch_lock);
 }
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -61,7 +115,24 @@ static void fb_convert(const uint8_t *src, uint32_t bpp)
         const uint8_t *row = src + (size_t)y * s_fb_pitch;
         uint32_t *dst = s_rgb + (size_t)y * s_fb_width;
 
-        if (bpp == 4) {
+        if (bpp == 4 && s_fb_xscale > 1) {
+            /* Resolve the multisamples the way the GPU's own resolve does:
+             * average the group that makes up one displayed pixel. Taking the
+             * first sample instead would alias every edge the title paid for
+             * the extra samples to smooth. */
+            const uint32_t *p = (const uint32_t *)row;
+            uint32_t n = s_fb_xscale, i;
+            for (x = 0; x < s_fb_width; x++) {
+                uint32_t r = 0, g = 0, b = 0;
+                for (i = 0; i < n; i++) {
+                    uint32_t v = p[x * n + i];
+                    r += (v >> 16) & 0xFF;
+                    g += (v >>  8) & 0xFF;
+                    b +=  v        & 0xFF;
+                }
+                dst[x] = ((r / n) << 16) | ((g / n) << 8) | (b / n);
+            }
+        } else if (bpp == 4) {
             memcpy(dst, row, (size_t)s_fb_width * 4);
         } else if (bpp == 2) {
             const uint16_t *p = (const uint16_t *)row;
@@ -175,7 +246,15 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         if (s_fb_va && s_fb_pitch && s_rgb) {
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
-            fb_convert(src, s_fb_pitch / s_fb_width);
+            uint32_t bpp = s_fb_bpp ? s_fb_bpp : s_fb_pitch / s_fb_width;
+            if (InterlockedCompareExchange(&s_latched, 1, 1)) {
+                AcquireSRWLockShared(&s_latch_lock);
+                if (s_latch && s_latch_size == (size_t)s_fb_pitch * s_fb_height)
+                    fb_convert(s_latch, bpp);
+                ReleaseSRWLockShared(&s_latch_lock);
+            } else {
+                fb_convert(src, bpp);
+            }
             StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
                           0, 0, (int)s_fb_width, (int)s_fb_height,
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
@@ -184,9 +263,30 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             /* One dump, a few seconds in, so the title has had time to render
              * something rather than catching the first blank frame. */
             const char *dump = getenv("RECOMP_FB_DUMP");
+            const char *snap = getenv("RECOMP_FB_SNAP");
+            const char *every = getenv("RECOMP_FB_SNAP_EVERY");
             static int frames;
-            if (dump && ++frames == 600)
+            ++frames;
+            if (dump && frames == 600)
                 xbox_FramebufferDumpBmp(dump);
+            /* RECOMP_FB_SNAP=<prefix> with RECOMP_FB_SNAP_EVERY=N: the window
+             * as <prefix>NNN.bmp every N frames, to follow a title past its
+             * first screen. Separate from RECOMP_FB_DUMP, which also makes the
+             * rasteriser write a file per frame and slows the title down. */
+            /* F10: a snapshot on demand, numbered separately. */
+            if ((GetAsyncKeyState(VK_F10) & 1) && GetForegroundWindow() == hwnd) {
+                static int f10;
+                char path[512];
+                snprintf(path, sizeof path, "%sF10_%03d.bmp",
+                         snap ? snap : "capture_", ++f10);
+                xbox_FramebufferDumpBmp(path);
+            }
+            if (snap && every && atoi(every) > 0 && frames % atoi(every) == 0) {
+                char path[512];
+                snprintf(path, sizeof path, "%s%03d.bmp", snap,
+                         frames / atoi(every));
+                xbox_FramebufferDumpBmp(path);
+            }
         }
         Sleep(16);
     }
@@ -215,5 +315,9 @@ void xbox_FramebufferWindowStart(void)
 
 #else
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
+void xbox_FramebufferWindowFormat(uint32_t width, uint32_t height,
+                                  uint32_t bpp, uint32_t xscale)
+{ (void)width; (void)height; (void)bpp; (void)xscale; }
 void xbox_FramebufferWindowStart(void) {}
+void xbox_FramebufferWindowLatch(void) {}
 #endif

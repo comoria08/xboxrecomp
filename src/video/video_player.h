@@ -60,6 +60,12 @@ int  video_dump_frame_bmp(const char *path);
  * the title renders into guest RAM appears there; nothing else scans it out. */
 void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+void xbox_FramebufferWindowLatch(void);   /* copy the finished frame */
+/* Tell the window the surface's real geometry instead of letting it infer the
+ * pixel size from pitch/width, which a multisampled surface breaks. bpp is
+ * bytes per sample; xscale is how many samples across make one pixel. */
+void xbox_FramebufferWindowFormat(uint32_t width, uint32_t height,
+                                  uint32_t bpp, uint32_t xscale);
 int  xbox_FramebufferDumpBmp(const char *path);
 
 #endif /* BURNOUT3_VIDEO_PLAYER_H */

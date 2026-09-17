@@ -18,6 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
+#ifdef _WIN32
+#include <mmsystem.h>   /* timeBeginPeriod for nv2a_irq_thread */
+#endif
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
 #endif
@@ -181,10 +184,19 @@ static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
      * Holding them at zero is correct rather than convenient: nothing here
      * ever raises a GPU interrupt, so "none pending" is the truth. */
     { 0x000100, 0xFFFFFFFFu },  /* PMC_INTR_0    */
+/* Handled specially in the poll loop: see the note there. Both bits name an
+ * interrupt this runtime actually raises -- the display's vblank and the GPU
+ * timer's alarm -- so both have to survive long enough to be serviced. */
+#define NV2A_PMC_INTR_0_OFFSET    0x000100u
+#define NV2A_PMC_INTR_PCRTC_BIT   (1u << 24)
+#define NV2A_PMC_INTR_PTIMER_BIT  (1u << 20)
+#define NV2A_PMC_INTR_RAISED      (NV2A_PMC_INTR_PCRTC_BIT \
+                                 | NV2A_PMC_INTR_PTIMER_BIT)
     { 0x001100, 0xFFFFFFFFu },  /* PBUS_INTR_0   */
     { 0x002100, 0xFFFFFFFFu },  /* PFIFO_INTR_0  */
     { 0x400100, 0xFFFFFFFFu },  /* PGRAPH_INTR   */
     { 0x600100, 0xFFFFFFFFu },  /* PCRTC_INTR_0  */
+    { 0x009100, 0xFFFFFFFFu },  /* PTIMER_INTR_0 */
 };
 
 /*
@@ -572,6 +584,301 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/*
+ * The GPU's own clock, which a title reads to schedule work.
+ *
+ * NV2A has a free-running counter in PTIMER, exposed as a pair of registers,
+ * and an alarm register the hardware compares against it. Xbox D3D8 uses it
+ * for timed callbacks: it reads TIME, adds the delay it wants in nanoseconds,
+ * writes the sum to ALARM_0 and enables the timer interrupt.
+ *
+ * Backed by plain RAM the counter never moves, so every deadline a title
+ * computes from it is meaningless and the alarm never arrives. Def Jam: Fight
+ * for NY schedules the callback that wakes its input thread this way, and that
+ * thread is what feeds its game loop -- so with a frozen counter the title
+ * renders forever without ever advancing a frame.
+ *
+ * Nanoseconds, split low dword / high dword, because that is the contract the
+ * title's own arithmetic assumes: it adds a nanosecond delta straight onto the
+ * register pair with carry. xemu exposes TIME_0 shifted left five instead;
+ * nothing here decodes that form, and a title that does would read this as
+ * 32x slow.
+ */
+#define NV2A_PTIMER_INTR_0     0x009100u
+#define NV2A_PTIMER_INTR_ALARM 0x00000001u
+#define NV2A_PTIMER_INTR_EN_0  0x009140u
+#define NV2A_PTIMER_TIME_0     0x009400u
+#define NV2A_PTIMER_TIME_1     0x009410u
+#define NV2A_PTIMER_ALARM_0    0x009420u
+
+/* Time the guest has not been allowed to see, in ns. See the alarm below. */
+static volatile LONG64 s_ptimer_skew_ns;
+
+/* The alarm value last seen and the 64-bit guest time when it first appeared.
+ * ALARM_0 holds only the low 32 bits of a deadline, so comparing it with
+ * TIME_0 alone reads a deadline more than 2.1 s in the past as one in the
+ * future: a timer thread held up that long then waited another two seconds
+ * for the counter to wrap. Measuring from when the value was set does not. */
+static CRITICAL_SECTION s_alarm_seen_cs;
+static INIT_ONCE        s_alarm_seen_once = INIT_ONCE_STATIC_INIT;
+static uint32_t         s_alarm_seen;
+static uint64_t         s_alarm_seen_ns;
+
+static BOOL CALLBACK alarm_seen_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&s_alarm_seen_cs);
+    return TRUE;
+}
+
+/* Note a new alarm value against the time just published; returns the time
+ * the current value was first seen. */
+static uint64_t alarm_seen_at(uint32_t alarm, uint64_t now_ns)
+{
+    uint64_t at;
+    InitOnceExecuteOnce(&s_alarm_seen_once, alarm_seen_init, NULL, NULL);
+    EnterCriticalSection(&s_alarm_seen_cs);
+    if (alarm != s_alarm_seen) {
+        s_alarm_seen = alarm;
+        s_alarm_seen_ns = now_ns;
+    }
+    at = s_alarm_seen_ns;
+    LeaveCriticalSection(&s_alarm_seen_cs);
+    return at;
+}
+
+static void nv2a_ptimer_tick(volatile uint32_t *regs)
+{
+    static LARGE_INTEGER qpf, origin;
+    LARGE_INTEGER now;
+    uint64_t ns;
+
+    if (!qpf.QuadPart) {
+        QueryPerformanceFrequency(&qpf);
+        QueryPerformanceCounter(&origin);
+        if (!qpf.QuadPart)
+            qpf.QuadPart = 1;
+    }
+    QueryPerformanceCounter(&now);
+    {
+        uint64_t ticks = (uint64_t)(now.QuadPart - origin.QuadPart);
+        uint64_t secs  = ticks / (uint64_t)qpf.QuadPart;
+        uint64_t rem   = ticks % (uint64_t)qpf.QuadPart;
+        ns = secs * 1000000000ull
+           + (rem * 1000000000ull) / (uint64_t)qpf.QuadPart;
+    }
+
+    ns -= (uint64_t)InterlockedCompareExchange64(&s_ptimer_skew_ns, 0, 0);
+
+    *(volatile uint32_t *)((char *)regs + NV2A_PTIMER_TIME_0) = (uint32_t)ns;
+    *(volatile uint32_t *)((char *)regs + NV2A_PTIMER_TIME_1) =
+        (uint32_t)(ns >> 32);
+
+    /* Both threads that tick the clock watch for a new deadline, so the
+     * moment it was set is known even while the timer thread is held up. */
+    {
+        uint32_t alarm = *(volatile uint32_t *)((char *)regs + NV2A_PTIMER_ALARM_0);
+        if (alarm)
+            alarm_seen_at(alarm, ns);
+    }
+
+    /* What the title asks of the timer, as it asks it.
+     *
+     * The registers are plain memory, so a write by the guest cannot be
+     * trapped -- but this poll runs constantly, so a changed value is a write
+     * that happened. That is the difference between "the title stopped arming
+     * the alarm" and "the alarm stopped firing", which is otherwise
+     * indistinguishable from the outside. */
+    if (getenv("RECOMP_PTIMER_TRACE")) {
+        static uint32_t last_alarm, last_en;
+        static unsigned arms;
+        uint32_t alarm = *(volatile uint32_t *)((char *)regs + NV2A_PTIMER_ALARM_0);
+        uint32_t en    = *(volatile uint32_t *)((char *)regs + NV2A_PTIMER_INTR_EN_0);
+
+        if (en != last_en) {
+            last_en = en;
+            fprintf(stderr, "  [PTIMER] guest set INTR_EN_0 = 0x%08X\n", en);
+            fflush(stderr);
+        }
+        if (alarm != last_alarm) {
+            last_alarm = alarm;
+            arms++;
+            if (arms <= 8 || (arms % 60) == 0)
+                fprintf(stderr, "  [PTIMER] arm #%u: alarm = %u, now = %u,"
+                        " in %d ns\n", arms, alarm, (uint32_t)ns,
+                        (int32_t)(alarm - (uint32_t)ns));
+            fflush(stderr);
+        }
+    }
+}
+
+/* Has the alarm the title armed come due?
+ *
+ * Signed difference so the comparison survives the low dword wrapping, the
+ * same way the hardware's does. Answering yes also posts the interrupt at both
+ * levels -- PTIMER's own status and PMC's summary bit -- because an ISR reads
+ * those to decide whether the interrupt is its business.
+ *
+ * Only the caller knows how to reach the title's ISR, so raising it is left to
+ * them; this reports and arms, nothing more.
+ */
+static uint32_t  s_ptimer_fired_for;   /* the deadline already delivered */
+static ULONGLONG s_ptimer_fired_ms;    /* and when */
+
+/* The last alarm value delivered, for a title-side diagnostic that wants to
+ * tell "armed but already delivered" from "armed and still pending". */
+uint32_t xbox_Nv2aPtimerFiredFor(void)
+{
+    return s_ptimer_fired_for;
+}
+
+int xbox_Nv2aPtimerAlarmDue(void)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
+    uint32_t fired_for = s_ptimer_fired_for;
+    uint32_t en, alarm, t0;
+    int64_t late = 0;
+    int again = 0;
+
+    if (!regs)
+        return 0;
+    en = *(volatile uint32_t *)((char *)regs + NV2A_PTIMER_INTR_EN_0);
+    if (!(en & NV2A_PTIMER_INTR_ALARM))
+        return 0;
+    alarm = *(volatile uint32_t *)((char *)regs + NV2A_PTIMER_ALARM_0);
+    if (!alarm)
+        return 0;
+
+    /* One interrupt per armed deadline. The alarm register keeps its value
+     * after it fires, so without this a deadline that has passed is "due" on
+     * every poll and the title is re-interrupted a hundred times a second for
+     * a callback it already ran. A new deadline is a new value, which is
+     * exactly when the alarm should fire again.
+     *
+     * Except when the interrupt was lost. The raised status bits are cleared
+     * about a millisecond after they appear (see nv2a_ack_delayed), so if this
+     * thread is preempted between the ISR and its deferred routine, the
+     * routine reads "nothing pending" and D3D never services the alarm: its
+     * slot stays armed, the register keeps the same value, and nothing ever
+     * fires again. Def Jam: Fight for NY froze on its fight loading screen
+     * that way, one run in two -- its input timer's stop request spins until
+     * a callback that never came. A real alarm is a level, so an unchanged,
+     * still-enabled alarm is raised again once its service had ample time to
+     * rewrite it. If it had been serviced and simply not re-armed, D3D finds
+     * its slot empty and disables the interrupt itself. */
+    if (alarm == fired_for) {
+        if (GetTickCount64() - s_ptimer_fired_ms < 16)
+            return 0;
+        again = 1;
+    }
+
+    /* The counter is advanced here too, not only by the NV2A thread: that
+     * thread also runs the software rasteriser, and while it draws a heavy
+     * frame the counter it publishes stands still. The alarm then fired a
+     * hundred milliseconds late, D3D's periodic callback gave up re-arming,
+     * and the title's logic stopped ticking the moment its front end started
+     * drawing textured full-screen quads. */
+    nv2a_ptimer_tick(regs);
+    t0 = *(volatile uint32_t *)((char *)regs + NV2A_PTIMER_TIME_0);
+    if (!again) {
+        uint64_t now = ((uint64_t)*(volatile uint32_t *)((char *)regs + NV2A_PTIMER_TIME_1) << 32)
+                     | t0;
+        uint64_t seen = alarm_seen_at(alarm, now);
+        int32_t  dist = (int32_t)(alarm - (uint32_t)seen);   /* as it stood when set */
+        late = (int64_t)(now - seen) - (dist > 0 ? dist : 0);
+        if (late < 0)
+            return 0;
+    }
+
+    /* And if it is late anyway -- this thread was not scheduled -- the guest
+     * is shown a clock that lost the difference. D3D re-arms at "period minus
+     * lateness" and stops altogether once lateness exceeds the period, so a
+     * late alarm is worse than a slow clock: the title slows down instead of
+     * freezing. A second delivery is not late in that sense. */
+    if (again) {
+        static unsigned n;
+        if (n++ < 8 || (n % 100) == 0)
+            fprintf(stderr, "  [PTIMER] alarm 0x%08X was not serviced, raised again (#%u)\n",
+                    alarm, n);
+        fflush(stderr);
+    } else {
+        const int64_t keep = 1000000;          /* 1 ms is honest lateness */
+        if (late > keep) {
+            InterlockedAdd64(&s_ptimer_skew_ns, (LONG64)(late - keep));
+            nv2a_ptimer_tick(regs);
+            t0 = *(volatile uint32_t *)((char *)regs + NV2A_PTIMER_TIME_0);
+        }
+    }
+
+    s_ptimer_fired_for = alarm;
+    s_ptimer_fired_ms  = GetTickCount64();
+    *(volatile uint32_t *)((char *)regs + NV2A_PTIMER_INTR_0)
+        |= NV2A_PTIMER_INTR_ALARM;
+
+    /* How late the alarm is delivered. A title that schedules its next
+     * deadline as "period minus how late the last one was" stops re-arming as
+     * soon as that lateness exceeds the period, so this number decides whether
+     * a periodic callback survives. */
+    if (getenv("RECOMP_PTIMER_TRACE")) {
+        static unsigned n;
+        if (n++ < 8 || (n % 60) == 0)
+            fprintf(stderr, "  [PTIMER] alarm delivered %lld ns late\n",
+                    (long long)late);
+        fflush(stderr);
+    }
+    return 1;
+}
+
+/* Status bits for interrupts this runtime raises, and how long they are held.
+ *
+ * Everything else in NV2A_ACK is cleared on sight, which is right while
+ * nothing raises those interrupts. These two registers carry interrupts that
+ * are raised, so clearing them instantly means the service routine reads them
+ * back as "nothing pending" and skips the work it was scheduled to do. The
+ * title's own acknowledging write cannot be seen through plain RAM, so instead
+ * the bits are held for about a millisecond: long enough for the interrupt
+ * service routine and the deferred routine behind it to read them, short
+ * enough that the spin those routines end on ends.
+ */
+static uint32_t nv2a_raised_mask(uint32_t offset)
+{
+    if (offset == NV2A_PMC_INTR_0_OFFSET)
+        return NV2A_PMC_INTR_RAISED;
+    if (offset == NV2A_PTIMER_INTR_0)
+        return NV2A_PTIMER_INTR_ALARM;
+    return 0;
+}
+
+static void nv2a_ack_delayed(volatile uint32_t *r, uint32_t held, size_t slot)
+{
+    static LARGE_INTEGER since[8], qpf;
+    uint32_t v = *r;
+    uint32_t others = v & ~held;
+
+    if (slot >= sizeof(since) / sizeof(since[0]))
+        return;
+    if (others)
+        *r = v & ~others;               /* the rest still clears on sight */
+
+    if (!(v & held)) {
+        since[slot].QuadPart = 0;
+        return;
+    }
+    {
+        LARGE_INTEGER now;
+        if (!qpf.QuadPart)
+            QueryPerformanceFrequency(&qpf);
+        QueryPerformanceCounter(&now);
+        if (!since[slot].QuadPart) {
+            since[slot] = now;
+        } else if ((now.QuadPart - since[slot].QuadPart) * 1000
+                   >= qpf.QuadPart) {   /* >= 1 ms */
+            *r &= ~held;
+            since[slot].QuadPart = 0;
+        }
+    }
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -579,6 +886,32 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+
+            /* The one interrupt this runtime does raise needs its status bit
+             * to survive long enough to be serviced.
+             *
+             * kernel_vblank_tick sets PMC_INTR_0's PCRTC bit and calls the
+             * title's ISR; the ISR queues a deferred routine, and that routine
+             * reads PMC_INTR_0 again to decide what to service. Zeroing the
+             * register on sight -- correct while nothing raised interrupts --
+             * means the deferred routine always reads zero and skips the work.
+             * Def Jam: Fight for NY lost its vblank callbacks exactly there,
+             * and with them the thread that feeds its game loop.
+             *
+             * The bit is still cleared, just not instantly: the title's own
+             * acknowledging write cannot be seen through plain RAM, so the
+             * source is modelled as clearing about a millisecond after the
+             * interrupt was taken. That is long enough for the ISR and the
+             * deferred routine to see it, and short enough that the spin they
+             * end on ends quickly. Every other bit is cleared on sight as
+             * before, because nothing raises those. */
+            {
+                /* Handled by nv2a_irq_thread, which this loop cannot
+                 * starve while it rasterises. */
+                if (nv2a_raised_mask(NV2A_ACK[i].offset))
+                    continue;
+            }
+
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
             }
@@ -599,6 +932,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 *get = *put;
             }
         }
+        nv2a_ptimer_tick(regs);
         fence_mirrors_tick();
         counter_mirrors_tick();
         frame_counters_tick();
@@ -708,9 +1042,44 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     return 0;
 }
 
+/* The raised interrupt bits and the GPU clock, on a thread of their own.
+ *
+ * They used to be serviced by the ack loop above, which also runs the software
+ * rasteriser. D3D's deferred routine loops until the status bit it serviced
+ * reads clear, so while a heavy frame was being drawn the timer thread spun in
+ * that routine for seconds, no alarm was delivered, and Def Jam: Fight for NY
+ * froze mid-fight for two to five seconds at a time. The rasteriser stays where
+ * it is -- its pace is what keeps the title from reusing a pushbuffer before it
+ * has been read -- but these do not wait for it. */
+static DWORD WINAPI nv2a_irq_thread(LPVOID param)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)param;
+#ifdef _WIN32
+    timeBeginPeriod(1);   /* held for the process's life, like the timer thread's */
+#endif
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+            uint32_t held = nv2a_raised_mask(NV2A_ACK[i].offset);
+            if (held)
+                nv2a_ack_delayed((volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset),
+                                 held, i);
+        }
+        nv2a_ptimer_tick(regs);
+        Sleep(1);
+    }
+    return 0;
+}
+
 static void xbox_Nv2aAckStart(void)
 {
     g_nv2a_ack_stop = 0;
+    {
+        HANDLE t = CreateThread(NULL, 0, nv2a_irq_thread, g_nv2a_memory, 0, NULL);
+        if (t) {
+            SetThreadPriority(t, THREAD_PRIORITY_ABOVE_NORMAL);
+            CloseHandle(t);
+        }
+    }
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     if (g_nv2a_ack_thread) {
@@ -2159,7 +2528,59 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * title allocates once. */
 static uint32_t g_contig_next = XBOX_CONTIG_BASE;
 
+/*
+ * One lock over both guest arenas.
+ *
+ * The bump pointers and the block table are plain globals, and every guest
+ * thread allocates through them: the title's own threads, the XAPI worker,
+ * DirectSound's mixer thread. Unserialised, two allocations that interleave
+ * read the same g_heap_next and are handed the same block, or write the same
+ * g_heap_blocks[g_heap_block_count] slot -- and the second writer's object
+ * lands on top of the first's.
+ *
+ * That is not a theoretical race. In Def Jam: Fight for NY it showed up as a
+ * crash in a different function on every run, always following a pointer read
+ * out of a guest object that another thread had been handed as well; two runs
+ * in three died somewhere in the first minute, the third ran clean.
+ *
+ * A CRITICAL_SECTION is recursive on the owning thread, so an allocator that
+ * ends up calling another cannot deadlock against itself. Initialised through
+ * InitOnce rather than at layout init, because these are reachable before any
+ * particular init order can be relied on.
+ */
+static CRITICAL_SECTION g_alloc_cs;
+static INIT_ONCE g_alloc_cs_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK alloc_cs_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_alloc_cs);
+    return TRUE;
+}
+
+static void alloc_lock(void)
+{
+    InitOnceExecuteOnce(&g_alloc_cs_once, alloc_cs_init, NULL, NULL);
+    EnterCriticalSection(&g_alloc_cs);
+}
+
+static void alloc_unlock(void)
+{
+    LeaveCriticalSection(&g_alloc_cs);
+}
+
+static uint32_t xbox_ContiguousAlloc_locked(uint32_t size, uint32_t alignment);
+
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t r;
+    alloc_lock();
+    r = xbox_ContiguousAlloc_locked(size, alignment);
+    alloc_unlock();
+    return r;
+}
+
+static uint32_t xbox_ContiguousAlloc_locked(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
@@ -2193,7 +2614,18 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
 }
 
 
+static uint32_t xbox_HeapAlloc_locked(uint32_t size, uint32_t alignment);
+
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t r;
+    alloc_lock();
+    r = xbox_HeapAlloc_locked(size, alignment);
+    alloc_unlock();
+    return r;
+}
+
+static uint32_t xbox_HeapAlloc_locked(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
@@ -2289,6 +2721,21 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     return result;
 }
 
+/* Bytes the guest heap can still hand out: the untouched tail plus every
+ * freed block. MmQueryStatistics reports this as the free page count, and
+ * titles size their own allocators from it. */
+uint32_t xbox_HeapFreeBytes(void)
+{
+    uint64_t total;
+    alloc_lock();
+    total = XBOX_HEAP_TOP > g_heap_next ? XBOX_HEAP_TOP - g_heap_next : 0;
+    for (int i = 0; i < g_heap_block_count; i++)
+        if (g_heap_blocks[i].free)
+            total += g_heap_blocks[i].size;
+    alloc_unlock();
+    return total > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)total;
+}
+
 /* How big is the block at this guest address?
  *
  * MmQueryAllocationSize and ExQueryPoolBlockSize both ask this, and both used
@@ -2304,21 +2751,35 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
  */
 uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
 {
+    uint32_t r = 0;
     int i;
 
     if (!xbox_va)
         return 0;
+    alloc_lock();
     for (i = 0; i < g_heap_block_count; i++) {
         if (g_heap_blocks[i].free)
             continue;
         if (xbox_va >= g_heap_blocks[i].addr &&
-            xbox_va <  g_heap_blocks[i].addr + g_heap_blocks[i].size)
-            return g_heap_blocks[i].size - (xbox_va - g_heap_blocks[i].addr);
+            xbox_va <  g_heap_blocks[i].addr + g_heap_blocks[i].size) {
+            r = g_heap_blocks[i].size - (xbox_va - g_heap_blocks[i].addr);
+            break;
+        }
     }
-    return 0;
+    alloc_unlock();
+    return r;
 }
 
+static void xbox_HeapFree_locked(uint32_t xbox_va);
+
 void xbox_HeapFree(uint32_t xbox_va)
+{
+    alloc_lock();
+    xbox_HeapFree_locked(xbox_va);
+    alloc_unlock();
+}
+
+static void xbox_HeapFree_locked(uint32_t xbox_va)
 {
     static int frees = 0, matched = 0;
 

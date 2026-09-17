@@ -241,6 +241,30 @@ extern RECOMP_TLS uint32_t g_ebp;
 extern RECOMP_TLS int g_df;
 #define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
 
+/* A forward `rep movs` whose ranges do not overlap, as a block copy.
+ *
+ * Unless either end is in the device windows at the top of the address space.
+ * Some of those are left unmapped on purpose so that every access faults into
+ * an emulated device (the APU at 0xFE800000), and the fault handler decodes
+ * plain `mov` only -- a vectorised memcpy there is an instruction it cannot
+ * replay, and Def Jam: Fight for NY crashed in its main menu the moment
+ * DirectSound copied a voice block out of the APU. Those copies go a byte at
+ * a time. */
+static inline void recomp_guest_copy(uint8_t *d, const uint8_t *s, uint32_t n,
+                                     uint32_t dva, uint32_t sva)
+{
+    if ((uint64_t)dva + n > 0xFD000000u || (uint64_t)sva + n > 0xFD000000u) {
+        volatile uint8_t b;
+        uint32_t i;
+        for (i = 0; i < n; i++) {
+            b = s[i];
+            d[i] = b;
+        }
+    } else {
+        memcpy(d, s, n);
+    }
+}
+
 /* x87 control and status. Thread-local for the same reason the x87 stack
    above is: one guest routine can lift to several C functions, so a compare
    and the FNSTSW that reads it can land in different bodies, and the control

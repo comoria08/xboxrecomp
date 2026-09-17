@@ -38,9 +38,11 @@ class DirectionFlagLifterTest(unittest.TestCase):
     def test_rep_movsb_uses_the_block_copy_only_when_it_cannot_overlap(self):
         generated = _lift(Instruction(0, 2, "rep movsb", "", "f3a4"))
 
-        # memcpy is still there for the common case, but guarded: it is only
-        # reached when the ranges provably do not overlap.
-        self.assertIn("memcpy(_d, _s, _n)", generated)
+        # The block copy is still there for the common case, but guarded: it
+        # is only reached when the ranges provably do not overlap. It goes
+        # through recomp_guest_copy, which falls back to a byte loop when an
+        # end is in the device windows.
+        self.assertIn("recomp_guest_copy(_d, _s, _n, edi, esi)", generated)
         self.assertIn("_d + _n <= _s || _s + _n <= _d", generated)
 
     def test_rep_movsb_propagates_an_overlapping_forward_copy(self):

@@ -349,6 +349,10 @@ def main():
             funcs = funcs[:args.max_funcs]
 
         manual = set()
+        # Filled by --exclude-manual below: addresses whose body is still
+        # generated (as sub_X_gen) but whose call sites must reach the
+        # hand-written wrapper.
+        wrapped = set()
         if args.manual_functions:
             with open(args.manual_functions, "r", encoding="utf-8") as fh:
                 entries = json.load(fh)
@@ -411,7 +415,8 @@ def main():
             # wrap: recomp_manual.c defines sub_X itself and calls the generated
             # body as sub_X_gen. So do NOT add these to `manual` (the body is
             # still needed) -- just rename them so the emitted body is sub_X_gen.
-            for addr in wrap & known:
+            wrapped = wrap & known
+            for addr in wrapped:
                 translator.func_db[addr]["name"] = f"sub_{addr:08X}_gen"
 
             # skip - wrap: defined by hand and not wrapped -> declare-only, which
@@ -430,6 +435,7 @@ def main():
             chunk_size=args.split,
             verbose=args.verbose,
             manual=manual,
+            wrapped=wrapped,
         )
 
         t_translate = time.time() - t0

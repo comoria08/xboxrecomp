@@ -22,7 +22,7 @@ import struct
 from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
-from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
+from .lifter import (Lifter, lift_basic_block, detect_seh_helpers, JOIN_FLAGS,
                      detect_setjmp_helpers, _func_ident)
 
 
@@ -851,6 +851,8 @@ class FunctionTranslator:
             for insn in instructions)
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
+        # Result snapshots of the arithmetic flag setters (lifter.RESULT_SNAPSHOT).
+        lines.append("    uint32_t _fr = 0, _frb = 0; (void)_fr; (void)_frb;")
 
         # Flag snapshot temporaries: a cmp/test records its operands here,
         # zero- and sign-extended to the compare's own width, so the branch
@@ -974,7 +976,63 @@ class FunctionTranslator:
                 preds[blocks[i + 1].start].add(bb.start)
 
         out_state = {}
-        for bb in blocks:
+        in_state = {}
+        stmts_of = {}
+        self.lifter.pfrom_preds = set()
+
+        def incoming_for(bb):
+            # Inherit the flag state only when every predecessor agrees on it.
+            # A predecessor not lifted yet counts as unknown rather than
+            # guessed, which costs a fallback condition and never a wrong one.
+            #
+            # Predecessors that all know their flags but disagree hand over a
+            # join state instead: the branch then picks each one's condition
+            # at run time (lifter.JOIN_FLAGS).
+            sources = preds[bb.start]
+            if bb.start == start or not sources:
+                return None
+            if not all(p in out_state for p in sources):
+                return None
+            states = [out_state[p] for p in sources]
+            incoming = states[0]
+            for other in states[1:]:
+                if other != incoming:
+                    incoming = None
+                    break
+            if incoming is None and all(states):
+                incoming = (JOIN_FLAGS,
+                            [(p, out_state[p]) for p in sorted(sources)])
+            return incoming
+
+        # Blocks are lifted in address order, so the first pass cannot see a
+        # back edge's predecessor. Later passes can: a block whose incoming
+        # state changed once every predecessor is known is lifted again, until
+        # nothing changes. APT's `sete` after a loop that re-enters from the
+        # bottom of the function was one of those.
+        for pass_no in range(4):
+            changed = False
+            for bb in blocks:
+                incoming = incoming_for(bb)
+                if pass_no and incoming == in_state.get(bb.start):
+                    continue
+                in_state[bb.start] = incoming
+                stmts, out = lift_basic_block(
+                    self.lifter, bb, flag_state=incoming)
+                stmts_of[bb.start] = stmts
+                if pass_no and out != out_state.get(bb.start):
+                    changed = True
+                if pass_no == 0 or out != out_state.get(bb.start):
+                    out_state[bb.start] = out
+                if pass_no:
+                    changed = True
+            if pass_no and not changed:
+                break
+        lifted = [(bb, stmts_of[bb.start]) for bb in blocks]
+
+        pfrom = self.lifter.pfrom_preds
+        if pfrom:
+            lines.append("    uint32_t _pfrom = 0; /* block a flag join came from */")
+        for bb, stmts in lifted:
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
                 # The trailing ';' is load-bearing: C requires a statement after
@@ -984,25 +1042,15 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
 
-            # Inherit the flag state only when every predecessor agrees on it.
-            # Blocks are walked in address order, so a back edge's predecessor
-            # may not be computed yet -- treat that as unknown rather than
-            # guessing, which costs a fallback condition and never a wrong one.
-            sources = preds[bb.start]
-            if bb.start == start or not sources:
-                incoming = None
-            elif all(p in out_state for p in sources):
-                states = [out_state[p] for p in sources]
-                incoming = states[0]
-                for other in states[1:]:
-                    if other != incoming:
-                        incoming = None
-                        break
-            else:
-                incoming = None
-
-            stmts, out_state[bb.start] = lift_basic_block(
-                self.lifter, bb, flag_state=incoming)
+            if bb.start in pfrom:
+                # Recorded before the block's closing branch, which is its last
+                # statement; a block that just falls through records at the end.
+                mark = f"_pfrom = 0x{bb.start:08X}u;"
+                last = bb.instructions[-1] if bb.instructions else None
+                if last is not None and (last.is_branch or last.is_cond_jump) and stmts:
+                    stmts = stmts[:-1] + [mark, stmts[-1]]
+                else:
+                    stmts = stmts + [mark]
             for stmt in stmts:
                 lines.append(f"    {stmt}")
 
@@ -1329,7 +1377,8 @@ class BatchTranslator:
 
     def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                               header_name="recomp_funcs.h",
-                              prefix="recomp", verbose=False, manual=None):
+                              prefix="recomp", verbose=False, manual=None,
+                              wrapped=None):
         """
         Translate functions into multiple .c files + a shared header.
 
@@ -1346,6 +1395,14 @@ class BatchTranslator:
         is how a game replaces a recompiled XDK routine (a D3D8 entry point,
         say) with one that drives the host runtime instead of the hardware.
 
+        wrapped: addresses the project wraps rather than replaces -- the hand
+        written sub_X calls the generated body as sub_X_gen. The body is still
+        emitted (under the _gen name, which the caller arranges through
+        func_db), but call sites must reach the wrapper, not the body. Without
+        this they resolved the renamed body directly and the wrapper only ever
+        saw indirect calls, which for a wrapper whose whole purpose is to run
+        before the body is the same as not being called at all.
+
         Returns dict with stats and list of generated files.
         """
         import sys
@@ -1355,11 +1412,13 @@ class BatchTranslator:
         func_list = [item for item in func_list
                      if item[0] not in self.translator.owned_function_starts]
         manual = set(manual or ())
+        wrapped = set(wrapped or ())
         # Hand the set to the lifter so a *direct* call to a replaced
         # function routes through recomp_lookup_manual too. Without this
         # the override only took effect through a function pointer, and
         # every direct caller silently reached the generated body.
-        self.translator.lifter.manual_functions = manual
+        # Wrapped functions route the same way, but keep their bodies.
+        self.translator.lifter.manual_functions = manual | wrapped
         manual_decls = {}
 
         # Translate all functions first, collecting results

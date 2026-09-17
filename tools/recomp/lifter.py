@@ -253,7 +253,7 @@ def _operand_width(op):
     narrow compare test a widened value - "cmp word ptr [x], -1" against
     0xFFFFFFFF never matches, because a 16-bit -1 is 0xFFFF.
     """
-    if op.type == "mem":
+    if op.type in ("mem", "expr"):
         return getattr(op, "mem_size", None) or 4
     if op.type == "reg":
         return _REG_WIDTH.get(str(op.reg).lower(), 4)
@@ -262,6 +262,8 @@ def _operand_width(op):
 
 def _fmt_operand_read(op):
     """Format reading any operand type."""
+    if op.type == "expr":
+        return op.reg              # a snapshot variable, see RESULT_SNAPSHOT
     if op.type == "reg":
         return _fmt_reg(op.reg)
     elif op.type == "imm":
@@ -1015,6 +1017,7 @@ class Lifter:
         self.func_end = 0
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
         self.publishes_ebp = False  # Set per-function: has a real frame
+        self.pfrom_preds = set()  # Per-function: blocks that record _pfrom
         self.trace_exit_name = None  # Set per-function when traced
         # Every direct call target we emit a name for, as {addr: name}. The
         # batch translator diffs this against the functions it actually defined
@@ -2182,7 +2185,7 @@ class Lifter:
         if "movsb" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  if (_d + _n <= _s || _s + _n <= _d) recomp_guest_copy(_d, _s, _n, edi, esi);",
                     "  else { uint32_t _i; for (_i = 0; _i < _n; _i++) _d[_i] = _s[_i]; }",
                     "  esi += ecx; edi += ecx; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
@@ -2191,7 +2194,7 @@ class Lifter:
         if "movsd" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 4;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  if (_d + _n <= _s || _s + _n <= _d) recomp_guest_copy(_d, _s, _n, edi, esi);",
                     "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM32(edi + _i*4) = MEM32(esi + _i*4); }",
                     "  esi += ecx * 4; edi += ecx * 4; }",
@@ -2201,7 +2204,7 @@ class Lifter:
         if "movsw" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 2;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  if (_d + _n <= _s || _s + _n <= _d) recomp_guest_copy(_d, _s, _n, edi, esi);",
                     "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM16(edi + _i*2) = MEM16(esi + _i*2); }",
                     "  esi += ecx * 2; edi += ecx * 2; }",
@@ -3087,6 +3090,32 @@ class Lifter:
             rhs = self._fcom_rhs(ops)
             return [f"g_fp_cmp = RECOMP_FCMP(fp_top(), {rhs});"
                     f"{pop_code} /* {m} */"]
+        if m == "fxam":
+            # Classify st0 into C3/C2/C0 with the sign in C1. MSVC's math
+            # intrinsics (_CIatan2, _CIsin, ...) dispatch on this before
+            # doing any work; left as a comment, the status word kept the
+            # last compare's bits and the dispatcher took a special-value
+            # path, so atan2 in EA's APT returned degrees-sized garbage and
+            # every tilted menu element came out turned by about a radian.
+            #
+            # The class is kept in g_fp_cmp as the raw status bits, marked by
+            # being >= 0x100 so the ordinary -1/0/1/2 compare codes are
+            # untouched. An empty st0 is not modelled.
+            return ["{ double _x = fp_top(); int _c ="
+                    " isnan(_x) ? 0x0100 : isinf(_x) ? 0x0500 :"
+                    " _x == 0.0 ? 0x4000 :"
+                    " fpclassify(_x) == FP_SUBNORMAL ? 0x4400 : 0x0400;"
+                    " if (signbit(_x)) _c |= 0x0200;"
+                    " g_fp_cmp = _c; } /* fxam */"]
+        if m in ("ficom", "ficomp"):
+            op = ops[0] if ops else None
+            if op is not None and getattr(op, "type", None) == "mem":
+                size = getattr(op, "mem_size", 4)
+                rhs = (f"(double)(int16_t)MEM16({_fmt_mem(op)})" if size == 2
+                       else f"(double)(int32_t)MEM32({_fmt_mem(op)})")
+                pop = " fp_pop();" if m == "ficomp" else ""
+                return [f"g_fp_cmp = RECOMP_FCMP(fp_top(), {rhs});{pop}"
+                        f" /* {m} {insn.op_str} */"]
         if m == "fnstsw":
             # `fnstsw ax` after an FPU compare is half of the pre-SSE float
             # branch idiom `fcomp; fnstsw ax; test ah, mask; j(p/np/z/nz)`.
@@ -3105,7 +3134,8 @@ class Lifter:
             # those two bits. Reporting equal for a NaN compare sends every
             # float classification in a title down the wrong branch.
             status = ("(uint16_t)(((g_fp_top & 7u) << 11) |"
-                      " (g_fp_cmp == 2 ? 0x4500u :"
+                      " (g_fp_cmp >= 0x100 ? ((unsigned)g_fp_cmp & 0x4700u) :"
+                      " g_fp_cmp == 2 ? 0x4500u :"
                       " g_fp_cmp < 0 ? 0x0100u :"
                       " g_fp_cmp > 0 ? 0x0000u : 0x4000u))")
             if insn.op_str.strip() in ("ax", "eax"):
@@ -3146,6 +3176,50 @@ class Lifter:
         return [f"/* FPU: {m} {insn.op_str} */"]
 
 
+# Flag setters whose conditions are computed from the result.
+#
+# The condition used to re-read the destination at the jcc. That is wrong as
+# soon as anything between the two moves it: MSVC's
+#
+#     dec  dword ptr [esp+0x18]
+#     pop  ecx
+#     jne  loop
+#
+# re-read [esp+0x18] four bytes further up the stack after the pop, so EA's
+# raster row writer in Def Jam: Fight for NY never saw its counter reach zero
+# and wrote 46 MB past a 42-pixel line, crashing the load of every fight.
+#
+# So the result is captured where the instruction runs -- _fr, sign-extended
+# from the operand's width -- and the source beforehand in _frb (sub/add
+# rebuild ordered compares from it). The conditions read those instead.
+RESULT_SNAPSHOT = frozenset({
+    "add", "sub", "adc", "sbb", "inc", "dec", "neg",
+    "and", "or", "xor", "shl", "shr", "sar",
+})
+
+_SNAP_SEXT = {1: "(int8_t)", 2: "(int16_t)", 4: "(int32_t)"}
+
+
+def _result_snapshot(insn):
+    """(statements before, statements after, operands for the conditions)."""
+    ops = insn.operands
+    width = _operand_width(ops[0]) or 4
+    sext = _SNAP_SEXT.get(width, "(int32_t)")
+    pre = []
+    post = [f"_fr = (uint32_t)(int32_t){sext}({_fmt_operand_read(ops[0])});"]
+    snap = [Operand(type="expr", reg="_fr", mem_size=width)]
+    if len(ops) >= 2:
+        if ops[1].type == "imm":
+            snap.append(ops[1])
+        else:
+            src_width = _operand_width(ops[1]) or width
+            src_sext = _SNAP_SEXT.get(src_width, "(int32_t)")
+            pre.append(f"_frb = (uint32_t)(int32_t){src_sext}"
+                       f"({_fmt_operand_read(ops[1])});")
+            snap.append(Operand(type="expr", reg="_frb", mem_size=src_width))
+    return pre, post, snap
+
+
 def lift_basic_block(lifter, bb, flag_state=None):
     """
     Lift a basic block to C statements.
@@ -3174,6 +3248,25 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
     while i < len(insns):
         curr = insns[i]
+
+        # Flags reaching this block from predecessors that disagree on what
+        # set them (see JOIN_FLAGS). Each predecessor's own condition is
+        # picked at run time by the block control came from.
+        if last_flag_setter == JOIN_FLAGS:
+            stmt = None
+            if ((curr.is_cond_jump and curr.mnemonic not in ("jecxz", "jcxz"))
+                    or curr.mnemonic.startswith("set")
+                    or curr.mnemonic.startswith("cmov")):
+                stmt = _join_condition(lifter, curr, last_flag_ops)
+            if stmt is not None:
+                stmts.append(stmt)
+                i += 1
+                continue
+            if (curr.is_cond_jump or curr.mnemonic.startswith("set")
+                    or curr.mnemonic.startswith("cmov")):
+                # Not expressible: the consumer takes the old fallback.
+                last_flag_setter = None
+                last_flag_ops = []
 
         # Try cmp/test + jcc pattern first (2-instruction match)
         match = try_match_cmp_jcc(insns, i, lifter=lifter)
@@ -3260,10 +3353,22 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 curr, curr.operands, preserve_carry=preserve)
         else:
             results = lifter.lift_instruction(insns[i])
-        stmts.extend(results)
+
+        snap_ops = None
+        if (curr.mnemonic in RESULT_SNAPSHOT and curr.operands
+                and curr.operands[0].type in ("reg", "mem")):
+            pre, post, snap_ops = _result_snapshot(curr)
+            stmts.extend(pre)
+            stmts.extend(results)
+            stmts.extend(post)
+        else:
+            stmts.extend(results)
 
         # Track flag-setting instructions
-        if curr.mnemonic in FLAG_SETTERS:
+        if snap_ops is not None:
+            last_flag_setter = curr.mnemonic
+            last_flag_ops = snap_ops
+        elif curr.mnemonic in FLAG_SETTERS:
             last_flag_setter = curr.mnemonic
             last_flag_ops = list(curr.operands)
         elif curr.mnemonic in _FLAGS_UNDEFINED:
@@ -3312,5 +3417,76 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
         i += 1
 
+    # A join state does not travel on: this block may itself be a predecessor
+    # that records _pfrom, which would overwrite the value the join reads.
+    if last_flag_setter == JOIN_FLAGS:
+        last_flag_setter = None
     out_flag_state = (last_flag_setter, last_flag_ops) if last_flag_setter else None
     return stmts, out_flag_state
+
+
+# Flag state at a block whose predecessors left the flags in different ways.
+#
+# The translator used to give up there and lower the branch to _flags, which
+# nothing assigns, so the branch was constant. MSVC produces this shape for
+# every inlined refcount release:
+#
+#     mov ecx, [esi]            |   ...
+#     dec ecx                   |   dec eax        ; other path
+#     mov eax, ecx              |   mov [esi], eax
+#     mov [esi], ecx            |   jmp join
+#     cmp eax, ebx              |
+#   join:
+#     jne keep                  ; free when the count reached zero
+#
+# and with the branch constant every release freed the object. In Def Jam that
+# destroyed each APT movie request inside the call that created it.
+#
+# The state carries [(pred_start, (setter, ops)), ...]; the consuming jcc
+# evaluates the predecessor's own condition, selected by _pfrom, which the
+# translator sets at the end of each of those predecessors.
+JOIN_FLAGS = "__join__"
+
+
+def _join_expr(lifter, jcc, sources):
+    """The condition `jcc` at a flag join, selected per predecessor, or None
+    when some predecessor's flags cannot be expressed."""
+    conds = []
+    for pred, (setter, ops) in sources:
+        result = _make_condition(jcc, setter, ops)
+        if not result:
+            return None
+        conds.append((pred, result[0]))
+    if len({c for _, c in conds}) == 1:
+        return conds[0][1]
+    expr = conds[-1][1]
+    for pred, c in reversed(conds[:-1]):
+        expr = f"(_pfrom == 0x{pred:08X}u ? {c} : {expr})"
+    lifter.pfrom_preds.update(p for p, _ in conds)
+    return expr
+
+
+def _join_condition(lifter, insn, sources):
+    """Lower a flag consumer (jcc, setcc, cmovcc) at a flag join, or None when
+    it cannot be expressed (the caller then falls back as before)."""
+    m = insn.mnemonic
+    if m.startswith("set") and insn.operands:
+        expr = _join_expr(lifter, "j" + m[3:], sources)
+        if expr is None:
+            return None
+        return (_fmt_operand_write(insn.operands[0], f"({expr}) ? 1 : 0")
+                + f" /* {m} (flag join) */")
+    if m.startswith("cmov") and len(insn.operands) >= 2:
+        expr = _join_expr(lifter, "j" + m[4:], sources)
+        if expr is None:
+            return None
+        return (f"if ({expr}) "
+                + _fmt_operand_write(insn.operands[0],
+                                     _fmt_operand_read(insn.operands[1]))
+                + f" /* {m} (flag join) */")
+    expr = _join_expr(lifter, m, sources)
+    if expr is None:
+        return None
+    desc = COND_MAP.get(m, (None, None, m))[2]
+    return _emit_cond_goto(expr, m, f"{desc} (flag join)",
+                           insn.jump_target, lifter)

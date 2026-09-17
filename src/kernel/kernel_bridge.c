@@ -41,6 +41,9 @@
  * ctype.h/wctype.h are not pulled in by the platform headers on either host. */
 #include <string.h>
 #include <ctype.h>
+#ifdef _WIN32
+#include <mmsystem.h>   /* timeBeginPeriod: 1 ms timer thread, see below */
+#endif
 #include <wctype.h>
 
 /* Access to recompiled code registers. Per-thread: RECOMP_TLS comes from
@@ -1310,6 +1313,7 @@ static void bridge_NtCreateEvent(void)
 
 static HANDLE ke_shadow_lookup(uint32_t guest_va);
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
+static HANDLE ke_shadow_adopt_event(uint32_t guest_va);
 static HANDLE bridge_resolve_handle(uint32_t token);
 
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
@@ -1324,6 +1328,8 @@ static void bridge_KeSetEvent(void)
     (void)wait;
 
     h = ke_shadow_lookup(guest_va);
+    if (!h)
+        h = ke_shadow_adopt_event(guest_va);
     if (!h)
         h = bridge_resolve_handle(guest_va);
     if (!h)
@@ -1345,6 +1351,8 @@ static void bridge_KeWaitForSingleObject(void)
     HANDLE h;
 
     h = ke_shadow_lookup(object);
+    if (!h)
+        h = ke_shadow_adopt_event(object);
     if (!h)
         h = bridge_resolve_handle(object);
     if (!h)
@@ -1576,6 +1584,33 @@ static void bridge_KeDelayExecutionThread(void)
     uint32_t alertable    = STACK_ARG(1);
     uint32_t interval_ptr = STACK_ARG(2);
 
+    /* The interval is a guest pointer, and a guest pointer that is not inside
+     * the mapped window must not be dereferenced here: the implementation's
+     * only guard is a NULL check, so anything else faults in the runtime
+     * rather than in the title. Def Jam: Fight for NY reaches this with
+     * 0xFFFFFFFF, and the fault landed in xbox_KeDelayExecutionThread with
+     * nothing to say which of its three callers was responsible.
+     *
+     * STATUS_INVALID_PARAMETER is what the kernel returns for a bad pointer,
+     * so declining is also the accurate answer. The caller's guest address is
+     * logged once per distinct value, because the useful information is which
+     * call site does this, not how often. */
+    if (interval_ptr &&
+        (uint64_t)interval_ptr + 8 > (uint64_t)xbox_GetMappedSize()) {
+        static uint32_t seen[8];
+        static unsigned n_seen;
+        unsigned i;
+        for (i = 0; i < n_seen && seen[i] != interval_ptr; i++) { }
+        if (i == n_seen && n_seen < 8) {
+            seen[n_seen++] = interval_ptr;
+            fprintf(stderr, "  [KERNEL] KeDelayExecutionThread: interval "
+                    "pointer 0x%08X is outside guest memory, declined "
+                    "(caller 0x%08X)\n", interval_ptr, g_xbox_kernel_caller);
+            fflush(stderr);
+        }
+        g_eax = (uint32_t)STATUS_INVALID_PARAMETER;
+        return;
+    }
 
     g_eax = (uint32_t)xbox_KeDelayExecutionThread(
         (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
@@ -1790,6 +1825,25 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
         return 0;
     }
 
+    /* Which deferred routines a title actually runs, once per routine. A DPC
+     * that is queued every frame but whose routine is not the one expected is
+     * indistinguishable from one that never runs, and this is the only place
+     * that can tell them apart. */
+    {
+        enum { SLOTS = 16 };
+        static uint32_t seen[SLOTS];
+        static unsigned n_seen;
+        unsigned i;
+        for (i = 0; i < n_seen && seen[i] != routine; i++) { }
+        if (i == n_seen && n_seen < SLOTS) {
+            seen[n_seen++] = routine;
+            fprintf(stderr, "  [KERNEL] DPC routine sub_%08X (context "
+                    "0x%08X -> 0x%08X) runs\n", routine, context,
+                    context ? BRIDGE_MEM32(context) : 0);
+            fflush(stderr);
+        }
+    }
+
     BRIDGE_MEM32(dpc_va + 20) = arg1;
     BRIDGE_MEM32(dpc_va + 24) = arg2;
 
@@ -1958,6 +2012,7 @@ static int kernel_raise_interrupt(uint32_t vector)
  */
 #define XBOX_NV2A_REG_BASE     0xFD000000u
 #define NV2A_PMC_INTR_0        0x00000100u
+#define NV2A_PMC_INTR_EN_0     0x00000140u
 #define NV2A_PMC_INTR_PCRTC    (1u << 24)
 #define NV2A_PCRTC_INTR_0      0x00600100u
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
@@ -1986,12 +2041,69 @@ static void kernel_vblank_tick(void)
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
 
     {
-        static unsigned n;
+        static unsigned n, claims, declines;
+        /* The enable register as the ISR is about to see it. A D3D8 ISR masks
+         * PMC_INTR_EN_0 on entry and leaves its DPC to restore it, so a vblank
+         * chain that stops after a few frames shows up here as an enable stuck
+         * at zero -- which says the DPC is the broken link, not the interrupt. */
+        uint32_t en = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_EN_0);
         int claimed = kernel_raise_interrupt(NV2A_VECTOR);
+
+        if (claimed > 0) claims++; else declines++;
         if (n++ < 3)
             fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
                     claimed < 0 ? "not callable" :
                     claimed ? "claimed it" : "declined it");
+        if (getenv("RECOMP_VBLANK_TRACE") && (n % 60) == 0)
+            fprintf(stderr, "  [NV2A] vblank #%u: claimed %u declined %u,"
+                    " PMC_INTR_EN_0 = 0x%08X\n", n, claims, declines, en);
+        fflush(stderr);
+    }
+}
+
+/* The GPU timer's alarm, delivered.
+ *
+ * Xbox D3D8 schedules its timed callbacks on NV2A's PTIMER: it writes a
+ * deadline to ALARM_0, enables the timer interrupt, and services the alarm
+ * from the same ISR that takes vblank. xbox_Nv2aPtimerAlarmDue() answers
+ * whether the counter has passed the deadline and posts PTIMER's own status
+ * bit; the summary bit and the ISR call belong here, next to vblank, because
+ * this is the thread that has a guest stack and TIB to call into.
+ *
+ * Bit 20 of PMC_INTR_0 is PTIMER -- the value D3D8's own ISR tests before it
+ * services the timer (0x00223028 in Def Jam: Fight for NY, XDK 5849).
+ *
+ * Opt-in through RECOMP_PTIMER: raising an interrupt a title was not getting
+ * changes its behaviour, so a title that already worked keeps working until
+ * someone asks for this.
+ */
+#define NV2A_PMC_INTR_PTIMER (1u << 20)
+
+int xbox_Nv2aPtimerAlarmDue(void);
+
+static void kernel_ptimer_tick(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0)
+        enabled = getenv("RECOMP_PTIMER") != NULL;
+    if (!enabled)
+        return;
+    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
+        return;
+    if (!xbox_Nv2aPtimerAlarmDue())
+        return;
+
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0) |= NV2A_PMC_INTR_PTIMER;
+    {
+        static unsigned n, claims;
+        int claimed = kernel_raise_interrupt(NV2A_VECTOR);
+        if (claimed > 0) claims++;
+        if (n++ < 3 || (n % 60) == 0)
+            fprintf(stderr, "  [NV2A] ptimer alarm #%u -> ISR %s (claimed %u)\n",
+                    n, claimed < 0 ? "not callable"
+                                   : claimed ? "claimed it" : "declined it",
+                    claims);
         fflush(stderr);
     }
 }
@@ -2253,13 +2365,40 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         g_fs_base = tib;
     }
 
+    /* One-millisecond scheduling for this thread's sleeps.
+     *
+     * Everything this loop delivers is late by up to one sleep, and Windows
+     * rounds a Sleep(10) up to its default 15.6 ms tick. That was survivable
+     * for kernel timers, but not for the GPU timer's alarm: Xbox D3D8 re-arms
+     * a periodic callback for "one period minus how late the last one was",
+     * so an alarm delivered 18.8 ms late against a 16.7 ms period produces a
+     * deadline already in the past, which D3D8 refuses -- and the periodic
+     * callback is gone for good. In Def Jam: Fight for NY that callback is
+     * what drives the game loop, which ran for exactly two frames.
+     *
+     * timeBeginPeriod raises the resolution process-wide; the matching
+     * timeEndPeriod is left to process exit, which is when this loop ends. */
+#ifdef _WIN32
+    timeBeginPeriod(1);
+#endif
+
     for (;;) {
         long long now;
         int i;
 
-        Sleep(10);
+        Sleep(1);
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
+        /* The timer alarm goes after the drain, not before it.
+         *
+         * A D3D8 ISR masks PMC_INTR_EN_0 on entry and leaves its deferred
+         * routine to restore it, and it declines any interrupt that arrives
+         * while the mask is down. Raised between the vblank and the drain,
+         * every alarm landed in that window and was refused -- so the timed
+         * callback it carries was never serviced and the title stopped
+         * re-arming it. */
+        kernel_ptimer_tick();  /* the GPU timer's alarm, which D3D8 schedules on */
+        kernel_drain_dpcs();
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
@@ -2458,19 +2597,62 @@ static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t inf
 #define BRIDGE_HANDLE_MAX  16384
 static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
 
+/*
+ * The table is shared by every guest thread, and claiming a slot is a scan
+ * followed by a store. Unserialised, two threads that create an object at the
+ * same time both see slot i free and both take it: one native handle is lost,
+ * and the token the loser holds now names the winner's object. The symptom is
+ * a Win32 call deep in the runtime handed something that is not its handle --
+ * for Def Jam: Fight for NY, a fault inside xbox_NtSetEvent while DirectSound
+ * and the title's loader were both starting up.
+ *
+ * The same lock covers releasing a slot, so a slot cannot be freed out from
+ * under a scan that is about to reuse it.
+ */
+static CRITICAL_SECTION s_handle_cs;
+static INIT_ONCE s_handle_cs_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK handle_cs_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&s_handle_cs);
+    return TRUE;
+}
+
+static void handle_lock(void)
+{
+    InitOnceExecuteOnce(&s_handle_cs_once, handle_cs_init, NULL, NULL);
+    EnterCriticalSection(&s_handle_cs);
+}
+
+static void handle_unlock(void)
+{
+    LeaveCriticalSection(&s_handle_cs);
+}
+
 static uint32_t bridge_handle_token(HANDLE h)
 {
+    uint32_t token = 0;
     int i;
+
     if (!h || h == INVALID_HANDLE_VALUE) return 0;
+
+    handle_lock();
     for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == h) return BRIDGE_HANDLE_TAG | (uint32_t)i;
-    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == NULL) {
-            s_handle_table[i] = h;
-            return BRIDGE_HANDLE_TAG | (uint32_t)i;
-        }
-    fprintf(stderr, "  [BRIDGE] handle table full\n");
-    return 0;
+        if (s_handle_table[i] == h) { token = BRIDGE_HANDLE_TAG | (uint32_t)i; break; }
+    if (!token) {
+        for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
+            if (s_handle_table[i] == NULL) {
+                s_handle_table[i] = h;
+                token = BRIDGE_HANDLE_TAG | (uint32_t)i;
+                break;
+            }
+    }
+    handle_unlock();
+
+    if (!token)
+        fprintf(stderr, "  [BRIDGE] handle table full\n");
+    return token;
 }
 
 /* Store a native HANDLE into a 32-bit Xbox memory slot (as a token). */
@@ -2520,8 +2702,11 @@ static HANDLE bridge_take_handle(uint32_t token)
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
         uint32_t i = token & BRIDGE_HANDLE_MASK;
         if (i > 0 && i < BRIDGE_HANDLE_MAX) {
-            HANDLE h = s_handle_table[i];
+            HANDLE h;
+            handle_lock();
+            h = s_handle_table[i];
             s_handle_table[i] = NULL;
+            handle_unlock();
             return h;
         }
     }
@@ -3862,7 +4047,14 @@ static void bridge_KeAlertThread(void)
  *
  * KeWaitForSingleObject is routed; the multiple-object sibling was not. Like
  * NtWaitForMultipleObjectsEx, the Objects[] array in guest memory holds 32-bit
- * handle tokens, so each is resolved before the native wait sees it. */
+ * handle tokens, so each is resolved before the native wait sees it.
+ *
+ * The Ke* form takes dispatcher objects, not handles, so each entry is first
+ * looked up in the shadow table the way KeWaitForSingleObject does -- and a
+ * KEVENT the title built by hand is adopted on sight (see
+ * ke_shadow_adopt_event). Passing the raw guest VA through as a HANDLE made
+ * the wait fail immediately, and XAPI's timer thread re-issued it in a tight
+ * loop: 95 million calls in 30 seconds, with the main thread parked behind it. */
 #define BRIDGE_MAXIMUM_WAIT_OBJECTS 64
 
 static void bridge_KeWaitForMultipleObjects(void)
@@ -3881,9 +4073,15 @@ static void bridge_KeWaitForMultipleObjects(void)
     }
     if (count > BRIDGE_MAXIMUM_WAIT_OBJECTS)
         count = BRIDGE_MAXIMUM_WAIT_OBJECTS;
-    for (i = 0; i < count; i++)
-        handles[i] = bridge_resolve_handle(
-            objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0);
+    for (i = 0; i < count; i++) {
+        uint32_t obj = objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0;
+        HANDLE h = ke_shadow_lookup(obj);
+        if (!h)
+            h = ke_shadow_adopt_event(obj);
+        if (!h)
+            h = bridge_resolve_handle(obj);
+        handles[i] = h;
+    }
 
     g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
         count, (PVOID *)handles, wait_type,
@@ -5568,6 +5766,57 @@ static HANDLE ke_shadow_lookup(uint32_t guest_va)
     return h;
 }
 
+/* Adopt a KEVENT the title initialised by hand.
+ *
+ * KeInitializeEvent inserts a host event into the shadow table and the
+ * Set/Reset/Pulse/Wait bridges find the guest VA there. But a KEVENT is only
+ * four dwords, and XAPI's timer thread (Def Jam: Fight for NY, XDK 5849)
+ * builds its wake-up event inline on its own stack -- Type=1, Size=4,
+ * SignalState=0, wait list pointing at itself -- without ever calling
+ * KeInitializeEvent. The lookup missed, the VA went to
+ * WaitForMultipleObjectsEx as a HANDLE, the wait failed on the spot, and the
+ * thread re-issued it 95 million times in 30 seconds.
+ *
+ * A dispatcher header inside the mapped guest window that reads as an event
+ * (Type 0 = notification, 1 = synchronization; Size = 4 dwords) gets a host
+ * event created for it on first sight, keyed by VA exactly as
+ * KeInitializeEvent would have done. Anything else returns NULL and the
+ * caller keeps its previous fallback. Done under the shadow lock so two
+ * threads meeting the same event for the first time share one handle. */
+static HANDLE ke_shadow_adopt_event(uint32_t guest_va)
+{
+    uint8_t type, size;
+    int32_t signal;
+    HANDLE h;
+
+    if (guest_va < 0x10000u ||
+        (uint64_t)guest_va + 16 > (uint64_t)xbox_GetMappedSize())
+        return NULL;
+
+    ke_shadow_init();
+    EnterCriticalSection(&g_ke_shadow_cs);
+
+    h = ke_shadow_lookup(guest_va);
+    if (!h) {
+        type = BRIDGE_MEM8(guest_va + 0);
+        size = BRIDGE_MEM8(guest_va + 2);
+        if (type <= 1 && size == 4) {
+            signal = (int32_t)BRIDGE_MEM32(guest_va + 4);
+            h = CreateEventW(NULL, type == 0 ? TRUE : FALSE,
+                             signal ? TRUE : FALSE, NULL);
+            if (h) {
+                ke_shadow_insert(guest_va, h);
+                fprintf(stderr, "  [KERNEL] KEVENT at 0x%08X was initialised "
+                        "by hand (type=%u state=%d): adopted into the shadow "
+                        "table\n", guest_va, type, signal);
+            }
+        }
+    }
+
+    LeaveCriticalSection(&g_ke_shadow_cs);
+    return h;
+}
+
 /* Remove (and close) the mapping for a guest object VA. */
 static void ke_shadow_remove(uint32_t guest_va)
 {
@@ -6352,6 +6601,8 @@ static void bridge_KePulseEvent(void)
 
     h = ke_shadow_lookup(guest_va);
     if (!h)
+        h = ke_shadow_adopt_event(guest_va);
+    if (!h)
         h = XBOX_TO_NATIVE(guest_va);
     if (h)
         PulseEvent(h);
@@ -6409,6 +6660,8 @@ static void bridge_KeResetEvent(void)
     HANDLE h;
 
     h = ke_shadow_lookup(guest_va);
+    if (!h)
+        h = ke_shadow_adopt_event(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
     if (h)
@@ -8641,8 +8894,28 @@ static void kernel_watch_arm_once(void)
         g_kernel_watch_va = (uint32_t)strtoul(env, NULL, 0);
 }
 
-/* Current dispatching slot */
-static int g_kernel_dispatch_slot = -1;
+/* Current dispatching slot.
+ *
+ * Thread-local, and it has to be. Every kernel call is two steps:
+ * recomp_lookup_kernel() records the slot and hands back this function, and
+ * the ICALL macro then calls it, which reads the slot back. As a plain global
+ * that hand-off is shared by every guest thread, so a second thread arriving
+ * between the two steps replaces the first thread's slot with its own.
+ *
+ * The first thread then runs the wrong bridge and -- far worse -- pops the
+ * wrong number of stdcall argument bytes off its own simulated stack. The
+ * caller's subsequent `pop`s run high or low by the difference and it returns
+ * with its callee-saved registers holding someone else's data, silently and
+ * frames away from the kernel call.
+ *
+ * In Def Jam: Fight for NY, with six guest threads making tens of thousands of
+ * kernel calls a second, this surfaced as a crash in a different function on
+ * every run. The one that gave it away: a DirectSound method whose `esi` came
+ * back holding 1 -- the WaitMode argument of a KeDelayExecutionThread call on
+ * another thread -- so it read its object pointer out of the middle of the
+ * code section.
+ */
+static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
 static void kernel_thunk_dispatch(void)
 {

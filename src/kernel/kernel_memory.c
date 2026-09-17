@@ -10,6 +10,8 @@
  */
 
 #include "kernel.h"
+
+uint32_t xbox_HeapFreeBytes(void);   /* xbox_memory_layout.c */
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
@@ -126,24 +128,26 @@ VOID __stdcall xbox_MmFreeSystemMemory(PVOID BaseAddress, ULONG NumberOfBytes)
 
 NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics)
 {
-    MEMORYSTATUSEX ms;
-    ms.dwLength = sizeof(ms);
-
     if (!MemoryStatistics)
         return STATUS_INVALID_PARAMETER;
-
-    if (!GlobalMemoryStatusEx(&ms))
-        return STATUS_UNSUCCESSFUL;
 
     memset(MemoryStatistics, 0, sizeof(XBOX_MM_STATISTICS));
     MemoryStatistics->Length = sizeof(XBOX_MM_STATISTICS);
 
-    /* Xbox has 64MB RAM. Report plausible values. */
+    /* Xbox has 64MB RAM. The free count is what the guest heap can actually
+     * still hand out, not anything about the host.
+     *
+     * Titles size their own allocators from it. Def Jam: Fight for NY takes
+     * GlobalMemoryStatus's dwAvailPhys, subtracts a 14 MB reserve and makes
+     * the rest its base heap. The old value -- the host's free memory, which
+     * on any PC is over 64 MB and was then halved to 32 MB -- left that heap
+     * at 18 MB, and the front end ran out of it loading its second screen:
+     * the allocator returned NULL and the movie decompressed over the code. */
     ULONG page_size = 4096;
     MemoryStatistics->TotalPhysicalPages = 64 * 1024 * 1024 / page_size; /* 16384 pages */
-    MemoryStatistics->AvailablePages = (ULONG)(ms.ullAvailPhys / page_size);
+    MemoryStatistics->AvailablePages = xbox_HeapFreeBytes() / page_size;
     if (MemoryStatistics->AvailablePages > MemoryStatistics->TotalPhysicalPages)
-        MemoryStatistics->AvailablePages = MemoryStatistics->TotalPhysicalPages / 2;
+        MemoryStatistics->AvailablePages = MemoryStatistics->TotalPhysicalPages;
 
     return STATUS_SUCCESS;
 }
