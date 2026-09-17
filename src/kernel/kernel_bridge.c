@@ -3821,9 +3821,53 @@ static void bridge_NtCreateMutant(void)
  * Memory model: a handle token in, an optional 4-byte LONG out through a guest
  * address. Nothing allocates, frees, or hands back a host pointer.
  */
+/* Who is taking and dropping this lock, and how often.
+ *
+ * Def Jam: Fight for NY makes about 630,000 mutant waits and releases a
+ * second -- a poll loop, not ordinary locking -- and each one is a host
+ * kernel object operation. RECOMP_MUTANT_TRACE=1 counts the guest return
+ * addresses so the loop can be named. */
+static void mutant_trace(void)
+{
+    static int on = -1;
+    static struct { uint32_t site, handle; unsigned long count; } top[16];
+    static int n;
+    static ULONGLONG next;
+    uint32_t site, handle;
+    int i;
+
+    if (on < 0)
+        on = getenv("RECOMP_MUTANT_TRACE") != NULL;
+    if (!on)
+        return;
+    site = g_xbox_kernel_caller;           /* the guest's return address */
+    handle = STACK_ARG(0);
+    for (i = 0; i < n; i++)
+        if (top[i].site == site && top[i].handle == handle) {
+            top[i].count++;
+            break;
+        }
+    if (i == n && n < 16) {
+        top[n].site = site;
+        top[n].handle = handle;
+        top[n].count = 1;
+        n++;
+    }
+    if (GetTickCount64() >= next) {
+        next = GetTickCount64() + 5000;
+        fprintf(stderr, "  [MUTANT] callers so far:\n");
+        for (i = 0; i < n; i++)
+            fprintf(stderr, "  [MUTANT]   from guest 0x%08X on handle 0x%08X: %lu\n",
+                    top[i].site, top[i].handle, top[i].count);
+        fflush(stderr);
+    }
+}
+
 static void bridge_NtReleaseMutant(void)
 {
     uint32_t count_va = STACK_ARG(1);
+
+    mutant_trace();
 
     g_eax = (uint32_t)xbox_NtReleaseMutant(
         bridge_resolve_handle(STACK_ARG(0)),

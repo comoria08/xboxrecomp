@@ -180,6 +180,119 @@ NTSTATUS __stdcall xbox_NtReleaseSemaphore(
 /*
  * Map Win32 WaitFor* return codes to NTSTATUS.
  */
+/* ── Mutants in user mode ───────────────────────────────────────────────
+ *
+ * A mutant is a recursive lock owned by a thread, which is exactly a Win32
+ * CRITICAL_SECTION -- but it was modelled with a Win32 mutex, a kernel
+ * object, so every take and drop cost a system call. Def Jam: Fight for NY
+ * does about 630,000 of each per second (its own code polls a queue that
+ * way): the front end and the intro videos ran at 8 frames a second while
+ * the CPU sat in NtReleaseMutant.
+ *
+ * The mutex handle is still created -- it is what identifies the object
+ * everywhere else, and a wait on several objects at once can still use it --
+ * but taking and dropping goes through a critical section beside it.
+ */
+#define XBOX_MAX_MUTANTS 128
+
+static struct {
+    HANDLE           handle;
+    CRITICAL_SECTION cs;
+} s_mutants[XBOX_MAX_MUTANTS];
+static LONG    s_mutant_count;
+static SRWLOCK s_mutant_lock = SRWLOCK_INIT;
+
+static CRITICAL_SECTION *xbox_mutant_find(HANDLE h)
+{
+    CRITICAL_SECTION *cs = NULL;
+    LONG i, n = s_mutant_count;
+
+    if (!h || !n)
+        return NULL;
+    AcquireSRWLockShared(&s_mutant_lock);
+    for (i = 0; i < n; i++)
+        if (s_mutants[i].handle == h) {
+            cs = &s_mutants[i].cs;
+            break;
+        }
+    ReleaseSRWLockShared(&s_mutant_lock);
+    return cs;
+}
+
+/* Track a mutant handle, whoever created it. */
+void xbox_mutant_track(HANDLE h, BOOL initial_owner)
+{
+    LONG n;
+
+    if (!h || xbox_mutant_find(h))
+        return;
+    AcquireSRWLockExclusive(&s_mutant_lock);
+    n = s_mutant_count;
+    if (n < XBOX_MAX_MUTANTS) {
+        s_mutants[n].handle = h;
+        InitializeCriticalSection(&s_mutants[n].cs);
+        if (initial_owner)
+            EnterCriticalSection(&s_mutants[n].cs);
+        s_mutant_count = n + 1;        /* published last: readers see it whole */
+    }
+    ReleaseSRWLockExclusive(&s_mutant_lock);
+}
+
+void xbox_mutant_forget(HANDLE h)
+{
+    LONG i;
+
+    AcquireSRWLockExclusive(&s_mutant_lock);
+    for (i = 0; i < s_mutant_count; i++)
+        if (s_mutants[i].handle == h) {
+            s_mutants[i].handle = NULL;   /* the section itself is left alone:
+                                           * another thread may be in it */
+            break;
+        }
+    ReleaseSRWLockExclusive(&s_mutant_lock);
+}
+
+/* Non-zero if the handle is a tracked mutant and the operation was done. */
+int xbox_mutant_release(HANDLE h)
+{
+    CRITICAL_SECTION *cs = xbox_mutant_find(h);
+    if (!cs)
+        return 0;
+    LeaveCriticalSection(cs);
+    return 1;
+}
+
+int xbox_mutant_wait(HANDLE h, DWORD ms, NTSTATUS *status)
+{
+    CRITICAL_SECTION *cs = xbox_mutant_find(h);
+
+    if (!cs)
+        return 0;
+    if (ms == 0) {
+        *status = TryEnterCriticalSection(cs) ? STATUS_SUCCESS : STATUS_TIMEOUT;
+        return 1;
+    }
+    if (ms == INFINITE) {
+        EnterCriticalSection(cs);
+        *status = STATUS_SUCCESS;
+        return 1;
+    }
+    {
+        ULONGLONG end = GetTickCount64() + ms;
+        for (;;) {
+            if (TryEnterCriticalSection(cs)) {
+                *status = STATUS_SUCCESS;
+                return 1;
+            }
+            if (GetTickCount64() >= end) {
+                *status = STATUS_TIMEOUT;
+                return 1;
+            }
+            Sleep(0);
+        }
+    }
+}
+
 static NTSTATUS xbox_wait_result_to_ntstatus(DWORD result, ULONG count)
 {
     if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + count)
@@ -200,7 +313,12 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObject(
     PLARGE_INTEGER Timeout)
 {
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
-    DWORD result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    DWORD result;
+    NTSTATUS st;
+
+    if (xbox_mutant_wait(Handle, ms, &st))
+        return st;
+    result = WaitForSingleObjectEx(Handle, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -220,6 +338,11 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
      */
     (void)WaitMode;
 
+    {
+        NTSTATUS st;
+        if (xbox_mutant_wait(Handle, ms, &st))
+            return st;
+    }
     result = WaitForSingleObjectEx(Handle, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
@@ -237,6 +360,33 @@ NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(
 
     /* WaitType: 0 = WaitAll, 1 = WaitAny (matches NT definitions) */
     bWaitAll = (WaitType == 0) ? TRUE : FALSE;
+
+    /* A tracked mutant is not signalled through its handle any more, so a
+     * wait naming one is polled instead. Rare: the title waits on events. */
+    {
+        ULONG i;
+        int has_mutant = 0;
+        for (i = 0; i < Count; i++)
+            if (xbox_mutant_find(Handles[i]))
+                has_mutant = 1;
+        if (has_mutant && !bWaitAll) {
+            ULONGLONG end = (ms == INFINITE) ? 0 : GetTickCount64() + ms;
+            for (;;) {
+                for (i = 0; i < Count; i++) {
+                    NTSTATUS st;
+                    if (xbox_mutant_wait(Handles[i], 0, &st)) {
+                        if (st == STATUS_SUCCESS)
+                            return (NTSTATUS)i;
+                    } else if (WaitForSingleObject(Handles[i], 0) == WAIT_OBJECT_0) {
+                        return (NTSTATUS)i;
+                    }
+                }
+                if (ms != INFINITE && GetTickCount64() >= end)
+                    return STATUS_TIMEOUT;
+                Sleep(1);
+            }
+        }
+    }
 
     result = WaitForMultipleObjectsEx(Count, Handles, bWaitAll, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, Count);
@@ -604,6 +754,7 @@ NTSTATUS __stdcall xbox_NtCreateMutant(
     }
 
     *MutantHandle = hMutex;
+    xbox_mutant_track(hMutex, InitialOwner);
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_SYNC,
         "NtCreateMutant: handle=%p initial_owner=%d", hMutex, InitialOwner);
@@ -613,6 +764,11 @@ NTSTATUS __stdcall xbox_NtCreateMutant(
 
 NTSTATUS __stdcall xbox_NtReleaseMutant(HANDLE MutantHandle, PLONG PreviousCount)
 {
+    if (xbox_mutant_release(MutantHandle)) {
+        if (PreviousCount)
+            *PreviousCount = 0;
+        return STATUS_SUCCESS;
+    }
     /*
      * ReleaseMutex reports the previous count only through its own bookkeeping,
      * which Win32 does not expose. Callers overwhelmingly use PreviousCount as

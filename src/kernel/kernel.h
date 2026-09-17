@@ -729,6 +729,12 @@ NTSTATUS __stdcall xbox_NtResumeThread(HANDLE ThreadHandle, PULONG PreviousSuspe
 NTSTATUS __stdcall xbox_NtClearEvent(HANDLE EventHandle);
 NTSTATUS __stdcall xbox_NtCreateMutant(PHANDLE MutantHandle, PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, BOOLEAN InitialOwner);
 NTSTATUS __stdcall xbox_NtReleaseMutant(HANDLE MutantHandle, PLONG PreviousCount);
+/* Mutants are recursive locks: tracked here so taking and dropping one
+ * stays in user mode (see kernel_sync.c). */
+void xbox_mutant_track(HANDLE h, BOOL initial_owner);
+void xbox_mutant_forget(HANDLE h);
+int  xbox_mutant_release(HANDLE h);
+int  xbox_mutant_wait(HANDLE h, DWORD ms, NTSTATUS *status);
 
 LONG     __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait);
 NTSTATUS __stdcall xbox_KeWaitForSingleObject(PVOID Object, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
