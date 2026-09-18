@@ -117,6 +117,11 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 
+/* Motifs d'ouverture : définis plus bas, avec la table d'énumération. */
+static BOOL name_has_wildcard(const WCHAR *name);
+static void remember_open_pattern(HANDLE h, const WCHAR *pattern);
+void xbox_forget_open_pattern(HANDLE h);
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -160,8 +165,27 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         }
     }
 
+    /* Un joker dans le dernier composant : le titre demande une énumération.
+     * On ouvre le dossier parent et on garde le motif pour plus tard. */
+    WCHAR open_pattern[64];
+    BOOL  has_pattern = FALSE;
+    {
+        WCHAR *last = wcsrchr(win_path, L'\\');
+        WCHAR *leaf = last ? last + 1 : win_path;
+        if (name_has_wildcard(leaf)) {
+            wcsncpy_s(open_pattern, ARRAYSIZE(open_pattern), leaf, _TRUNCATE);
+            has_pattern = TRUE;
+            if (last)
+                *last = 0;          /* ne garder que le dossier */
+            else
+                wcscpy_s(win_path, MAX_PATH, L".");
+            CreateOptions |= XBOX_FILE_DIRECTORY_FILE;
+        }
+    }
+
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
-        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
+        if (!has_pattern &&
+            (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF))
             CreateDirectoryW(win_path, NULL);
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
@@ -201,6 +225,9 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             default:                   return STATUS_UNSUCCESSFUL;
         }
     }
+
+    if (has_pattern)
+        remember_open_pattern(h, open_pattern);
 
     *FileHandle = h;
     if (IoStatusBlock) {
@@ -291,6 +318,10 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        /* Windows reuses handle values, so an enumeration pattern left
+         * attached to a closed handle would be inherited by whatever opens
+         * next and quietly filter its listing. */
+        xbox_forget_open_pattern(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -502,6 +533,31 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
                 info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
+
+                /* Un disque d'hôte moderne dépasse de loin ce qu'un titre Xbox
+                 * peut concevoir. Def Jam annonçait « il manque 24 blocs » avec
+                 * 884 Go annoncés libres : son calcul de blocs ne tient pas sur
+                 * un volume pareil. On plafonne donc à la taille réelle de la
+                 * partition de sauvegarde d'une Xbox (E:, 4,6 Go), ce qui est
+                 * à la fois plausible pour le titre et largement suffisant. */
+                {
+                    const ULONGLONG xbox_e_clusters = 4983472128ULL / cs;
+                    if ((ULONGLONG)info->TotalAllocationUnits.QuadPart > xbox_e_clusters)
+                        info->TotalAllocationUnits.QuadPart = xbox_e_clusters;
+                    if ((ULONGLONG)info->AvailableAllocationUnits.QuadPart >
+                        (ULONGLONG)info->TotalAllocationUnits.QuadPart)
+                        info->AvailableAllocationUnits.QuadPart =
+                            info->TotalAllocationUnits.QuadPart;
+                }
+                if (getenv("RECOMP_DIR_TRACE")) {
+                    fprintf(stderr, "  [VOL] %llu unites au total, %llu libres,"
+                            " %u octets par unite\n",
+                            (unsigned long long)info->TotalAllocationUnits.QuadPart,
+                            (unsigned long long)info->AvailableAllocationUnits.QuadPart,
+                            (unsigned)(info->BytesPerSector *
+                                       info->SectorsPerAllocationUnit));
+                    fflush(stderr);
+                }
             } else {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
@@ -569,6 +625,91 @@ typedef struct {
     WIN32_FIND_DATAW find_data;
 } DIR_CONTEXT;
 
+/* Motifs retenus à l'ouverture.
+ *
+ * Sur Xbox, XAPI énumère un dossier en ouvrant « dossier\motif » : le noyau
+ * accepte le joker dans le dernier composant, garde le motif attaché au
+ * handle, et le ressort aux appels d'énumération suivants. Win32 refuse tout
+ * nom contenant '*', donc cette ouverture échouait et le titre concluait
+ * qu'il n'y avait rien -- c'est ainsi que Def Jam ne voyait aucune de ses
+ * sauvegardes, pourtant présentes sur le disque. */
+#define MAX_OPEN_PATTERNS 32
+
+typedef struct {
+    HANDLE handle;
+    WCHAR  pattern[64];
+} OPEN_PATTERN;
+
+static OPEN_PATTERN s_open_patterns[MAX_OPEN_PATTERNS];
+static CRITICAL_SECTION s_pattern_cs;
+static BOOL s_pattern_cs_init = FALSE;
+
+static void pattern_lock(void)
+{
+    if (!s_pattern_cs_init) {
+        InitializeCriticalSection(&s_pattern_cs);
+        s_pattern_cs_init = TRUE;
+    }
+    EnterCriticalSection(&s_pattern_cs);
+}
+
+static BOOL name_has_wildcard(const WCHAR *name)
+{
+    for (; *name; name++)
+        if (*name == L'*' || *name == L'?')
+            return TRUE;
+    return FALSE;
+}
+
+static void remember_open_pattern(HANDLE h, const WCHAR *pattern)
+{
+    int i;
+
+    pattern_lock();
+    for (i = 0; i < MAX_OPEN_PATTERNS; i++) {
+        if (s_open_patterns[i].handle == NULL ||
+            s_open_patterns[i].handle == h) {
+            s_open_patterns[i].handle = h;
+            wcsncpy_s(s_open_patterns[i].pattern,
+                      ARRAYSIZE(s_open_patterns[i].pattern), pattern, _TRUNCATE);
+            break;
+        }
+    }
+    LeaveCriticalSection(&s_pattern_cs);
+}
+
+static BOOL take_open_pattern(HANDLE h, WCHAR *out, size_t out_len)
+{
+    BOOL found = FALSE;
+    int i;
+
+    if (!s_pattern_cs_init)
+        return FALSE;
+    EnterCriticalSection(&s_pattern_cs);
+    for (i = 0; i < MAX_OPEN_PATTERNS; i++) {
+        if (s_open_patterns[i].handle == h) {
+            wcsncpy_s(out, out_len, s_open_patterns[i].pattern, _TRUNCATE);
+            found = TRUE;
+            break;
+        }
+    }
+    LeaveCriticalSection(&s_pattern_cs);
+    return found;
+}
+
+void xbox_forget_open_pattern(HANDLE h)
+{
+    int i;
+
+    if (!s_pattern_cs_init)
+        return;
+    EnterCriticalSection(&s_pattern_cs);
+    for (i = 0; i < MAX_OPEN_PATTERNS; i++)
+        if (s_open_patterns[i].handle == h)
+            s_open_patterns[i].handle = NULL;
+    LeaveCriticalSection(&s_pattern_cs);
+}
+
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
@@ -594,6 +735,13 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
     }
     LeaveCriticalSection(&s_dir_cs);
     return NULL;
+}
+
+/* "." and ".." are a filesystem convention the Xbox does not have. */
+static BOOL is_dot_entry(const WCHAR *name)
+{
+    return name[0] == L'.' &&
+           (name[1] == 0 || (name[1] == L'.' && name[2] == 0));
 }
 
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
@@ -628,7 +776,13 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         WCHAR* clean_path = dir_path;
         if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
             clean_path += 4;
-        if (FileName && FileName->Buffer) {
+        WCHAR stored_pattern[64];
+        if (!(FileName && FileName->Buffer) &&
+            take_open_pattern(FileHandle, stored_pattern,
+                              ARRAYSIZE(stored_pattern))) {
+            swprintf_s(search_path, MAX_PATH, L"%s\\%s", clean_path,
+                       stored_pattern);
+        } else if (FileName && FileName->Buffer) {
             WCHAR pattern_wide[MAX_PATH];
             MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
                                 pattern_wide, MAX_PATH);
@@ -644,14 +798,38 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             return STATUS_NO_MORE_FILES;
         }
         ctx->first_done = TRUE;
-    } else {
-        if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
-            FindClose(ctx->find_handle);
-            ctx->find_handle = NULL;
-            ctx->file_handle = NULL;
-            IoStatusBlock->Status = STATUS_NO_MORE_FILES;
-            return STATUS_NO_MORE_FILES;
+        /* FATX has no "." or ".." entries, so the Xbox kernel never returns
+         * them and titles do not expect them. Handing them over derails an
+         * enumeration on the very first entry: Def Jam walks
+         * UDATA\<titleid>\* looking for save folders, and "." is not one. */
+        while (is_dot_entry(ctx->find_data.cFileName)) {
+            if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
+                FindClose(ctx->find_handle);
+                ctx->find_handle = NULL;
+                IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+                return STATUS_NO_MORE_FILES;
+            }
         }
+    } else {
+        do {
+            if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
+                FindClose(ctx->find_handle);
+                ctx->find_handle = NULL;
+                ctx->file_handle = NULL;
+                IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+                return STATUS_NO_MORE_FILES;
+            }
+        } while (is_dot_entry(ctx->find_data.cFileName));
+    }
+
+    /* RECOMP_DIR_TRACE=1 names every entry an enumeration hands back. What a
+     * title does with a directory listing is invisible otherwise, and a
+     * listing that looks right from here can still be missing what it wants. */
+    if (getenv("RECOMP_DIR_TRACE")) {
+        fprintf(stderr, "  [DIR] %ls%s\n", ctx->find_data.cFileName,
+                (ctx->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                    ? "  (dossier)" : "");
+        fflush(stderr);
     }
 
     entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
@@ -1151,6 +1329,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }
+        /* Skip "." and ".." for the same reason as the Win32 backend: FATX
+         * has no such entries, so no title expects them. */
+        if (de->d_name[0] == '.' &&
+            (de->d_name[1] == 0 || (de->d_name[1] == '.' && de->d_name[2] == 0)))
+            continue;
         if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0)
             break;
     }

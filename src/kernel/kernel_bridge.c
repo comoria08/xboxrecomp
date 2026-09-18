@@ -6484,10 +6484,15 @@ static void bridge_IoQueryFileInformation(void)
 static void bridge_IoQueryVolumeInformation(void)
 {
     (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
     (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
     (void)STACK_ARG(4);
+    if (getenv("RECOMP_DIR_TRACE")) {
+        fprintf(stderr, "  [VOL] IoQueryVolumeInformation appelé :"
+                " classe %u, longueur %u -- non implémenté\n",
+                (unsigned)STACK_ARG(1), (unsigned)STACK_ARG(2));
+        fflush(stderr);
+    }
+    (void)STACK_ARG(3);
     g_eax = 0xC000000D;  /* STATUS_INVALID_PARAMETER */
 }
 
@@ -8977,6 +8982,10 @@ static void kernel_watch_arm_once(void)
  */
 static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
+/* L'ordinal de l'appel noyau en cours, pour que les traces d'un étage
+ * inférieur (la traduction de chemins) puissent dire qui les appelle. */
+RECOMP_TLS uint32_t g_xbox_current_ordinal = 0;
+
 static void kernel_thunk_dispatch(void)
 {
     int slot = g_kernel_dispatch_slot;
@@ -8991,6 +9000,7 @@ static void kernel_thunk_dispatch(void)
     }
 
     ordinal = g_slot_ordinals[slot];
+    g_xbox_current_ordinal = ordinal;
     bridge = g_slot_bridges[slot];
 
     g_kernel_call_count++;

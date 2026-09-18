@@ -17,6 +17,15 @@
 #include <string.h>
 #include <ctype.h>
 
+/* Renseigné par le répartiteur du pont : l'ordinal de l'appel noyau en cours.
+ * Une trace de chemin sans son appelant ne dit pas grand-chose. (RECOMP_TLS
+ * vit dans l'en-tête du runtime généré, que ce fichier n'inclut pas.) */
+#ifdef _MSC_VER
+extern __declspec(thread) uint32_t g_xbox_current_ordinal;
+#else
+extern __thread uint32_t g_xbox_current_ordinal;
+#endif
+
 /*
  * Helper: check if an ANSI string starts with a prefix (case-insensitive).
  * Returns the number of chars consumed from the prefix, or 0 if no match.
@@ -412,7 +421,8 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     return TRUE;
 
 translate:
-    fprintf(stderr, "  [PATH] %s\n", xbox_path);
+    fprintf(stderr, "  [PATH] %s  (appel %u)\n", xbox_path,
+            g_xbox_current_ordinal);
     fflush(stderr);
     {
         WCHAR remainder_wide[MAX_PATH];
