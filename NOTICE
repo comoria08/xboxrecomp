@@ -6,6 +6,56 @@ not, and are included here under their original licences with their original
 copyright intact. They are other people's work and are credited as such.
 
 
+GPL-2.0-or-later — the MCPX DSP core, from xemu by way of Hatari
+----------------------------------------------------------------
+
+  READ THIS FIRST IF YOU DISTRIBUTE A BINARY.
+
+  Everything else in this repository can be linked into a proprietary or
+  MIT-licensed program. The files in src/apu/dsp/ cannot. They are the
+  DSP56300 emulator that the Xbox's audio DSP runs on, and they descend from
+  Hatari's DSP M56001 emulation, which is GPL:
+
+    src/apu/dsp/dsp.c          MCPX DSP emulator
+    src/apu/dsp/dsp.h          (c) 2015 espes; 2020-2025 Matt Borgerson
+    src/apu/dsp/dsp_state.h    Adapted from Hatari DSP M56001 emulation,
+    src/apu/dsp/dsp_cpu.c      (c) 2001-2008 ARAnyM developer team,
+    src/apu/dsp/dsp_cpu.h      adaption to Hatari (c) 2008 Thomas Huth
+    src/apu/dsp/dsp_cpu_regs.h
+    src/apu/dsp/dsp_emu.c.inc
+    src/apu/dsp/dsp_dis.c.inc
+    src/apu/dsp/debug.h
+
+  src/apu/dsp/dsp_compat.h is this project's own file, released under the
+  same licence because it exists only to host the above. Our additions inside
+  dsp_cpu.c and dsp_emu.c.inc (the EXTRACT/EXTRACTU/INSERT, BScc, shift, CLB
+  and MERGE instructions, written from the DSP56300 Family Manual, and the
+  non-fatal handling of unknown opcodes) are marked in place and are likewise
+  GPL-2.0-or-later.
+
+  Two files in that directory are LGPL-2.1-or-later, not GPL, and say so in
+  their own headers: dsp_dma.c and dsp_dma.h.
+
+  Licensed under the GNU General Public License, version 2 or (at your option)
+  any later version. The full text is in LICENSES/GPL-2.0.txt.
+
+  What this means in practice: an executable linked against src/apu/dsp/ is a
+  combined work covered by the GPL. It may be distributed only under the GPL,
+  with complete corresponding source offered to whoever receives it. The MIT
+  files stay MIT on their own terms -- MIT is GPL-compatible, which is what
+  makes the combination lawful -- but the binary as a whole is not MIT and
+  must not be presented as such.
+
+  Note that src/apu/apu_state.h includes dsp/dsp.h, dsp/dsp_cpu.h,
+  dsp/dsp_dma.h and dsp/dsp_state.h for the DSP structure definitions, so the
+  APU is bound to the GPL code at compile time and not merely at link time.
+  Building a non-GPL audio path means removing those includes as well as the
+  dsp/ sources from src/apu/CMakeLists.txt, and restoring the structure
+  definitions apu_state.h used to carry. Turning the DSP off at run time
+  (RECOMP_APU_DSP=0, the default) changes what executes; it does not change
+  what the binary contains or the licence it carries.
+
+
 LGPL-2.1-or-later — extracted from xemu
 ---------------------------------------
 

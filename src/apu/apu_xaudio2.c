@@ -163,6 +163,22 @@ int xa2_get_buffer_size(void)
     return XA2_BUF_SAMPLES;
 }
 
+/* How many submitted buffers the card has not played yet.
+ *
+ * This is the only honest clock in the system: the card consumes exactly
+ * 48000 samples a second, and the APU frame thread has to match it. Left to
+ * free-run the thread drifts, and every drift ends in a click -- too fast and
+ * a submission is refused above, too slow and the card runs dry. */
+int xa2_buffers_queued(void)
+{
+    XAUDIO2_VOICE_STATE state;
+
+    if (!g_xa2_initialized || !g_xa2_source) return -1;
+    IXAudio2SourceVoice_GetState(g_xa2_source, &state,
+                                 XAUDIO2_VOICE_NOSAMPLESPLAYED);
+    return (int)state.BuffersQueued;
+}
+
 #else /* !_WIN32 -- POSIX stubs (no audio output yet) */
 
 int  xa2_init(void)                                   { return 0; }
@@ -170,5 +186,6 @@ void xa2_shutdown(void)                               {}
 int  xa2_is_active(void)                              { return 0; }
 int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
 int  xa2_get_buffer_size(void)                        { return 0; }
+int  xa2_buffers_queued(void)                         { return -1; }
 
 #endif /* _WIN32 */

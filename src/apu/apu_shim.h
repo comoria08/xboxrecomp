@@ -93,34 +93,61 @@ static inline void qemu_thread_join(QemuThread *t) {
  * We access Xbox RAM via a global pointer, same as NV2A.
  * ============================================================ */
 
-extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
+extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox VA 0 */
+
+/* Where a physical address the title programmed into an APU register lands in
+ * our flat guest view.
+ *
+ * Two kinds of address arrive here, and they are not the same memory:
+ *
+ *   0x00000000-0x03FFFFFF   ordinary RAM. Physical equals guest VA.
+ *
+ *   0x80000000+             the contiguous window. MmAllocateContiguousMemory
+ *                           hands the title addresses there -- physical page P
+ *                           is visible at 0x80000000 + P -- and the runtime
+ *                           maps that window separately from RAM, at that same
+ *                           address in the flat view. So it is already the
+ *                           offset we want, and must NOT be masked down.
+ *
+ * Masking everything to 64 MB, which is what this did, sent every audio buffer
+ * and every scatter-gather table the title allocated contiguously to an
+ * unrelated and mostly empty page of RAM. That is why voices decoded silence
+ * with plausible-looking addresses, and why the DSP bootstrapped from a page
+ * table of zeros: the addresses were right and we were reading the wrong
+ * memory.
+ */
+static inline uint32_t apu_phys_off(uint32_t addr) {
+    if (addr >= 0x80000000u && addr < 0x84000000u)
+        return addr;                /* contiguous window: flat guest address */
+    return addr & 0x03FFFFFFu;      /* RAM */
+}
 
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint32_t *)(g_apu_ram_ptr + apu_phys_off((uint32_t)addr));
 }
 static inline uint16_t lduw_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint16_t *)(g_apu_ram_ptr + apu_phys_off((uint32_t)addr));
 }
 static inline uint8_t ldub_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint8_t *)(g_apu_ram_ptr + apu_phys_off((uint32_t)addr));
 }
 
 /* Little-endian physical memory writes */
 static inline void stl_le_phys(void *as, hwaddr addr, uint32_t val) {
     (void)as;
-    *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint32_t *)(g_apu_ram_ptr + apu_phys_off((uint32_t)addr)) = val;
 }
 static inline void stw_le_phys(void *as, hwaddr addr, uint16_t val) {
     (void)as;
-    *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint16_t *)(g_apu_ram_ptr + apu_phys_off((uint32_t)addr)) = val;
 }
 static inline void stb_phys(void *as, hwaddr addr, uint8_t val) {
     (void)as;
-    *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint8_t *)(g_apu_ram_ptr + apu_phys_off((uint32_t)addr)) = val;
 }
 
 /* Stub address space - just passed to ldl_le_phys etc. (ignored) */

@@ -268,6 +268,62 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
             g_waveout.frames_written);
 }
 
+/* RECOMP_APU_WAV=<path> writes everything that reaches the sound card to a
+ * 48 kHz stereo WAV. "It crackles" is not something a log can settle; the
+ * recording can be measured, and compared against the same audio decoded from
+ * the game's own files. The header is patched with the real sizes at exit. */
+static FILE *g_wav;
+static uint32_t g_wav_bytes;
+
+static void apu_wav_close(void)
+{
+    uint32_t riff, data;
+
+    if (!g_wav)
+        return;
+    riff = 36 + g_wav_bytes;
+    data = g_wav_bytes;
+    fseek(g_wav, 4, SEEK_SET);
+    fwrite(&riff, 4, 1, g_wav);
+    fseek(g_wav, 40, SEEK_SET);
+    fwrite(&data, 4, 1, g_wav);
+    fclose(g_wav);
+    g_wav = NULL;
+    fprintf(stderr, "[APU] wrote %u bytes of audio (%.1f s)\n",
+            data, data / (48000.0 * 4.0));
+}
+
+static void apu_wav_write(const int16_t (*samples)[2], int count)
+{
+    static int tried;
+
+    if (!tried) {
+        const char *path = getenv("RECOMP_APU_WAV");
+        tried = 1;
+        if (path && *path) {
+            g_wav = fopen(path, "wb");
+            if (g_wav) {
+                const uint8_t header[44] = {
+                    'R','I','F','F', 0,0,0,0, 'W','A','V','E',
+                    'f','m','t',' ', 16,0,0,0, 1,0, 2,0,
+                    0x80,0xBB,0,0,            /* 48000 Hz */
+                    0x00,0xEE,0x02,0,         /* byte rate 192000 */
+                    4,0, 16,0,
+                    'd','a','t','a', 0,0,0,0
+                };
+                fwrite(header, sizeof header, 1, g_wav);
+                atexit(apu_wav_close);
+                fprintf(stderr, "[APU] recording audio to %s\n", path);
+            }
+        }
+    }
+
+    if (g_wav) {
+        fwrite(samples, 4, count, g_wav);
+        g_wav_bytes += count * 4;
+    }
+}
+
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
     if ((d->ep_frame_div + 1) % 8) {
@@ -307,6 +363,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             mixer_render(out, MIXER_FRAME_SAMPLES);
 
         xa2_submit_samples((const int16_t *)out, MIXER_FRAME_SAMPLES);
+        apu_wav_write(out, MIXER_FRAME_SAMPLES);
         memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
 
         /* How loud what reached the sound card was, once a second. */
@@ -390,29 +447,113 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * Throttle (timing control for frame pacing)
  * ============================================================ */
 
-static void throttle(MCPXAPUState *d)
+/* Wait a sub-millisecond interval.
+ *
+ * qemu_cond_timedwait takes whole milliseconds, and a voice frame is 667 us,
+ * so it cannot pace one. A high-resolution waitable timer can; on a Windows
+ * without that flag the timer is still better than nothing, and Sleep is the
+ * last resort. */
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+static void apu_wait_us(int64_t us)
 {
-    if (d->ep_frame_div % 8) {
+    static HANDLE timer;
+    static int tried;
+    LARGE_INTEGER due;
+
+    if (us <= 0)
         return;
+
+    if (!tried) {
+        tried = 1;
+        timer = CreateWaitableTimerExW(NULL, NULL,
+                                       CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                       TIMER_ALL_ACCESS);
+        if (!timer)
+            timer = CreateWaitableTimerW(NULL, FALSE, NULL);
     }
 
-    int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    if (timer) {
+        due.QuadPart = -(LONGLONG)(us * 10); /* relative, 100 ns units */
+        if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
+            WaitForSingleObject(timer, INFINITE);
+            return;
+        }
+    }
 
+    Sleep((DWORD)((us + 999) / 1000));
+}
+#endif
+
+/* Pace the pipeline one voice frame at a time.
+ *
+ * This used to sleep once every eight frames and then run all eight back to
+ * back, which meant 256 samples were consumed in a burst at the top of each
+ * 5.33 ms window. The hardware reads those 256 samples spread across the
+ * window, and a title counts on it: Def Jam keeps its streaming buffer only
+ * 32 samples -- one voice frame -- ahead of the play position, and writes
+ * everything beyond that whenever it likes. Our burst therefore read up to
+ * 224 samples of not-yet-refreshed buffer, the title overwrote them, and the
+ * next burst read the new data: a discontinuity on a frame boundary, several
+ * times a second, heard as crackle.
+ *
+ * Pacing every frame keeps the read position within a frame of real time,
+ * which is the contract the title is written against.
+ */
+static void throttle(MCPXAPUState *d)
+{
+    int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    int64_t wait_us;
+
+    /* A voice frame is 32/48000 s = 666.67 us. Carry the third of a
+     * microsecond so the cadence stays exact over time. */
     if (d->next_frame_time_us == 0 ||
         now_us - d->next_frame_time_us > EP_FRAME_US) {
         d->next_frame_time_us = now_us;
+        d->frame_time_rem_us = 0;
     }
 
-    while (!d->pause_requested) {
-        now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-        int64_t remaining_ms = (d->next_frame_time_us - now_us) / 1000;
-        if (remaining_ms > 0) {
-            qemu_cond_timedwait(&d->cond, &d->lock, (int)remaining_ms);
-        } else {
-            break;
+    d->next_frame_time_us += 666;
+    d->frame_time_rem_us += 2;
+    if (d->frame_time_rem_us >= 3) {
+        d->next_frame_time_us += 1;
+        d->frame_time_rem_us -= 3;
+    }
+
+    /* Lock the cadence to the sound card.
+     *
+     * 666.67 us is the right period on paper, but a wait always overshoots a
+     * little and the error accumulates: a hair too fast and submissions start
+     * being refused, a hair too slow and the card runs dry. Both are clicks.
+     * The card's queue depth says which way we are drifting, so nudge the
+     * period by a few microseconds until it sits at the target. Authority is
+     * about 1 %, far more than the drift and far too small to hear. */
+    {
+        int queued = xa2_buffers_queued();
+        const int target = 3;
+
+        if (queued >= 0) {
+            if (queued > target)
+                d->next_frame_time_us += 8;
+            else if (queued < target)
+                d->next_frame_time_us -= 8;
         }
     }
-    d->next_frame_time_us += EP_FRAME_US;
+
+    wait_us = d->next_frame_time_us - now_us;
+    if (wait_us > 0 && !d->pause_requested) {
+#ifdef _WIN32
+        qemu_mutex_unlock(&d->lock);
+        apu_wait_us(wait_us);
+        qemu_mutex_lock(&d->lock);
+#else
+        if (wait_us >= 1000)
+            qemu_cond_timedwait(&d->cond, &d->lock, (int)(wait_us / 1000));
+#endif
+    }
 
     d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - now_us);
 }
@@ -621,6 +762,10 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
 
 uint64_t mcpx_apu_vp_read(void *opaque, hwaddr addr, unsigned int size);
 void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size);
+uint64_t mcpx_apu_gp_read(MCPXAPUState *d, hwaddr addr, unsigned int size);
+void mcpx_apu_gp_write(MCPXAPUState *d, hwaddr addr, uint64_t val, unsigned int size);
+uint64_t mcpx_apu_ep_read(MCPXAPUState *d, hwaddr addr, unsigned int size);
+void mcpx_apu_ep_write(MCPXAPUState *d, hwaddr addr, uint64_t val, unsigned int size);
 
 /* Dispatch a VP-region access (offset 0x20000-0x2FFFF from APU base) */
 void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
@@ -638,8 +783,19 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
         if (is_write) {
             mcpx_apu_write(d, addr, val, size);
         }
+    } else if (addr >= 0x30000 && addr < 0x40000) {
+        /* GP: DSP program and data memory, and its reset lines. This is how
+         * a title uploads and starts its audio DSP program. */
+        if (is_write) {
+            mcpx_apu_gp_write(d, addr - 0x30000, val, size);
+        }
+    } else if (addr >= 0x50000 && addr < 0x60000) {
+        /* EP: the encode processor, same shape as the GP. */
+        if (is_write) {
+            mcpx_apu_ep_write(d, addr - 0x50000, val, size);
+        }
     }
-    /* GP (0x30000) and EP (0x50000) regions ignored for now */
+
 }
 
 /* ============================================================
@@ -652,6 +808,10 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
     if (!d) return 0;
     if (addr >= 0x20000 && addr < 0x30000) {
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
+    } else if (addr >= 0x30000 && addr < 0x40000) {
+        return mcpx_apu_gp_read(d, (hwaddr)addr - 0x30000, size);
+    } else if (addr >= 0x50000 && addr < 0x60000) {
+        return mcpx_apu_ep_read(d, (hwaddr)addr - 0x50000, size);
     } else if (addr < 0x20000) {
         return mcpx_apu_read(d, (hwaddr)addr, size);
     }

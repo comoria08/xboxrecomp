@@ -583,6 +583,23 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
  * SGE data pointer resolution
  * ============================================================ */
 
+/* Read position shadow and the reporting lead. See the note where the
+ * position is published, at the end of voice_get_samples. */
+static uint32_t s_cbo_published[MCPX_HW_MAX_VOICES];
+static uint32_t s_cbo_actual[MCPX_HW_MAX_VOICES];
+
+static uint32_t apu_cbo_lead(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *s = getenv("RECOMP_APU_CBO_LEAD");
+        cached = (s && *s) ? atoi(s) : 64;
+        if (cached < 0)
+            cached = 0;
+    }
+    return (uint32_t)cached;
+}
+
 static hwaddr get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr)
 {
     unsigned int entry = addr / TARGET_PAGE_SIZE;
@@ -758,6 +775,15 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                                   NV_PAVS_VOICE_PAR_NEXT_EBO);
     uint32_t cbo = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                                   NV_PAVS_VOICE_PAR_OFFSET_CBO);
+    /* Undo the reporting lead: the register carries what the title is told,
+     * the shadow carries where we actually are. A value the title wrote
+     * itself will not match the shadow and is taken as-is. */
+    if (apu_cbo_lead() && cbo == s_cbo_published[v])
+        cbo = s_cbo_actual[v];
+
+    uint32_t cbo_entry = cbo;
+    uint32_t last_sample_addr = 0;
+    uint32_t first_sample_addr = 0;
     uint32_t lbo = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CUR_PSH_SAMPLE,
                                   NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO);
     uint32_t ba = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CUR_PSL_START,
@@ -855,7 +881,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                                                        (container_size_index ==
                                                         NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM)
                                                        ? 36 : container_size) * samples_per_block);
-            const uint8_t *p = d->ram_ptr ? &d->ram_ptr[base & 0x03FFFFFF] : NULL;
+            const uint8_t *p = d->ram_ptr ? &d->ram_ptr[apu_phys_off(base)] : NULL;
             shown++;
             {   /* the voice's own registers, as the title left them */
                 hwaddr vbase = d->regs[NV_PAPU_VPVADDR] + v * NV_PAVS_SIZE;
@@ -897,7 +923,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, &d->ram_ptr[addr & 0x03FFFFFF],
+                    memcpy(adpcm_block, &d->ram_ptr[apu_phys_off(addr)],
                            block_size);
                 } else {
                     linear_addr += ba;
@@ -930,6 +956,10 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF,
                                     linear_addr);
             }
+
+            last_sample_addr = (uint32_t)addr;
+            if (!sample_count)
+                first_sample_addr = (uint32_t)addr;
 
             for (unsigned int channel = 0; channel < channels; channel++) {
                 uint32_t ival;
@@ -988,8 +1018,205 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         }
     }
 
-    voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
-                   NV_PAVS_VOICE_PAR_OFFSET_CBO, cbo);
+    /* Where the clicks come from.
+     *
+     * A crackle is an impulsive discontinuity, so the useful question is which
+     * sample position it lands on. This ties each large jump between two
+     * consecutive samples to the voice's read position, and says whether the
+     * buffer had just wrapped -- a click exactly on the wrap means the loop
+     * boundary, a click anywhere else means the data itself. */
+    if (apu_trace_on()) {
+        static struct {
+            float last;
+            uint32_t cbo_after;   /* where the previous call left off */
+            int count;            /* how many samples it returned */
+            uint32_t addr;        /* address its last sample came from */
+            uint32_t first_addr;  /* and where its first one came from */
+            float first_val;
+        } seen[MCPX_HW_MAX_VOICES];
+        static int shown;
+        float diff = sample_count ? samples[0][0] - seen[v].last : 0.0f;
+
+        if (diff < 0)
+            diff = -diff;
+
+        /* The read position carries over cleanly, so the data itself must be
+         * changing. This re-reads the very sample the previous call ended on,
+         * at the same address: if it now holds something else, the title
+         * rewrote the buffer under us between the two frames. */
+        if (sample_count && diff > 0.25f && shown < 12) {
+            float again = seen[v].last;
+            bool rewritten = false;
+
+            if (seen[v].addr) {
+                uint32_t raw = lduw_le_phys(address_space_memory, seen[v].addr);
+                again = int16_to_float((int16_t)(raw & 0xffff));
+                rewritten = (again != seen[v].last);
+            }
+
+            shown++;
+            fprintf(stderr, "[APU] voice %d frame seam: jump %.3f;"
+                            " previous call ended at cbo %u after %d samples,"
+                            " this one started at %u and read %d"
+                            " (lbo %u ebo %u); its last sample at 0x%08X was"
+                            " %.4f, now reads %.4f -- %s\n",
+                    v, diff, seen[v].cbo_after, seen[v].count,
+                    cbo_entry, sample_count, lbo, ebo,
+                    seen[v].addr, seen[v].last, again,
+                    rewritten ? "the title rewrote it"
+                              : "unchanged, so the jump is in the data ahead");
+            fflush(stderr);
+        }
+
+        /* When a frame comes back starting with four zero samples, note where
+         * they were and look again 32 frames later (about 21 ms). The title
+         * clears a block before mixing into it, so a hole that fills in was
+         * simply read too early; a hole still there later is one the engine
+         * never filled. */
+        {
+            static uint32_t hole_addr;
+            static int hole_age;
+            static unsigned filled, stayed;
+            static uint32_t next_ms3;
+            uint32_t now3 = (uint32_t)qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
+            if (hole_addr && ++hole_age >= 32) {
+                uint32_t raw = lduw_le_phys(address_space_memory, hole_addr);
+                if ((int16_t)(raw & 0xffff) != 0)
+                    filled++;
+                else
+                    stayed++;
+                hole_addr = 0;
+            }
+
+            if (!hole_addr && sample_count >= 8 && first_sample_addr &&
+                samples[0][0] == 0.0f && samples[1][0] == 0.0f &&
+                samples[2][0] == 0.0f && samples[3][0] == 0.0f &&
+                (samples[6][0] > 0.02f || samples[6][0] < -0.02f)) {
+                hole_addr = first_sample_addr;
+                hole_age = 0;
+            }
+
+            if (now3 >= next_ms3) {
+                next_ms3 = now3 + 1000;
+                if (filled || stayed)
+                    fprintf(stderr, "[APU] four-sample holes: %u filled in"
+                                    " later, %u still empty\n", filled, stayed);
+                filled = stayed = 0;
+            }
+        }
+
+        /* The other half of the question: did a sample we already consumed
+         * change afterwards? If it did, we read that stretch of buffer before
+         * the title had written it -- we are running ahead of the writer, and
+         * what we played was whatever the previous loop left there. */
+        if (seen[v].first_addr) {
+            uint32_t raw = lduw_le_phys(address_space_memory,
+                                        seen[v].first_addr);
+            float now_val = int16_to_float((int16_t)(raw & 0xffff));
+            static unsigned stale, fresh;
+            static uint32_t next_ms2;
+            uint32_t now2 = (uint32_t)qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
+            if (now_val != seen[v].first_val)
+                stale++;
+            else
+                fresh++;
+
+            if (now2 >= next_ms2) {
+                next_ms2 = now2 + 1000;
+                fprintf(stderr, "[APU] read-ahead check: %u samples changed"
+                                " after we played them, %u stayed put\n",
+                        stale, fresh);
+                fflush(stderr);
+                stale = fresh = 0;
+            }
+        }
+
+        if (sample_count) {
+            seen[v].last = samples[sample_count - 1][0];
+            seen[v].cbo_after = cbo;
+            seen[v].count = sample_count;
+            seen[v].addr = last_sample_addr;
+            seen[v].first_addr = first_sample_addr;
+            seen[v].first_val = samples[0][0];
+        }
+    }
+
+    /* RECOMP_APU_BUF_DUMP=<path> writes this voice's whole buffer once, as it
+     * sits in guest memory, pages resolved. The decoded stream shows holes of
+     * four zero samples; this says whether they are in the buffer -- and what
+     * the layout around them really looks like. */
+    if (!stream && getenv("RECOMP_APU_BUF_DUMP")) {
+        static int done;
+        static int warmup;
+        /* Wait for the title to have filled the buffer, then dump on a frame
+         * that actually starts with the four-sample hole. */
+        bool loud = sample_count >= 16 &&
+                    (samples[8][0] > 0.05f || samples[8][0] < -0.05f) &&
+                    (samples[12][0] > 0.05f || samples[12][0] < -0.05f);
+        bool hole = loud && samples[0][0] == 0.0f && samples[1][0] == 0.0f &&
+                    samples[2][0] == 0.0f && samples[3][0] == 0.0f;
+        if (warmup < 6000)
+            warmup++;
+        if (!done && warmup >= 6000 && hole && ebo > 0 && ebo < 0x10000) {
+            FILE *f = fopen(getenv("RECOMP_APU_BUF_DUMP"), "wb");
+            done = 1;
+            if (f) {
+                for (uint32_t i = 0; i <= ebo; i++) {
+                    uint32_t linear = ba + i * (uint32_t)block_size;
+                    hwaddr a = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
+                                            0xFFFFFFFF, linear);
+                    for (size_t k = 0; k < block_size; k++)
+                        fputc(ldub_phys(address_space_memory, a + k), f);
+                }
+                fclose(f);
+                fprintf(stderr, "[APU] voice %d buffer dumped:"
+                                " %u frames of %u bytes from ba 0x%X;"
+                                " the hole this frame starts at cbo %u,"
+                                " guest address 0x%08X\n",
+                        v, ebo + 1, (unsigned)block_size, ba, cbo_entry,
+                        (uint32_t)get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
+                                               0xFFFFFFFF,
+                                               ba + cbo_entry *
+                                                   (uint32_t)block_size));
+                fflush(stderr);
+            }
+        }
+    }
+
+    /* Publish the read position, optionally a little ahead of the truth.
+     *
+     * A title streaming into a looping buffer writes just past the position
+     * the hardware reports: Def Jam leaves exactly 32 samples of margin. That
+     * works when the hardware reads one sample at a time in lockstep with the
+     * title's writer. Here the voice is decoded a frame at a time into a queue
+     * feeding the sound card, and the writer is the game loop, so the two
+     * drift by a sample or two several times a second -- we step past the
+     * frontier, read what the previous loop left there, and the title fills it
+     * in afterwards. That is the crackle.
+     *
+     * Reporting the position a few samples ahead widens the title's margin by
+     * that much. It costs a fraction of a millisecond of apparent playback
+     * time, which nothing can hear, and it is only reporting: the decode still
+     * runs from the real position, kept in a shadow so a position the title
+     * writes itself is still honoured.
+     */
+    {
+        uint32_t lead = apu_cbo_lead();
+        uint32_t shown = cbo;
+
+        if (lead && ebo > lead) {
+            shown = cbo + lead;
+            if (shown > ebo)
+                shown -= (ebo + 1) - lbo;   /* wrap inside the loop region */
+        }
+
+        s_cbo_actual[v] = cbo;
+        s_cbo_published[v] = shown;
+        voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
+                       NV_PAVS_VOICE_PAR_OFFSET_CBO, shown);
+    }
     return sample_count;
 }
 
@@ -1034,6 +1261,22 @@ static void voice_process(MCPXAPUState *d,
                           uint16_t v, int voice_list)
 {
     assert(v < MCPX_HW_MAX_VOICES);
+
+    /* RECOMP_APU_ONLY_VOICE=<n> mixes that voice and no other. Def Jam layers
+     * three stereo stems interleaved in one buffer, one voice each; hearing
+     * them one at a time is how you tell a bad stem from a bad mix. */
+    {
+        static int only = -2;
+        if (only == -2) {
+            const char *s = getenv("RECOMP_APU_ONLY_VOICE");
+            only = (s && *s) ? atoi(s) : -1;
+            if (only >= 0)
+                fprintf(stderr, "[APU] mixing voice %d only\n", only);
+        }
+        if (only >= 0 && v != (uint16_t)only)
+            return;
+    }
+
     bool stereo = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                  NV_PAVS_VOICE_CFG_FMT_STEREO) != 0;
     unsigned int channels = stereo ? 2 : 1;
@@ -1108,6 +1351,46 @@ static void voice_process(MCPXAPUState *d,
     int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
     if (!active) return;
+
+    /* RECOMP_APU_VOICE_WAV=<path>, with RECOMP_APU_ONLY_VOICE, records a
+     * voice as it comes out of the decoder -- before envelope, volume and
+     * mixing. Comparing that recording with the one taken at the sound card
+     * says which side of the pipeline a defect is on. */
+    {
+        static FILE *vw;
+        static int tried;
+        if (!tried) {
+            const char *path = getenv("RECOMP_APU_VOICE_WAV");
+            tried = 1;
+            if (path && *path) {
+                vw = fopen(path, "wb");
+                if (vw) {
+                    const uint8_t header[44] = {
+                        'R','I','F','F', 0,0,0,0, 'W','A','V','E',
+                        'f','m','t',' ', 16,0,0,0, 1,0, 2,0,
+                        0x80,0xBB,0,0, 0x00,0xEE,0x02,0, 4,0, 16,0,
+                        'd','a','t','a', 0,0,0,0
+                    };
+                    fwrite(header, sizeof header, 1, vw);
+                    fprintf(stderr, "[APU] recording voice %d raw to %s\n",
+                            v, path);
+                }
+            }
+        }
+        if (vw) {
+            int16_t out[NUM_SAMPLES_PER_FRAME][2];
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                float l = samples[i][0];
+                float r = samples[i][1];
+                if (l > 1.0f) l = 1.0f; if (l < -1.0f) l = -1.0f;
+                if (r > 1.0f) r = 1.0f; if (r < -1.0f) r = -1.0f;
+                out[i][0] = (int16_t)(l * 32767.0f);
+                out[i][1] = (int16_t)(r * 32767.0f);
+            }
+            fwrite(out, 4, NUM_SAMPLES_PER_FRAME, vw);
+            fflush(vw);
+        }
+    }
 
     /* Get volume bins */
     int bin[8];
@@ -1327,7 +1610,9 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         if (now >= next_ms) {
             next_ms = now + 1000;
             fprintf(stderr, "[APU] %u frames/s, voices chained %d, active %d,"
-                    " peak %.4f\n", frames, max_seen, max_active, peak);
+                    " peak %.4f, DSP cycles GP %u EP %u\n",
+                    frames, max_seen, max_active, peak,
+                    g_dbg.gp.cycles, g_dbg.ep.cycles);
             fflush(stderr);
             frames = 0; max_seen = 0; max_active = 0; peak = 0.0f;
         }

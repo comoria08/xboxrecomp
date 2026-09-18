@@ -18,6 +18,9 @@ int xa2_is_active(void);
 /* Submit interleaved stereo 16-bit samples. Returns 1 if accepted. */
 int xa2_submit_samples(const int16_t *samples, int num_samples);
 
+/* Buffers submitted but not yet played, or -1 if the backend is off. */
+int xa2_buffers_queued(void);
+
 /* Get the preferred buffer size in samples. */
 int xa2_get_buffer_size(void);
 

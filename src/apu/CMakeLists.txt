@@ -2,8 +2,13 @@
 # Extracted from xemu (https://github.com/xemu-project/xemu)
 #
 # Voice Processor (VP): ADPCM/PCM decode, sample mixing, envelopes, filters
-# Global Processor (GP): Stub - effects bypass
-# Encode Processor (EP): Stub - direct mixbin passthrough
+# Global Processor (GP): DSP56300, effects and mixing
+# Encode Processor (EP): DSP56300, final encode
+#
+# NOTE ON LICENSING: dsp/ is GPL-2.0-or-later (it descends from Hatari's
+# DSP M56001 emulation), while the rest of this directory is LGPL-2.1-or-later
+# and the toolkit around it is MIT. Linking dsp/ in makes the resulting
+# binary GPL-2.0-or-later. See the NOTICE file.
 
 add_library(xbox_apu STATIC
     apu_core.c
@@ -11,6 +16,9 @@ add_library(xbox_apu STATIC
     apu_dsp.c
     apu_mmio_hook.c
     apu_xaudio2.c
+    dsp/dsp.c
+    dsp/dsp_cpu.c
+    dsp/dsp_dma.c
 )
 
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
