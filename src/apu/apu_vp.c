@@ -501,6 +501,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FETRAPREASON;
             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
             d->set_irq = true;
+            g_apu_fe_idle_traps++;
+            g_apu_fe_idle_voice = argument;
         }
         break;
 
@@ -1610,9 +1612,9 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         if (now >= next_ms) {
             next_ms = now + 1000;
             fprintf(stderr, "[APU] %u frames/s, voices chained %d, active %d,"
-                    " peak %.4f, DSP cycles GP %u EP %u\n",
+                    " peak %.4f, DSP cycles GP %u EP %u, idle-voice traps %u\n",
                     frames, max_seen, max_active, peak,
-                    g_dbg.gp.cycles, g_dbg.ep.cycles);
+                    g_dbg.gp.cycles, g_dbg.ep.cycles, g_apu_fe_idle_traps);
             fflush(stderr);
             frames = 0; max_seen = 0; max_active = 0; peak = 0.0f;
         }

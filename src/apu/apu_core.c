@@ -47,6 +47,20 @@ uint64_t g_dbg_muted_voices[4] = { 0 };
 /* Global audio mute — disables all AWD/mixer sound playback */
 volatile int g_audio_muted = 0;  /* 0 = audio enabled */
 
+/* Front-end traps on an idle voice: raised in apu_vp.c, answered in the frame
+ * thread. See the note there. */
+unsigned g_apu_fe_idle_traps;
+unsigned g_apu_fe_idle_voice;
+static unsigned g_fe_resumes;
+
+static int fe_trap_kept(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+        cached = getenv("RECOMP_APU_FE_TRAP") != NULL;
+    return cached;
+}
+
 /* ============================================================
  * Debug frame markers (minimal stubs)
  * ============================================================ */
@@ -619,9 +633,59 @@ static void *mcpx_apu_frame_thread(void *arg)
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
-        bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+        uint32_t methmode = fectl & NV_PAPU_FECTL_FEMETHMODE;
+        bool apu_active;
+
+        /* A trapped front end is a question put to the driver, and on hardware
+         * the driver answers it within microseconds: the trap raises a PCI
+         * interrupt, the driver reads the reason, retires the voice that went
+         * idle, and writes FECTL back to free running.
+         *
+         * This runtime cannot raise that interrupt -- pci_irq_assert is a
+         * no-op here -- so nobody ever answered, and the trap stood for good.
+         * One voice going idle stopped se_frame for the rest of the run: no
+         * voice processed, nothing mixed, and no way back. Answer it here
+         * instead, the way xbox_Nv2aMirrorFence answers for a GPU that has
+         * finished its work (bring-up point 3). The status the title reads out
+         * of memory is published by set_notify_status either way; that is the
+         * other half of the same notification.
+         *
+         * RECOMP_APU_FE_TRAP=1 leaves the trap standing, for whoever wires
+         * the interrupt up for real. */
+        if (methmode == NV_PAPU_FECTL_FEMETHMODE_TRAPPED && !fe_trap_kept()) {
+            fectl = (fectl & ~NV_PAPU_FECTL_FEMETHMODE)
+                    | NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING;
+            qatomic_set(&d->regs[NV_PAPU_FECTL], fectl);
+            methmode = NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING;
+            if (!g_fe_resumes++) {
+                fprintf(stderr, "[APU] front end trapped on idle voice %u;"
+                        " resuming it ourselves (no PCI interrupt to raise)\n",
+                        g_apu_fe_idle_voice);
+                fflush(stderr);
+            }
+        }
+
+        apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
+                     methmode != NV_PAPU_FECTL_FEMETHMODE_TRAPPED &&
+                     methmode != NV_PAPU_FECTL_FEMETHMODE_HALTED;
+
+        /* Say it once each way. When the sound dies, this line names which of
+         * the two registers stopped the pipeline and what the front end was
+         * doing at the time -- the one measurement that separates "the title
+         * stopped asking for sound" from "we stopped delivering it". */
+        {
+            static int was_active = -1;
+            if ((int)apu_active != was_active) {
+                was_active = (int)apu_active;
+                fprintf(stderr, "[APU] pipeline %s: SECTL=%08X FECTL=%08X,"
+                        " %u idle-voice traps (last voice %u), %u resumed\n",
+                        apu_active ? "running" : "STOPPED",
+                        qatomic_read(&d->regs[NV_PAPU_SECTL]), fectl,
+                        g_apu_fe_idle_traps, g_apu_fe_idle_voice,
+                        g_fe_resumes);
+                fflush(stderr);
+            }
+        }
 
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */

@@ -428,3 +428,9 @@ extern MCPXAPUState *g_state;
 extern struct McpxApuDebug g_dbg, g_dbg_cache;
 extern int g_dbg_voice_monitor;
 extern uint64_t g_dbg_muted_voices[4];
+
+/* The front end traps when the title has asked to be told that a voice went
+ * idle. It is raised in apu_vp.c and answered in apu_core.c, so the count and
+ * the voice it named live between the two. */
+extern unsigned g_apu_fe_idle_traps;
+extern unsigned g_apu_fe_idle_voice;
