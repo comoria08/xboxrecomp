@@ -531,6 +531,34 @@ class FunctionDetector:
             i = bisect.bisect_right(starts, addr) - 1
             return i >= 0 and addr < bounds[i][1]
 
+        # An address that falls *inside* an already-decoded instruction is not
+        # a function start, whatever it decodes to from there. x86 being what
+        # it is, a misaligned start decodes happily -- 0x00046500 is the third
+        # byte of `mov eax,[esi+4]` and probed as a 169-byte body ending in a
+        # ret -- and the damage is not the phantom itself but the real function
+        # it truncates. sub_00046450 lost its epilogue that way: no ret at all,
+        # so it fell out of the bottom of its own body leaving esp and every
+        # preserved register wherever they happened to be. Eight nested frames
+        # unwound wrong behind it and Def Jam's Story mode died on the first
+        # thing that dereferenced esi.
+        #
+        # inside_a_function cannot catch this: the truncated function is found
+        # by a later pass (gap_prologue), so at this point it does not exist.
+        # Instruction boundaries do exist, which is why the test is made here
+        # and only here -- this pass is the one whose evidence is a bare
+        # immediate. A call_target or a vtable seed means something really
+        # reaches that address, and there it is the *preceding* decode that is
+        # wrong; dropping those would put back the point-17 bug that left the
+        # USB pool uninitialised.
+        decoded = sorted(self.engine.instructions)
+
+        def splits_an_instruction(addr: int) -> bool:
+            i = bisect.bisect_left(decoded, addr) - 1
+            if i < 0:
+                return False
+            prev = decoded[i]
+            return prev < addr < prev + self.engine.instructions[prev].size
+
         # Collect distinct targets first. The instruction dict holds millions of
         # entries and the same address is taken over and over, so probing per
         # instruction rather than per address is the difference between seconds
@@ -552,6 +580,8 @@ class FunctionDetector:
             if target is None or target in self.functions:
                 continue
             if inside_a_function(target) or not in_code_section(target):
+                continue
+            if splits_an_instruction(target):
                 continue
             targets.add(target)
 
