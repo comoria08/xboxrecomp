@@ -6011,9 +6011,15 @@ static void bridge_DbgLoadImageSymbols(void)
 static void bridge_DbgPrint(void)
 {
     /* First vararg is a guest format string. Log it verbatim (never treat it
-     * as a format, it is guest-owned); caller cleans the stack (__cdecl). */
+     * as a format, it is guest-owned); caller cleans the stack (__cdecl).
+     *
+     * This is the title talking about itself, not our own tracing, so it is
+     * not subject to the kernel call budget: that cap silenced it after the
+     * first two hundred kernel calls, which is still inside the boot sequence.
+     * Def Jam's save system narrates itself this way ("| MC_LoadOptionStart
+     * device = %d ..."), and none of it was reaching the log. */
     const char *fmt = (const char *)XBOX_TO_NATIVE(STACK_ARG(0));
-    if (fmt && KERNEL_LOG_ON()) {
+    if (fmt) {
         size_t i, n = 0;
         for (i = 0; i < 512 && fmt[i]; i++)
             n++;
