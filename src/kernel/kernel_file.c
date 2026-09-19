@@ -114,6 +114,37 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     const char* xbox_path = get_xbox_path(ObjectAttributes);
     if (!xbox_path)
         return FALSE;
+
+    /* A name given relative to an open directory handle.
+     *
+     * NT titles open a directory once and then name its contents relative to
+     * that handle, and such a name is not an Xbox path at all -- it has no
+     * \Device prefix, so translating it on its own fails. Resolve the handle
+     * to its host path and join the two. */
+    if (ObjectAttributes->RootDirectory &&
+        ObjectAttributes->RootDirectory != INVALID_HANDLE_VALUE &&
+        xbox_path[0] != '\\') {          /* un nom absolu se suffit à lui-même */
+        WCHAR dir[MAX_PATH];
+        WCHAR leaf[MAX_PATH];
+        DWORD n = GetFinalPathNameByHandleW(ObjectAttributes->RootDirectory,
+                                            dir, MAX_PATH, FILE_NAME_NORMALIZED);
+        /* Un handle qui ne nomme aucun chemin n'est pas un répertoire : on
+         * retombe sur la traduction normale plutôt que d'échouer. */
+        if (n == 0 || n >= MAX_PATH)
+            return xbox_translate_path(xbox_path, win_path, buf_size);
+        {
+            WCHAR *clean = dir;
+            if (wcsncmp(clean, L"\\\\?\\", 4) == 0)
+                clean += 4;
+            MultiByteToWideChar(CP_ACP, 0, xbox_path, -1, leaf, MAX_PATH);
+            if (leaf[0] == L'\\')
+                swprintf_s(win_path, buf_size, L"%s%s", clean, leaf);
+            else
+                swprintf_s(win_path, buf_size, L"%s\\%s", clean, leaf);
+        }
+        return TRUE;
+    }
+
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 

@@ -2721,7 +2721,14 @@ static void bridge_build_oa(uint32_t obj_attrs_va,
     name->Buffer        = (PCHAR)path;
     name->Length        = path ? (USHORT)strlen(path) : 0;
     name->MaximumLength = (USHORT)(name->Length + 1);
-    oa->RootDirectory = NULL;
+    /* RootDirectory was read from the guest structure and then dropped, which
+     * broke every relative open. NT titles open a directory once and then name
+     * its contents relative to that handle: Def Jam enumerates UDATA\<titleid>
+     * and opens each save's files that way, so all of them failed with
+     * STATUS_OBJECT_PATH_NOT_FOUND and it concluded it had no saves. */
+    oa->RootDirectory = obj_attrs_va
+                            ? bridge_resolve_handle(BRIDGE_MEM32(obj_attrs_va))
+                            : NULL;
     oa->ObjectName    = name;
     oa->Attributes    = 0;
 }
