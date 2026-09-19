@@ -356,7 +356,7 @@ _EFLAGS_PRESERVE = frozenset({
     "call",
     "int3", "int", "wait",
     "cld", "std", "cli", "sti",
-    "pushfd", "popfd", "pushal",
+    "pushfd", "popfd", "pushal", "popal", "pushad", "popad",
     "sgdt", "ljmp", "sfence",
     # SSE scalar float
     "movss", "movsd",
@@ -1017,6 +1017,7 @@ class Lifter:
         self.func_end = 0
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
         self.publishes_ebp = False  # Set per-function: has a real frame
+        self.func_pushal_balanced = False  # Set per-function: pushal == popal
         self.pfrom_preds = set()  # Per-function: blocks that record _pfrom
         self.trace_exit_name = None  # Set per-function when traced
         # Every direct call target we emit a name for, as {addr: name}. The
@@ -1101,6 +1102,10 @@ class Lifter:
             return self._lift_push(insn, ops)
         if m == "pop":
             return self._lift_pop(insn, ops)
+        if m in ("pushal", "pushad"):
+            return self._lift_pushal()
+        if m in ("popal", "popad"):
+            return self._lift_popal()
 
         # ── Arithmetic ──
         if m in ("add", "sub", "and", "or", "xor"):
@@ -1551,6 +1556,57 @@ class Lifter:
             return [f"POP32(esp, {r});"]
         else:
             return [f"{{ uint32_t _tmp; POP32(esp, _tmp); {_fmt_operand_write(ops[0], '_tmp')} }}"]
+
+    # ── PUSHAD / POPAD ──
+    #
+    # Hand-written assembly saves everything with one instruction, and a
+    # comment in their place is worse than an unimplemented opcode usually
+    # is: it silently drops *two* things at once. The callee's saved
+    # registers never come back, so its caller carries on with ebx, esi and
+    # edi belonging to the callee -- and esp never moves by the 32 bytes the
+    # instruction reserves, so every [esp+N] and every push/pop inside the
+    # function addresses the wrong slot.
+    #
+    # Def Jam's audio decode worker sub_0012E560 is exactly that shape:
+    # push ebp / mov ebp,esp / pushal ... popal / leave / ret. It is also
+    # the function that returns four samples short of what it is asked for.
+    #
+    # PUSHAD pushes eax, ecx, edx, ebx, the *original* esp, ebp, esi, edi.
+    # POPAD pops them back in reverse and discards the esp slot rather than
+    # loading it -- that discard is part of the instruction, not an
+    # oversight.
+    def _lift_pushal(self):
+        if not getattr(self, "func_pushal_balanced", False):
+            return ["/* pushal unmatched in this function -- not acted on */"]
+        return ["{ uint32_t _sp = esp;",
+                "  PUSH32(esp, eax); PUSH32(esp, ecx);",
+                "  PUSH32(esp, edx); PUSH32(esp, ebx);",
+                "  PUSH32(esp, _sp); PUSH32(esp, ebp);",
+                "  PUSH32(esp, esi); PUSH32(esp, edi); } /* pushal */"]
+
+    def _lift_popal(self):
+        # Both halves are only honoured when the function holds as many
+        # pushal as popal. In Def Jam the listing has 7 pushal against 123
+        # popal, which is not a language feature -- 0x61 is an ordinary byte
+        # and a sweep that drifts into data decodes it as popal all day.
+        #
+        # Acting on an unmatched one is strictly worse than ignoring it, and
+        # it cuts both ways: a lone popal pops 32 bytes nobody pushed, a lone
+        # pushal leaves esp 32 bytes low for the rest of the function. Def Jam
+        # has one of each -- sub_0019ACB6 with 1 pushal and no popal,
+        # sub_001C6106 with 4 against 1 -- next to two honest pairs.
+        #
+        # A callee really popping a frame its caller pushed is legal x86 and
+        # is missed here, but it is vanishingly rare next to a stray byte, and
+        # the failure modes are not comparable: missing it does nothing,
+        # honouring a phantom corrupts the machine.
+        if not getattr(self, "func_pushal_balanced", False):
+            return ["/* popal unmatched in this function -- not acted on */"]
+        return ["{ uint32_t _sp;",
+                "  POP32(esp, edi); POP32(esp, esi);",
+                "  POP32(esp, ebp); POP32(esp, _sp); /* esp slot discarded */",
+                "  POP32(esp, ebx); POP32(esp, edx);",
+                "  POP32(esp, ecx); POP32(esp, eax); } /* popal */"]
 
     # ── ALU binary operations ──
 

@@ -723,6 +723,15 @@ class FunctionTranslator:
         if any(insn.mnemonic == "leave" for insn in instructions):
             used_regs.add("ebp")
 
+        # Same for pushal/popal, which name every general-purpose register
+        # without spelling any of them in op_str. A function that saves
+        # everything this way and otherwise never touches ebp would fail to
+        # compile with "'ebp': undeclared identifier" -- the same way the SEH
+        # helper path below used to.
+        if any(insn.mnemonic in ("pushal", "pushad", "popal", "popad")
+               for insn in instructions):
+            used_regs.add("ebp")
+
         # Guest control leaves the bottom of this function when its last
         # instruction neither returns, jumps, nor traps. A function the lifter
         # split into consecutive pieces continues into the next piece exactly
@@ -908,6 +917,11 @@ class FunctionTranslator:
         # idiom MSVC emits for odd trailing elements.
         self.lifter.needs_cf = has_carry
         self.lifter.publishes_ebp = self._func_owns_a_frame(instructions)
+        _pushal = sum(insn.mnemonic in ("pushal", "pushad")
+                      for insn in instructions)
+        _popal = sum(insn.mnemonic in ("popal", "popad")
+                     for insn in instructions)
+        self.lifter.func_pushal_balanced = _pushal > 0 and _pushal == _popal
 
         # SSE and MMX are architectural state, declared globally by the
         # runtime exactly like the GPRs and the x87 stack. Declaring either
