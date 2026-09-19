@@ -803,11 +803,11 @@ static BOOL is_dot_entry(const WCHAR *name)
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
-    PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan)
+    ULONG FileInformationClass, PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan)
 {
     DIR_CONTEXT* ctx;
     PXBOX_FILE_DIRECTORY_INFORMATION entry;
-    (void)Event; (void)ApcRoutine; (void)ApcContext;
+    (void)Event; (void)ApcRoutine; (void)ApcContext; (void)FileInformationClass;
 
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
@@ -1330,9 +1330,9 @@ static BOOL s_dir_cs_init = FALSE;
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
-    PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan)
+    ULONG FileInformationClass, PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan)
 {
-    (void)Event; (void)ApcRoutine; (void)ApcContext;
+    (void)Event; (void)ApcRoutine; (void)ApcContext; (void)FileInformationClass;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
 
