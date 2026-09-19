@@ -695,20 +695,107 @@ static void dsp_run_frame(DSPState *dsp, bool realtime, const char *who)
     }
 }
 
-/* What this file did before the DSP was ported: mixbin 0 and 1 (front left
- * and right) straight into the monitor buffer. Still the right answer for a
- * title that leaves the DSP in reset, and for RECOMP_APU_DSP=0. */
+/* Folding the title's surround mix down to the two channels we output.
+ *
+ * The passthrough used to take mixbin 0 and 1 alone -- front left and right --
+ * which is the whole answer only for a title that puts everything there. Def
+ * Jam does not: it renders three stereo stems into one interleaved buffer,
+ * chains one voice over each (248, 249, 250) and routes them to three
+ * different pairs of bins, each at the same audible volume (384; every other
+ * bin of each voice sits at 4095, full attenuation). Those six bins are
+ * DirectSound's standard surround layout -- 0/1 front, 2 centre, 3 LFE, 4/5
+ * back -- so the title is rendering 5.1 and leaving the fold-down to the DSP,
+ * which encodes or downmixes according to the dashboard setting.
+ *
+ * Reading only the front pair dropped two thirds of the mix, the character
+ * voices with it, since dialogue sits in the centre channel. Summing the bins
+ * pairwise instead was worse in an instructive way: it put the centre channel
+ * entirely in the left ear and the LFE in the right. A channel has to be
+ * folded by what it is, not by whether its index is even.
+ *
+ * The coefficients are the usual ones (ITU-R BS.775): centre and the two
+ * back channels at -3 dB into both outputs. BS.775 drops the LFE; a fighting
+ * game puts its impacts there, so it is folded in at the same -3 dB rather
+ * than thrown away. It carries sound in about one second in fifty here, so
+ * the choice is nearly free either way.
+ *
+ * Bins past 5 are not ours to read: voices 64 to 67 hand the DSP's own output
+ * back through bins 0/1, 8/9, 16/17 and 24/25, so the front pair already
+ * carries whatever it returns, and folding the rest in would count it twice.
+ *
+ * RECOMP_APU_DOWNMIX=0 restores the front-pair-only reading. */
+#define DOWNMIX_3DB 0.70710678f
+
+static int downmix_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *s = getenv("RECOMP_APU_DOWNMIX");
+        cached = (s && *s) ? (atoi(s) != 0) : 1;
+    }
+    return cached;
+}
+
+/* What the title is really putting in each mixbin, once a second under
+ * RECOMP_APU_TRACE. A bin that carries sound and is not being read is audio
+ * we are dropping; this line is what named the centre and back channels, and
+ * what showed bin 3 lighting up four times in a game where bin 2 lit up 178 --
+ * which is how a centre channel and an LFE behave, and a stereo pair does not. */
+static void mixbin_report(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+{
+    static float peak[NUM_MIXBINS];
+    static uint64_t next_ms;
+    uint64_t now;
+    int b, i;
+
+    for (b = 0; b < NUM_MIXBINS; b++)
+        for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float a = mixbins[b][i] < 0 ? -mixbins[b][i] : mixbins[b][i];
+            if (a > peak[b])
+                peak[b] = a;
+        }
+
+    now = (uint64_t)qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (now < next_ms)
+        return;
+    next_ms = now + 1000;
+
+    fprintf(stderr, "[APU] mixbins carrying sound (%s):",
+            downmix_enabled() ? "5.1 fold-down" : "front pair only");
+    for (b = 0; b < NUM_MIXBINS; b++)
+        if (peak[b] > 0.0001f)
+            fprintf(stderr, " %d=%.3f", b, peak[b]);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+    memset(peak, 0, sizeof peak);
+}
+
+/* What this file did before the DSP was ported: the voice mixbins straight
+ * into the monitor buffer. Still the right answer for a title that leaves the
+ * DSP in reset, and for RECOMP_APU_DSP=0. */
 static void dsp_passthrough(MCPXAPUState *d,
                             float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+    int fold = downmix_enabled();
 
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP)
         return;
 
+    if (dsp_traced())
+        mixbin_report(mixbins);
+
     for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
         float left = mixbins[0][i];
         float right = mixbins[1][i];
+
+        if (fold) {
+            float centre = mixbins[2][i] * DOWNMIX_3DB;
+            float lfe = mixbins[3][i] * DOWNMIX_3DB;
+
+            left += centre + lfe + mixbins[4][i] * DOWNMIX_3DB;
+            right += centre + lfe + mixbins[5][i] * DOWNMIX_3DB;
+        }
         /* Clipping is worth counting, not just clamping: a mix that arrives
          * above full scale comes out as crackle, and the number says whether
          * that is what is being heard. */
