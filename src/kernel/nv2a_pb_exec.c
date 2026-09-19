@@ -366,6 +366,55 @@ static int tex_size_from_format(uint32_t fmt)
     return d3d8_format_is_swizzled(fmt) || d3d8_format_dxt_block_bytes(fmt);
 }
 
+/* NV097_SET_TEXTURE_CONTROL0 bit 30 turns a texture stage on.
+ *
+ * Nothing read it before, so a stage the title had switched off went on being
+ * sampled with whatever texture was still bound. That is not a small detail:
+ * a title draws batches whose only job is to write depth, with the texture
+ * disabled and the colour mask closed, and Def Jam builds the stencil of its
+ * screen titles exactly that way -- fill the band with a near z, cut the
+ * letters into it with a far z, then let the paper through with LEQUAL, which
+ * passes only inside the letters. Sampled anyway, that first batch picked a
+ * transparent texel, the alpha test dropped the fragment, no depth was
+ * written, and the paper came out as a solid slab over the title.
+ *
+ * Refusing to sample whenever the bit is clear was too much, and the measure
+ * said so: on the character select screen 47 batches have the stage off, but
+ * only 5 of them write no colour. The other 42 do write colour, and what they
+ * write comes out of the register combiners -- which this rasteriser does not
+ * implement at all. Switched to flat vertex colour they came out transparent
+ * black, so the fighters vanished from their panels.
+ *
+ * So the bit is only acted on where its meaning is not in doubt: a batch with
+ * the stage off AND a closed colour mask exists to write depth, and nothing
+ * else. For those, the alpha test must not run -- it would be judging a
+ * colour we cannot compute, and rejecting the fragment would drop the depth
+ * with it. That is precisely what hid the screen titles: the band's depth
+ * fill has transparent vertices, and the panels' fills are transparent black.
+ *
+ * A stage the title never programmed counts as on, which is what this did
+ * before. RECOMP_TEX_ENABLE_BIT=0 restores the old behaviour wholesale. */
+static int tex_stage0_enabled(void)
+{
+    static int honour = -1;
+    const uint32_t i = (0x1B0C - NV_TEX_FIRST) / 4;
+
+    if (honour < 0) {
+        const char *v = getenv("RECOMP_TEX_ENABLE_BIT");
+        honour = !(v && atoi(v) == 0);
+    }
+    if (!honour || !s_tex_set[i])
+        return 1;
+    return (s_tex_reg[i] & (1u << 30)) != 0;
+}
+
+/* A batch that writes no colour with its texture stage switched off is laying
+ * down depth alone. See the note above tex_stage0_enabled. */
+static int depth_only_batch(void)
+{
+    return s_gpu.color_mask == 0 && !tex_stage0_enabled();
+}
+
 static void record_tex_reg(uint32_t method, uint32_t param)
 {
     s_tex_reg[(method - NV_TEX_FIRST) / 4] = param;
@@ -395,6 +444,36 @@ static int s_tex_use_count;
 
 /* Defined below, next to the sampler it goes through. */
 static void dump_texture_bmp(uint32_t seq);
+
+/* RECOMP_SKIP_TEX=0x8204E500[,0x...]: drop every batch bound to those
+ * textures.
+ *
+ * When one element covers another, the question is what is underneath, and
+ * no amount of state logging answers it -- the frame has to be drawn without
+ * the thing on top. Lifting the covering batch out for one run says straight
+ * away whether what it hides is correct and merely in the wrong order, or
+ * missing too. Diagnosis only; it changes what is drawn. */
+static int tex_skipped(uint32_t offset)
+{
+    static uint32_t list[8];
+    static int count = -1;
+
+    if (count < 0) {
+        const char *spec = getenv("RECOMP_SKIP_TEX");
+        count = 0;
+        while (spec && *spec && count < (int)(sizeof list / sizeof list[0])) {
+            list[count++] = (uint32_t)strtoul(spec, (char **)&spec, 0);
+            while (*spec == ',' || *spec == ' ')
+                spec++;
+        }
+        if (count)
+            fprintf(stderr, "[NV2A] skipping %d texture(s) on request\n", count);
+    }
+    for (int i = 0; i < count; i++)
+        if (list[i] == offset)
+            return 1;
+    return 0;
+}
 
 static void note_texture_use(void)
 {
@@ -824,7 +903,7 @@ static int fragment_tests(int x, int y, float z, uint32_t color)
     size_t idx;
     int zpass = 1;
 
-    if (s_gpu.alpha_test && !alpha_pass(color))
+    if (s_gpu.alpha_test && !depth_only_batch() && !alpha_pass(color))
         return 0;
     if (!s_depth_on)
         return 1;
@@ -1663,7 +1742,7 @@ static void d3d_triangle(const float *p[3], uint32_t argb,
         st.blend_color  = s_gpu.blend_color;
     }
     st.color_mask = s_gpu.color_mask;
-    if (s_gpu.alpha_test) {
+    if (s_gpu.alpha_test && !depth_only_batch()) {
         st.alpha_test = 1;
         st.alpha_func = s_gpu.alpha_func;
         st.alpha_ref  = s_gpu.alpha_ref;
@@ -2752,23 +2831,60 @@ static void raster_batch_program(void)
         if ((want && s_gpu.flips == (uint32_t)want)
                 || (every > 0 && s_gpu.flips % (uint32_t)every == 0)) {
             float lx = 1e30f, hx = -1e30f, ly = 1e30f, hy = -1e30f;
+            /* Which part of the texture the batch samples, not just where it
+             * lands. A quad showing the wrong picture is either reading the
+             * wrong texture or the wrong region of the right one, and only
+             * the span of the texture coordinates separates the two. */
+            float lu = 1e30f, hu = -1e30f, lv = 1e30f, hv = -1e30f;
             for (i = 0; i < n; i++) {
                 if (s_vp_verts[i].xy[0] < lx) lx = s_vp_verts[i].xy[0];
                 if (s_vp_verts[i].xy[0] > hx) hx = s_vp_verts[i].xy[0];
                 if (s_vp_verts[i].xy[1] < ly) ly = s_vp_verts[i].xy[1];
                 if (s_vp_verts[i].xy[1] > hy) hy = s_vp_verts[i].xy[1];
+                if (s_vp_verts[i].uv[0] < lu) lu = s_vp_verts[i].uv[0];
+                if (s_vp_verts[i].uv[0] > hu) hu = s_vp_verts[i].uv[0];
+                if (s_vp_verts[i].uv[1] < lv) lv = s_vp_verts[i].uv[1];
+                if (s_vp_verts[i].uv[1] > hv) hv = s_vp_verts[i].uv[1];
             }
             s_vpf_flip = s_gpu.flips;
-            fprintf(stderr, "  [VPF] f%u depth t%u f%X m%u clear%06X z0 %.1f fmt%08X\n",
+            /* Which surface the batch lands in. Two batches that cover the
+             * same screen rectangle are only fighting over the same pixels
+             * if they are drawn into the same target; one of them may be
+             * filling a texture the other will later display. */
+            fprintf(stderr, "  [VPF] f%u depth t%u f%X m%u clear%06X z0 %.1f fmt%08X"
+                            "  dst 0x%08X pitch %u  sten t%u f%X r%02X m%02X\n",
                     s_gpu.flips, s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
-                    s_gpu.zclear >> 8, s_vp_verts[0].z, s_gpu.format);
+                    s_gpu.zclear >> 8, s_vp_verts[0].z, s_gpu.format,
+                    s_gpu.color_offset, s_gpu.pitch,
+                    s_gpu.stencil_test, s_gpu.stencil_func,
+                    s_gpu.stencil_ref, s_gpu.stencil_fmask);
             fprintf(stderr, "  [VPF] f%u prim %u n %u  x %.1f..%.1f y %.1f..%.1f  d0 %08X"
-                            "  tex 0x%08X %ux%u fmt %02X valid %d  uv0 %.2f %.2f"
-                            "  blend %u\n",
+                            "  tex 0x%08X %ux%u fmt %02X valid %d  u %.2f..%.2f"
+                            " v %.2f..%.2f  blend %u %X/%X eq %X bc %08X  alpha %u %X %02X"
+                            "  cmask %08X tc0 %08X\n",
                     s_gpu.flips, s_gpu.prim, n, lx, hx, ly, hy, s_vp_verts[0].argb,
                     s_gpu.tex.offset, s_gpu.tex.width, s_gpu.tex.height,
                     s_gpu.tex.color, s_gpu.tex.valid,
-                    s_vp_verts[0].uv[0], s_vp_verts[0].uv[1], s_gpu.blend_enable);
+                    lu, hu, lv, hv, s_gpu.blend_enable,
+                    s_gpu.blend_sfactor, s_gpu.blend_dfactor,
+                    s_gpu.blend_equation, s_gpu.blend_color,
+                    s_gpu.alpha_test, s_gpu.alpha_func, s_gpu.alpha_ref,
+                    s_gpu.color_mask, s_tex_reg[(0x1B0C - NV_TEX_FIRST) / 4]);
+            /* The stages past the first. This rasteriser samples stage 0 and
+             * nothing else, so a title that combines two stages -- a stencil
+             * pattern in one and the matter that fills it in the other -- gets
+             * the matter alone, spread over the whole quad. Printing what the
+             * other stages hold says whether that is what is happening. */
+            {
+                int st_i;
+                for (st_i = 1; st_i < 4; st_i++) {
+                    uint32_t o = (uint32_t)(0x1B00 + st_i * 0x40 - NV_TEX_FIRST) / 4;
+                    if (!s_tex_set[o] && !s_tex_set[o + 1])
+                        continue;
+                    fprintf(stderr, "  [VPF]   stage%d offset 0x%08X format 0x%08X\n",
+                            st_i, s_tex_reg[o], s_tex_reg[o + 1]);
+                }
+            }
             {
                 static const int rows[] = { 0, 1, 2, 3, 4, 5, 8, 9, 96, 97, 98, 99 };
                 uint32_t r;
@@ -2796,6 +2912,9 @@ static void raster_batch_program(void)
                 break;
             }
     }
+
+    if (tex_skipped(s_gpu.tex.offset))
+        return;
 
     t = batch_triangles(s_gpu.prim, n, s_vp_tris, NV_MAX_INDICES * 2);
     for (i = 0; i < t; i++) {
