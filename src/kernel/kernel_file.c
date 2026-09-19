@@ -115,6 +115,18 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     if (!xbox_path)
         return FALSE;
 
+    /* Le nom tel que le titre le donne, avec le répertoire de référence.
+     * Un nom qui ne commence pas par '\' n'est pas un chemin Xbox : c'est un
+     * nom relatif, et sans son RootDirectory il ne mène nulle part. */
+    if (getenv("RECOMP_DIR_TRACE") && xbox_path[0] != '\\') {
+        static int shown;
+        if (shown++ < 400) {
+            fprintf(stderr, "  [REL] nom « %s », RootDirectory %p\n",
+                    xbox_path, (void *)ObjectAttributes->RootDirectory);
+            fflush(stderr);
+        }
+    }
+
     /* A name given relative to an open directory handle.
      *
      * NT titles open a directory once and then name its contents relative to
@@ -211,6 +223,19 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             else
                 wcscpy_s(win_path, MAX_PATH, L".");
             CreateOptions |= XBOX_FILE_DIRECTORY_FILE;
+        }
+    }
+
+    /* Ce que le titre ouvre réellement du côté hôte, chemin final compris.
+     * Les ouvertures relatives à un répertoire n'ont pas de ligne [PATH] :
+     * leur nom n'est pas un chemin Xbox, donc c'est ici ou nulle part. */
+    if (getenv("RECOMP_DIR_TRACE")) {
+        static int shown;
+        if (shown < 200 && (wcsstr(win_path, L"UDATA") || wcsstr(win_path, L"TDATA"))) {
+            shown++;
+            fprintf(stderr, "  [OPEN] %ls%s\n", win_path,
+                    has_pattern ? "  (énumération)" : "");
+            fflush(stderr);
         }
     }
 

@@ -333,6 +333,11 @@ static long kernel_log_budget(void)
 /* Some sites logged at a tighter cap than the rest; keep them proportional. */
 #define KERNEL_LOG_ON_HALF() (g_kernel_call_count <= kernel_log_budget() / 2)
 
+/* Renseignés par le répartiteur, plus bas : l'ordinal et l'adresse de retour
+ * invitée de l'appel en cours. */
+extern RECOMP_TLS uint32_t g_xbox_current_ordinal;
+extern RECOMP_TLS uint32_t g_xbox_current_ret;
+
 /* Read Xbox stack arg as uint32_t.
  * After kernel_thunk_dispatch pops the dummy return address (g_esp += 4),
  * arg0 is at g_esp+0, arg1 at g_esp+4, etc. */
@@ -2746,7 +2751,42 @@ static NTSTATUS bridge_create_file_impl(
     NTSTATUS st;
 
     bridge_build_oa(obj_attrs_va, &oa, &name);
+
+    /* Qui demande quoi. Un nom qui ne commence pas par '\' vient d'un chemin
+     * construit par le titre : s'il est corrompu, c'est l'appelant qu'il faut
+     * remonter, et lui seul donne l'adresse de retour invitée. */
+    if (name.Buffer && name.Buffer[0] != '\\' && getenv("RECOMP_DIR_TRACE")) {
+        static int shown;
+        if (shown++ < 400)
+        {
+            /* La pile invitée, balayée comme le fait le gestionnaire de
+             * crash : l'appelant direct ne suffit pas quand il s'agit d'un
+             * helper générique comme CreateFile. */
+            int i, found = 0;
+            fprintf(stderr, "  [REL] « %s » demandé depuis 0x%08X, pile :",
+                    name.Buffer, g_xbox_current_ret);
+            for (i = 0; i < 256 && found < 6; i++) {
+                uint32_t v = BRIDGE_MEM32(g_esp + i * 4);
+                if (v > 0x00011000u && v < 0x002D0000u) {
+                    fprintf(stderr, " 0x%08X", v);
+                    found++;
+                }
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+    }
+
     if (!name.Buffer) {
+        /* Un nom vide n'est pas une erreur en NT : avec un RootDirectory, il
+         * désigne l'objet déjà ouvert. Le dire, parce que ce rejet est muet
+         * autrement -- aucune traduction de chemin ne l'accompagne. */
+        if (getenv("RECOMP_DIR_TRACE")) {
+            fprintf(stderr, "  [REL] nom vide, RootDirectory 0x%08X --"
+                            " ouverture refusée\n",
+                    obj_attrs_va ? BRIDGE_MEM32(obj_attrs_va) : 0);
+            fflush(stderr);
+        }
         bridge_write_iostatus(iostatus_va, STATUS_OBJECT_PATH_NOT_FOUND, 0);
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
@@ -8999,6 +9039,10 @@ static RECOMP_TLS int g_kernel_dispatch_slot = -1;
  * inférieur (la traduction de chemins) puissent dire qui les appelle. */
 RECOMP_TLS uint32_t g_xbox_current_ordinal = 0;
 
+/* L'adresse de retour invitée de cet appel : la seule façon, depuis un étage
+ * inférieur, de nommer le code du titre qui a demandé quelque chose. */
+RECOMP_TLS uint32_t g_xbox_current_ret = 0;
+
 static void kernel_thunk_dispatch(void)
 {
     int slot = g_kernel_dispatch_slot;
@@ -9014,6 +9058,7 @@ static void kernel_thunk_dispatch(void)
 
     ordinal = g_slot_ordinals[slot];
     g_xbox_current_ordinal = ordinal;
+    g_xbox_current_ret = g_esp ? BRIDGE_MEM32(g_esp) : 0;
     bridge = g_slot_bridges[slot];
 
     g_kernel_call_count++;
