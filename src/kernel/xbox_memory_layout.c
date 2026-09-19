@@ -258,6 +258,137 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
  * paces audio off it yet. Derive it from a real clock if timing starts to
  * matter.
  */
+/*
+ * AC'97 bus-master reset, modelled by trapping the write rather than by
+ * clearing the bit afterwards.
+ *
+ * Each of the three DMA channels -- PCM In, PCM Out, Mic In -- has a one-byte
+ * control register at NABM + 0x0B, and bit 1 is RR, "Reset Registers".
+ * Software sets it and waits for the controller to clear it. DDS9 does that
+ * inside DirectSoundCreate, and the wait is worth quoting because it is not a
+ * poll:
+ *
+ *     mov  cl, [eax+0xFEC0010B]
+ *     and  cl, 2
+ *   L: test cl, cl
+ *     jne  L
+ *
+ * MSVC hoisted the load out of the loop -- the pointer was not volatile -- so
+ * the title reads the register exactly ONCE, a few instructions after writing
+ * it, and spins forever on whatever that single read returned. On hardware
+ * the reset has long completed by then.
+ *
+ * That rules out the NV2A_ACK approach. A thread that clears the bit
+ * afterwards is racing a window a few instructions wide and gets only one
+ * attempt; measured, it loses, and the title sits on a stale cl = 2 while the
+ * register itself reads 0. The bit has to be clear at the moment of the read,
+ * which means the write must never deposit it.
+ *
+ * So the page is PAGE_READONLY: reads run at full speed and see plain memory,
+ * writes fault. The fault handler makes the page writable, single-steps the
+ * faulting instruction, then masks RR out of the three control bytes and
+ * re-protects. No instruction decoding, which matters because the write forms
+ * a compiler emits here are not worth enumerating -- and being wrong about
+ * one would corrupt a register rather than fail visibly.
+ *
+ * Only RR. Bit 0 is RPBM, run/pause bus master, which software owns.
+ */
+#define AC97_NABM_OFFSET  0x400000u   /* 0xFEC00000 within the MCPX aperture */
+#define AC97_TRAP_BYTES   0x1000u
+#define AC97_RR           0x02u
+
+static void *g_ac97_page = NULL;      /* host address of the trapped page */
+static void *g_ac97_veh  = NULL;
+static RECOMP_TLS int s_ac97_stepping = 0;
+
+static void ac97_clear_reset_bits(void)
+{
+    /* Every bus-master channel, not the three a PC AC'97 has.
+     *
+     * The generic controller has PCM In, PCM Out and Mic In at NABM +0x00,
+     * +0x10 and +0x20; the MCPX has more, and DDS9 walks a table of channel
+     * offsets rather than naming them. It reset the channel at +0x00 first
+     * and then one at +0x60 -- which a three-entry list did not cover, so it
+     * spun on the second exactly as it had on the first. Sweeping the whole
+     * NABM block is both simpler and right: +0x0B is the control byte of
+     * whatever channel lives there, and RR is the same bit in all of them. */
+    uint32_t off;
+
+    for (off = 0x10B; off < 0x180; off += 0x10) {
+        volatile uint8_t *r = (volatile uint8_t *)((char *)g_ac97_page + off);
+        if (*r & AC97_RR)
+            *r = (uint8_t)(*r & ~AC97_RR);
+    }
+}
+
+static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    DWORD old;
+
+    if (!g_ac97_page)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    /* Second half: the faulting write has now executed. Apply what the
+     * controller would have done and close the page again. Thread-local,
+     * because another thread must not mistake its own single-step for this
+     * one -- and re-protecting from the wrong thread would strand this one
+     * mid-step. */
+    if (code == EXCEPTION_SINGLE_STEP && s_ac97_stepping) {
+        s_ac97_stepping = 0;
+        ac97_clear_reset_bits();
+        VirtualProtect(g_ac97_page, AC97_TRAP_BYTES, PAGE_READONLY, &old);
+        ep->ContextRecord->EFlags &= ~0x100u;   /* clear TF */
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    if (code == EXCEPTION_ACCESS_VIOLATION
+            && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+        uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
+
+        if (fault >= (uintptr_t)g_ac97_page
+                && fault < (uintptr_t)g_ac97_page + AC97_TRAP_BYTES) {
+            if (!VirtualProtect(g_ac97_page, AC97_TRAP_BYTES,
+                                PAGE_READWRITE, &old))
+                return EXCEPTION_CONTINUE_SEARCH;
+            s_ac97_stepping = 1;
+            ep->ContextRecord->EFlags |= 0x100u;   /* TF: step the write */
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Arm the trap. Called once the MCPX aperture exists, and only alongside the
+ * rest of RECOMP_AC97_READY: a title that never gets as far as resetting a
+ * channel has nothing to gain from it, and the page fault costs something. */
+static void ac97_arm_write_trap(void)
+{
+    DWORD old;
+
+    if (!g_mcpx_memory || g_ac97_page)
+        return;
+    g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
+    /* First, so it runs before the game target's own crash reporter, which
+     * would otherwise print the write as an access violation. */
+    g_ac97_veh = AddVectoredExceptionHandler(1, ac97_write_veh);
+    if (!g_ac97_veh
+            || !VirtualProtect(g_ac97_page, AC97_TRAP_BYTES,
+                               PAGE_READONLY, &old)) {
+        if (g_ac97_veh) {
+            RemoveVectoredExceptionHandler(g_ac97_veh);
+            g_ac97_veh = NULL;
+        }
+        g_ac97_page = NULL;
+        fprintf(stderr, "  AC97: could not arm the bus-master write trap;"
+                        " a channel reset will spin\n");
+        return;
+    }
+    fprintf(stderr, "  AC97: bus-master writes trapped at 0x%08X"
+                    " (channel reset completes on write)\n",
+            XBOX_MCPX_BASE + AC97_NABM_OFFSET);
+}
+
 static const uint32_t MCPX_COUNTERS[] = {
     0x020010,   /* APU GP sample counter, DirectSound SetupVoiceProcessor */
 };
@@ -2042,6 +2173,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 *(volatile uint32_t *)((char *)g_mcpx_memory
                                        + MCPX_AC97_CODEC_STATUS)
                     |= MCPX_AC97_CODEC_READY;
+                /* Before the trap is armed: this write would otherwise be
+                 * the first thing to fault. */
+                ac97_arm_write_trap();
                 fprintf(stderr, "  AC97: codec reported ready at 0x%08X"
                                 " (DirectSound will initialise)\n",
                         XBOX_MCPX_BASE + MCPX_AC97_CODEC_STATUS);
