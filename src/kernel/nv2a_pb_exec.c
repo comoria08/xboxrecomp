@@ -408,6 +408,45 @@ static int tex_stage0_enabled(void)
     return (s_tex_reg[i] & (1u << 30)) != 0;
 }
 
+/* The register combiners, captured and not executed.
+ *
+ * They are what an NV2A actually computes a fragment's colour with: up to
+ * eight general stages, then a final combiner. This rasteriser has one hard
+ * wired rule instead -- texel times vertex colour -- so every batch whose
+ * combiners say something else comes out wrong, and a batch whose vertex
+ * colour is zero comes out invisible. Recording what the title programs is
+ * the cheapest way to find out how much of the model it actually uses before
+ * deciding to implement any of it. */
+static uint32_t s_comb_ctrl, s_comb_fog0, s_comb_fog1;
+static uint32_t s_comb_color_icw[8], s_comb_color_ocw[8];
+static uint32_t s_comb_alpha_icw[8], s_comb_alpha_ocw[8];
+static uint32_t s_comb_factor0[8], s_comb_factor1[8];
+
+static int record_combiner_reg(uint32_t method, uint32_t param)
+{
+    /* Addresses confirmed against the method inventory (RECOMP_PB_SCAN): the
+     * title sends 0x0260-0x027C, 0x0288/0x028C, 0x0A60-0x0ADC and
+     * 0x0AE0-0x0AEC, and nothing at 0x0280 or 0x1288 -- which is where a
+     * first guess had put the output words and the final combiner. */
+    if (method >= 0x0260 && method < 0x0280)
+        s_comb_alpha_icw[(method - 0x0260) / 4] = param;
+    else if (method == 0x0288) s_comb_fog0 = param;   /* final combiner */
+    else if (method == 0x028C) s_comb_fog1 = param;
+    else if (method >= 0x0A60 && method < 0x0A80)
+        s_comb_factor0[(method - 0x0A60) / 4] = param;
+    else if (method >= 0x0A80 && method < 0x0AA0)
+        s_comb_factor1[(method - 0x0A80) / 4] = param;
+    else if (method >= 0x0AA0 && method < 0x0AC0)
+        s_comb_alpha_ocw[(method - 0x0AA0) / 4] = param;
+    else if (method >= 0x0AC0 && method < 0x0AE0)
+        s_comb_color_icw[(method - 0x0AC0) / 4] = param;
+    else if (method >= 0x0AE0 && method < 0x0AF0)
+        s_comb_color_ocw[(method - 0x0AE0) / 4] = param;
+    else if (method == 0x1294) s_comb_ctrl = param;
+    else return 0;
+    return 1;
+}
+
 /* A batch that writes no colour with its texture stage switched off is laying
  * down depth alone. See the note above tex_stage0_enabled. */
 static int depth_only_batch(void)
@@ -526,6 +565,65 @@ static void note_unhandled(uint32_t method, uint32_t param)
 /* Read attribute `a` of vertex `index` as floats. Only the float and the
  * normalised-byte types appear in practice; anything else returns 0 so a
  * caller sees a degenerate vertex rather than reading past the array. */
+/* The value an attribute keeps while its array is switched off.
+ *
+ * SET_VERTEX_DATA4UB sets an attribute's current value, and a vertex whose
+ * array for that attribute is disabled (size 0) takes it -- that is how a
+ * title draws a whole batch in one colour without putting it in every vertex.
+ * Only the inline path used it here, so an ordinary indexed batch with the
+ * colour array off handed the vertex program (0,0,0,1) instead: transparent
+ * black. Def Jam draws the stat bars of its select screen exactly that way,
+ * and their combiners ask for the diffuse colour and nothing else, so they
+ * came out invisible -- 113 batches of 129 in that frame have the array off.
+ *
+ * RECOMP_IMM_ATTR=0 goes back to ignoring it. */
+static uint32_t s_imm_attr[NV_VERTEX_ATTRS];
+static uint8_t  s_imm_set[NV_VERTEX_ATTRS];
+
+static int imm_attr_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_IMM_ATTR");
+        on = !(v && atoi(v) == 0);
+    }
+    return on;
+}
+
+/* A colour attribute the batch does not supply at all.
+ *
+ * fetch_attr leaves (0,0,0,1) behind, and for a colour that is transparent
+ * black: a vertex program that reads v3 and writes it to oD0 then paints the
+ * batch with nothing. White is the value the D3D runtime leaves in those
+ * registers, and it is the neutral one for the modulate the combiners ask
+ * for -- vertex_color has returned white for an absent colour since bring-up
+ * for exactly this reason; the vertex program path never got the same
+ * treatment. Only the two colour registers, diffuse and specular: white is
+ * meaningless for a position or a texture coordinate. */
+static int default_color_attr(uint32_t a, float out[4])
+{
+    if ((a != 3 && a != 4) || !imm_attr_enabled())
+        return 0;
+    out[0] = out[1] = out[2] = out[3] = 1.0f;
+    return 1;
+}
+
+static int imm_attr_value(uint32_t a, float out[4])
+{
+    uint32_t c;
+
+    if (a >= NV_VERTEX_ATTRS || !imm_attr_enabled())
+        return 0;
+    if (!s_imm_set[a])
+        return default_color_attr(a, out);
+    c = s_imm_attr[a];
+    out[0] = (float)((c >> 16) & 0xFF) / 255.0f;   /* D3DCOLOR is ARGB */
+    out[1] = (float)((c >>  8) & 0xFF) / 255.0f;
+    out[2] = (float)( c        & 0xFF) / 255.0f;
+    out[3] = (float)((c >> 24) & 0xFF) / 255.0f;
+    return 1;
+}
+
 static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -2003,7 +2101,8 @@ static uint32_t vertex_color(uint32_t index)
 {
     float c[4];
 
-    if (!fetch_attr(color_attr(), index, c))
+    if (!fetch_attr(color_attr(), index, c)
+            && !imm_attr_value(3, c))
         return 0xFFFFFFFFu;
     return ((uint32_t)(c[3] * 255.0f) << 24)
          | ((uint32_t)(c[0] * 255.0f) << 16)
@@ -2187,6 +2286,17 @@ static int vp_method(uint32_t method, uint32_t param)
             && method < NV097_SET_TRANSFORM_CONSTANT + 16 * 4) {
         uint32_t slot = (method - NV097_SET_TRANSFORM_CONSTANT) / 4;
         if (s_vp.c_load < VP_CONSTANTS) {
+            /* Under F9, every low constant the title uploads during the
+             * logged frame. A program reading a constant the title never
+             * wrote gets zero, and only the upload log distinguishes "never
+             * sent" from "sent and lost on our side". */
+            if (s_gpu.flips == s_vpf_flip && s_vp.c_load < 16) {
+                float f;
+                memcpy(&f, &param, 4);
+                fprintf(stderr, "  [VPFC]  c%u.%u = %g", s_vp.c_load,
+                        slot % 4, f);
+                fprintf(stderr, "\n");
+            }
             memcpy(&s_vp.c[s_vp.c_load][slot % 4], &param, 4);
             if (slot % 4 == 3)
                 s_vp.c_load++;
@@ -2464,7 +2574,8 @@ static void vp_transform(uint32_t index, VpVertex *out)
         vp_decode();
     for (a = 0; a < NV_VERTEX_ATTRS; a++)
         if ((s_vp_inputs >> a) & 1 || env_on(ENV_VP_TRACE))
-            fetch_attr(&s_gpu.attr[a], index, s.v[a]);
+            if (!fetch_attr(&s_gpu.attr[a], index, s.v[a]))
+                imm_attr_value(a, s.v[a]);
 
     out->ok = vp_run(&s);
     s_vp.runs++;
@@ -2875,6 +2986,13 @@ static void raster_batch_program(void)
              * pattern in one and the matter that fills it in the other -- gets
              * the matter alone, spread over the whole quad. Printing what the
              * other stages hold says whether that is what is happening. */
+            fprintf(stderr, "  [VPF]   comb ctrl %08X final %08X %08X"
+                            "  s0 cicw %08X cocw %08X aicw %08X aocw %08X"
+                            "  f0 %08X f1 %08X\n",
+                    s_comb_ctrl, s_comb_fog0, s_comb_fog1,
+                    s_comb_color_icw[0], s_comb_color_ocw[0],
+                    s_comb_alpha_icw[0], s_comb_alpha_ocw[0],
+                    s_comb_factor0[0], s_comb_factor1[0]);
             {
                 int st_i;
                 for (st_i = 1; st_i < 4; st_i++) {
@@ -2886,11 +3004,62 @@ static void raster_batch_program(void)
                 }
             }
             {
+                /* Every constant the program could be reading, not just the
+                 * dozen usually worth printing: a batch that comes out with
+                 * no colour and no texture coordinates is reading something,
+                 * and the only way to find which slot carries what is to see
+                 * them all. Zero rows are skipped, so this stays short. */
+                /* The program itself, decoded. Which outputs it writes and
+                 * which constants it reads is the only thing that says why a
+                 * batch comes out with no colour and no texture coordinates:
+                 * a program that never writes oD0 cannot be fixed by feeding
+                 * it a better vertex colour. */
+                {
+                    uint32_t ii;
+                    for (ii = 0; ii < s_vp_code_len && ii < 24; ii++) {
+                        const VpInsn *d = &s_vp_code[ii];
+                        fprintf(stderr, "  [VPF]   i%-2u mac %2u ilu %u out o%-2u"
+                                        " mask %X mmask %X imask %X c%-3u%s"
+                                        " mux %u/%u/%u in v%u\n",
+                                ii, d->mac, d->ilu, d->orb, d->out_mask,
+                                d->mac_mask, d->ilu_mask, d->cidx,
+                                d->rel ? "+a0" : "   ",
+                                d->mux[0], d->mux[1], d->mux[2], d->input);
+                    }
+                }
+                {
+                    int ci, shown = 0;
+                    fprintf(stderr, "  [VPF]   nonzero c:");
+                    for (ci = 0; ci < 96; ci++) {
+                        if (s_vp.c[ci][0] == 0.0f && s_vp.c[ci][1] == 0.0f
+                         && s_vp.c[ci][2] == 0.0f && s_vp.c[ci][3] == 0.0f)
+                            continue;
+                        if (++shown > 16)
+                            break;
+                        fprintf(stderr, " c%d(%g %g %g %g)", ci,
+                                s_vp.c[ci][0], s_vp.c[ci][1],
+                                s_vp.c[ci][2], s_vp.c[ci][3]);
+                    }
+                    fprintf(stderr, "\n");
+                }
                 static const int rows[] = { 0, 1, 2, 3, 4, 5, 8, 9, 96, 97, 98, 99 };
                 uint32_t r;
                 float in[4];
                 fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], in);
                 fprintf(stderr, "  [VPF]   v0 in %.2f %.2f %.2f %.2f\n", in[0], in[1], in[2], in[3]);
+                /* Where the diffuse colour is read from, and what comes back.
+                 * A batch drawn in transparent black is either reading the
+                 * wrong place or reading it the wrong way, and the stream's
+                 * type and stride say which. */
+                {
+                    const VertexAttr *ca = color_attr();
+                    float c[4];
+                    int got = fetch_attr(ca, s_gpu.idx[0], c);
+                    fprintf(stderr, "  [VPF]   colour off 0x%08X type %u size %u"
+                                    " stride %u -> %s %.3f %.3f %.3f %.3f\n",
+                            ca->offset, ca->type, ca->size, ca->stride,
+                            got ? "read" : "absent,white", c[0], c[1], c[2], c[3]);
+                }
                 for (r = 0; r < sizeof rows / sizeof rows[0]; r++)
                     fprintf(stderr, "  [VPF]   c%-3d %13g %13g %13g %13g\n", rows[r],
                             s_vp.c[rows[r]][0], s_vp.c[rows[r]][1],
@@ -3313,7 +3482,10 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
     }
     if (method >= NV097_SET_VERTEX_DATA4UB
             && method < NV097_SET_VERTEX_DATA4UB + NV_VERTEX_ATTRS * 4) {
-        if ((method - NV097_SET_VERTEX_DATA4UB) / 4 == 3)   /* diffuse */
+        uint32_t a = (method - NV097_SET_VERTEX_DATA4UB) / 4;
+        s_imm_attr[a] = param;
+        s_imm_set[a] = 1;
+        if (a == 3)                                        /* diffuse */
             s_gpu.imm_diffuse = param;
         return 1;
     }
@@ -3572,6 +3744,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
 
     default:
+        record_combiner_reg(method, param);
         if (method >= NV_TEX_FIRST && method <= NV_TEX_LAST)
             record_tex_reg(method, param);
         if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
