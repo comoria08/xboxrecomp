@@ -93,7 +93,9 @@ static int   s_depth_count;
 typedef struct {
     uint32_t key[6];
     uint64_t hash;
-    uint32_t w, h, used;
+    uint32_t w, h, used;                  /* the D3D texture's own size */
+    uint32_t decl_w, decl_h;              /* what the title declared: the two differ
+                                           * when a pack image stands in */
     int      rt;                          /* >= 0: really render target #rt */
     ID3D11Texture2D          *tex;
     ID3D11ShaderResourceView *srv;
@@ -591,12 +593,187 @@ uint32_t nvd3d_target(uint32_t base, uint32_t width, uint32_t height)
 static uint32_t *s_decode_buf;
 static size_t    s_decode_cap;
 
+/* ── Texture pack, keyed by the texture's fingerprint ───────────────── */
+/*
+ * RECOMP_TEX_PACK=<dir> lets a file stand in for a texture the title loaded,
+ * and it may be LARGER than the original. That works because nothing
+ * downstream knows the replacement's size: the pixel shader divides the
+ * incoming coordinates by tex_w/tex_h, which is what the TITLE declared
+ * through SET_TEXTURE_FORMAT, and samples normalised. Measured in a frame
+ * log: a 64x64 texture is addressed u 1.25..63.05, a 256x256 one
+ * u 19.93..236.16 -- texels of the declared size. Divided by that size the
+ * result is 0..1 whatever the file behind it actually is.
+ *
+ * Hence the one rule: the replacement must keep the ORIGINAL RATIO. A 2x or
+ * 4x image lands exactly on the original; a different ratio would stretch the
+ * texture over the same UV rectangle, and is refused rather than silently
+ * distorting the model.
+ *
+ * Files are named by the fingerprint the GPU path already computes over the
+ * texture's bytes (and its palette), so a pack does not depend on addresses,
+ * load order, or which archive a texture came from. RECOMP_TEX_PACK_DUMP=<dir>
+ * writes each texture out under that name, which is how a pack is started:
+ * run once, enlarge the files worth enlarging, point RECOMP_TEX_PACK at them.
+ *
+ * BMP, because it needs no decoder and every editor writes it: 32-bit BGRA
+ * out (BITMAPV4HEADER, so the alpha survives the round trip -- a fighter's
+ * atlas is alpha-tested and would come back opaque otherwise), 24- or 32-bit
+ * in.
+ *
+ * Reserve: a texture read back out of a render target keeps the Load path and
+ * is addressed in whole texels, so it is not packable. Those are the title's
+ * own frames, not artwork.
+ */
+static const char *pack_dir(void)
+{
+    static const char *dir;
+    static int asked;
+    if (!asked) { asked = 1; dir = getenv("RECOMP_TEX_PACK"); }
+    return dir;
+}
+
+static const char *pack_dump_dir(void)
+{
+    static const char *dir;
+    static int asked;
+    if (!asked) { asked = 1; dir = getenv("RECOMP_TEX_PACK_DUMP"); }
+    return dir;
+}
+
+static void pack_path(char *out, size_t n, const char *dir, uint64_t hash)
+{
+    snprintf(out, n, "%s%s%016llX.bmp", dir,
+             (dir[0] && (dir[strlen(dir) - 1] == '\\' || dir[strlen(dir) - 1] == '/'))
+                 ? "" : "\\",
+             (unsigned long long)hash);
+}
+
+/* Reads 24- or 32-bit uncompressed BMP into fresh BGRA. NULL if absent or
+ * unusable; *pw / *ph get the file's size. */
+static uint32_t *pack_read(const char *path, uint32_t *pw, uint32_t *ph)
+{
+    FILE *f = fopen(path, "rb");
+    uint8_t fh[14], ih[124];
+    uint32_t off, hs, bpp, comp, row, pad, x, y;
+    int32_t  w, h, flip;
+    uint32_t *out;
+
+    if (!f)
+        return NULL;
+    if (fread(fh, 1, sizeof fh, f) != sizeof fh || fh[0] != 'B' || fh[1] != 'M')
+        { fclose(f); return NULL; }
+    memcpy(&off, fh + 10, 4);
+    if (fread(ih, 1, 4, f) != 4)
+        { fclose(f); return NULL; }
+    memcpy(&hs, ih, 4);
+    if (hs < 40 || hs > sizeof ih || fread(ih + 4, 1, hs - 4, f) != hs - 4)
+        { fclose(f); return NULL; }
+    memcpy(&w, ih + 4, 4);
+    memcpy(&h, ih + 8, 4);
+    memcpy(&bpp, ih + 14, 4);
+    bpp &= 0xFFFFu;
+    memcpy(&comp, ih + 16, 4);
+    flip = h > 0;                       /* positive height: rows bottom-up */
+    if (h < 0) h = -h;
+    if (w <= 0 || h <= 0 || w > 8192 || h > 8192 || (bpp != 24 && bpp != 32)
+            || (comp != 0 && comp != 3))
+        { fclose(f); return NULL; }
+
+    row = ((uint32_t)w * (bpp / 8) + 3u) & ~3u;
+    pad = row - (uint32_t)w * (bpp / 8);
+    out = (uint32_t *)malloc((size_t)w * h * 4);
+    if (!out) { fclose(f); return NULL; }
+    if (fseek(f, (long)off, SEEK_SET) != 0) { free(out); fclose(f); return NULL; }
+    for (y = 0; y < (uint32_t)h; y++) {
+        uint32_t *dst = out + (size_t)(flip ? (uint32_t)h - 1 - y : y) * w;
+        for (x = 0; x < (uint32_t)w; x++) {
+            uint8_t px[4] = { 0, 0, 0, 0xFF };
+            if (fread(px, 1, bpp / 8, f) != bpp / 8)
+                { free(out); fclose(f); return NULL; }
+            if (bpp == 24) px[3] = 0xFF;
+            dst[x] = ((uint32_t)px[3] << 24) | ((uint32_t)px[2] << 16)
+                   | ((uint32_t)px[1] << 8) | px[0];
+        }
+        if (pad && fseek(f, (long)pad, SEEK_CUR) != 0)
+            { free(out); fclose(f); return NULL; }
+    }
+    fclose(f);
+    *pw = (uint32_t)w; *ph = (uint32_t)h;
+    return out;
+}
+
+static void pack_write(const char *path, const uint32_t *bgra, uint32_t w, uint32_t h)
+{
+    FILE *f;
+    uint8_t fh[14], ih[108];
+    uint32_t off = 14 + 108, filesz = off + w * h * 4, y;
+    int32_t  neg = -(int32_t)h;         /* top-down, so no row juggling */
+    static const uint32_t masks[4] = { 0x00FF0000u, 0x0000FF00u, 0x000000FFu, 0xFF000000u };
+
+    f = fopen(path, "wb");
+    if (!f)
+        return;
+    memset(fh, 0, sizeof fh); memset(ih, 0, sizeof ih);
+    fh[0] = 'B'; fh[1] = 'M';
+    memcpy(fh + 2, &filesz, 4);
+    memcpy(fh + 10, &off, 4);
+    ih[0] = 108;                        /* BITMAPV4HEADER */
+    memcpy(ih + 4, &w, 4);
+    memcpy(ih + 8, &neg, 4);
+    ih[12] = 1; ih[14] = 32;
+    ih[16] = 3;                         /* BI_BITFIELDS */
+    memcpy(ih + 40, masks, sizeof masks);
+    ih[56] = 'B'; ih[57] = 'G'; ih[58] = 'R'; ih[59] = 's';   /* LCS_sRGB */
+    fwrite(fh, 1, sizeof fh, f);
+    fwrite(ih, 1, sizeof ih, f);
+    for (y = 0; y < h; y++)
+        fwrite(bgra + (size_t)y * w, 4, w, f);
+    fclose(f);
+}
+
+/* The replacement for this fingerprint, or NULL. Refuses a different ratio. */
+static uint32_t *pack_lookup(uint64_t hash, uint32_t width, uint32_t height,
+                             uint32_t *pw, uint32_t *ph)
+{
+    const char *dir = pack_dir();
+    char path[512];
+    uint32_t *pix;
+
+    if (!dir || !*dir)
+        return NULL;
+    pack_path(path, sizeof path, dir, hash);
+    pix = pack_read(path, pw, ph);
+    if (!pix)
+        return NULL;
+    if ((uint64_t)*pw * height != (uint64_t)*ph * width) {
+        fprintf(stderr, "  [TEXPACK] %016llX refused: %ux%u is not the ratio of %ux%u\n",
+                (unsigned long long)hash, *pw, *ph, width, height);
+        free(pix);
+        return NULL;
+    }
+    {
+        static int said;
+        if (said++ < 64)
+            fprintf(stderr, "  [TEXPACK] %016llX %ux%u -> %ux%u\n",
+                    (unsigned long long)hash, width, height, *pw, *ph);
+        if (said == 1) {
+            const char *f = getenv("RECOMP_TEX_FILTER");
+            if (f && atoi(f) == 0)
+                fprintf(stderr, "  [TEXPACK] warning: RECOMP_TEX_FILTER=0 reads whole texels"
+                        " of the declared size, so an enlarged image is only partly seen\n");
+        }
+    }
+    return pix;
+}
+
 int nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t width, uint32_t height,
                   uint32_t mem_base, uint32_t mem_bytes,
                   void (*decode)(uint32_t *dst, uint32_t width, uint32_t height))
 {
     int i, slot = -1;
     Tex *t;
+    uint32_t *pack = NULL, *src;
+    uint32_t sw, sh;
 
     if (!width || !height || width > 4096 || height > 4096)
         return -1;
@@ -622,8 +799,8 @@ int nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t width, uint32_t
             slot = i;
             break;
         }
-    if (slot >= 0 && s_tex[slot].hash == hash && s_tex[slot].w == width
-            && s_tex[slot].h == height) {
+    if (slot >= 0 && s_tex[slot].hash == hash && s_tex[slot].decl_w == width
+            && s_tex[slot].decl_h == height) {
         s_tex[slot].used = s_use_clock;
         return slot;
     }
@@ -649,10 +826,25 @@ int nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t width, uint32_t
     }
     decode(s_decode_buf, width, height);
 
-    if (t->tex && t->w == width && t->h == height) {
+    /* A pack image stands in for what the title loaded, at its own size. The
+     * declared size is what the shader divides by, so only the ratio has to
+     * match -- see the comment on pack_lookup. */
+    pack = pack_lookup(hash, width, height, &sw, &sh);
+    if (pack) {
+        src = pack;
+    } else {
+        src = s_decode_buf; sw = width; sh = height;
+        if (pack_dump_dir()) {
+            char path[512];
+            pack_path(path, sizeof path, pack_dump_dir(), hash);
+            pack_write(path, s_decode_buf, width, height);
+        }
+    }
+
+    if (t->tex && t->w == sw && t->h == sh) {
         flush();   /* the batch may sample the old contents */
         ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)t->tex, 0, NULL,
-                                              s_decode_buf, width * 4, 0);
+                                              src, sw * 4, 0);
     } else {
         D3D11_TEXTURE2D_DESC td;
         D3D11_SUBRESOURCE_DATA init;
@@ -661,22 +853,27 @@ int nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t width, uint32_t
         if (t->tex) ID3D11Texture2D_Release(t->tex);
         t->srv = NULL; t->tex = NULL;
         memset(&td, 0, sizeof td);
-        td.Width = width; td.Height = height; td.MipLevels = 1; td.ArraySize = 1;
+        td.Width = sw; td.Height = sh; td.MipLevels = 1; td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        init.pSysMem = s_decode_buf;
-        init.SysMemPitch = width * 4;
+        init.pSysMem = src;
+        init.SysMemPitch = sw * 4;
         init.SysMemSlicePitch = 0;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, &init, &t->tex)))
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, &init, &t->tex))) {
+            free(pack);
             return -1;
+        }
         ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t->tex, NULL, &t->srv);
     }
+    free(pack);
     memcpy(t->key, key, sizeof t->key);
     t->hash = hash;
-    t->w = width;
-    t->h = height;
+    t->w = sw;
+    t->h = sh;
+    t->decl_w = width;
+    t->decl_h = height;
     t->used = s_use_clock;
     return slot;
 }
