@@ -45,14 +45,15 @@ extern int xbox_FramebufferWindowPixelsWanted(void);
  * environment does not change while the title runs. */
 enum {
     ENV_ZCLEAR_TRACE, ENV_VP_TRACE, ENV_VP_OFF, ENV_PB_EXEC_VERBOSE,
-    ENV_RASTER_TEST,
+    ENV_RASTER_TEST, ENV_CULL_FLIP, ENV_CULL_TRACE,
     ENV_COUNT
 };
 static const char *const s_env_names[ENV_COUNT] = {
     "RECOMP_ZCLEAR_TRACE", "RECOMP_VP_TRACE", "RECOMP_VP_OFF",
-    "RECOMP_PB_EXEC_VERBOSE", "RECOMP_RASTER_TEST",
+    "RECOMP_PB_EXEC_VERBOSE", "RECOMP_RASTER_TEST", "RECOMP_CULL_FLIP",
+    "RECOMP_CULL_TRACE",
 };
-static signed char s_env_on[ENV_COUNT] = { -1, -1, -1, -1, -1 };
+static signed char s_env_on[ENV_COUNT] = { -1, -1, -1, -1, -1, -1, -1 };
 
 static int env_on(int which)
 {
@@ -191,6 +192,17 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_BLEND_COLOR             0x034C
 #define NV097_SET_BLEND_EQUATION          0x0350
 #define NV097_SET_ALPHA_TEST_ENABLE       0x0300
+/* Face culling. The title switches this on and off once per batch --
+ * 30 361 times in one survey -- and neither path read it, so every
+ * model was drawn inside and out. */
+#define NV097_SET_CULL_FACE_ENABLE        0x0308
+#define NV097_SET_CULL_FACE               0x039C
+#define NV097_SET_FRONT_FACE              0x03A0
+#define NV_CULL_FACE_FRONT                0x0404
+#define NV_CULL_FACE_BACK                 0x0405
+#define NV_CULL_FACE_FRONT_AND_BACK       0x0408
+#define NV_FRONT_FACE_CW                  0x0900
+#define NV_FRONT_FACE_CCW                 0x0901
 #define NV097_SET_DEPTH_TEST_ENABLE       0x030C
 #define NV097_SET_STENCIL_TEST_ENABLE     0x032C
 #define NV097_SET_COLOR_MASK              0x0358
@@ -240,6 +252,11 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_FLIP_INCREMENT_WRITE        0x012C
 #define NV097_FLIP_STALL                  0x0130
 #define NV097_ARRAY_ELEMENT16             0x1800
+/* The two draw calls this executor never decoded. A batch submitted through
+ * either of them was dropped whole and in silence, which on screen is a piece
+ * of a model that simply is not there. */
+#define NV097_ARRAY_ELEMENT32             0x1808
+#define NV097_DRAW_ARRAYS                 0x1810
 #define NV097_INLINE_ARRAY                0x1818
 /* Immediate-mode vertices. SET_VERTEX3F/4F carry the position, and writing
  * its last component completes a vertex using whatever the SET_VERTEX_DATA*
@@ -270,8 +287,13 @@ typedef struct {
 } VertexAttr;
 
 #define NV_VERTEX_ATTRS 16
-#define NV_MAX_INDICES  4096
-#define NV_MAX_INLINE   4096            /* dwords of INLINE_ARRAY per batch */
+/* Raised from 4096 once DRAW_ARRAYS was honoured: a batch that names runs of
+ * vertices rather than listing them reaches further than one that spells every
+ * index out, and 28 batches of a fight overran the old cap. An index list that
+ * overruns loses the end of a model in silence, which is the defect this cap
+ * would otherwise reintroduce -- see the counters in the [GPU] report. */
+#define NV_MAX_INDICES  16384
+#define NV_MAX_INLINE   16384           /* dwords of INLINE_ARRAY per batch */
 
 /* Texture stage 0, decoded from what the title programmed.
  *
@@ -330,6 +352,36 @@ static struct {
     uint32_t stencil_test, stencil_wmask, stencil_func, stencil_ref, stencil_fmask;
     uint32_t stencil_op_fail, stencil_op_zfail, stencil_op_zpass;
     uint32_t color_mask;
+    /* Face culling, as the title asked for it. */
+    uint32_t cull_enable, cull_face, front_face;
+    /* Culled, and submitted while the bit was on. Without the second
+     * number a zero in the first says either "nothing faced away" or
+     * "the title never asked", and those want opposite next steps. */
+    uint32_t tris_culled, tris_cull_on;
+    uint32_t cull_sets, cull_sets_on;
+    /* Geometry this executor throws away without saying so. Each of these is
+     * a silent hole in a model, and "a few triangles are missing from a
+     * fighter" is exactly what they would look like. Counted so that the
+     * answer is which one fires, not which one sounds likely. */
+    uint32_t idx_dropped, idx_drop_batches, idx_max;
+    uint32_t inline_dropped, inline_drop_batches, inline_max;
+    uint32_t inline_batches_refused;
+    uint32_t tris_skipped_badvert, verts_bad_nan, verts_bad_nolast;
+    uint32_t batch_in_frame;
+    /* The draw calls that used to be ignored, and how many batches the title
+     * opened against how many this executor actually drew. A gap between the
+     * two is geometry that never reached the screen. */
+    uint32_t draw_arrays_seen, elem32_seen;
+    uint32_t begins, batches_drawn, begins_empty;
+    uint32_t batches_with_elem32, batches_with_draw_arrays;
+    /* Which screen winding faces the camera, measured rather than
+     * assumed. On a closed model the near side of every surface is the
+     * side that faces us, so averaging depth per winding says which one
+     * the title means by "front" -- and that is the one thing the
+     * register dump cannot say, because NV2A inherits OpenGL's CW/CCW
+     * enums while its window y already points down. */
+    double cw_z_sum, ccw_z_sum;
+    uint32_t cw_n, ccw_n;
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
     uint32_t flip_read, flip_write, flip_modulo, flips;
@@ -346,6 +398,13 @@ static struct {
     uint32_t batches_stage_off, batches_stage_off_colour;
     Texture  tex;
 } s_gpu;
+
+/* Set the first time a batch overruns one of the fixed buffers above, so that
+ * a batch that overruns a thousand times counts as one batch, not a thousand. */
+static int s_batch_overflowed;
+/* Whether this batch used one of the two draw calls that used to be
+ * ignored, so the count is of batches affected, not of methods. */
+static int s_batch_odd_route, s_batch_draw_arrays;
 
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
@@ -488,7 +547,11 @@ static void record_tex_reg(uint32_t method, uint32_t param)
  * which is enough to see that texturing works at all and not enough to answer
  * "is a font page ever bound". This is the same shape as the unhandled-method
  * table below it: a small set, ranked, printed with the rest of the report. */
-#define PB_EXEC_MAX_TEXTURES 64
+/* Enough for a whole session, not just a screen. At 64 the front end filled
+ * the table before a fight ever loaded, so the fighters' own atlases were
+ * neither counted nor dumped -- and the one texture a session needs to look
+ * at is never among the first sixty-four. */
+#define PB_EXEC_MAX_TEXTURES 512
 typedef struct {
     uint32_t offset, color, width, height, batches;
 } PbTexUse;
@@ -884,6 +947,16 @@ static int      s_tri_has_z;
  * (screen-space batches) the old affine, flat path is kept. */
 static float    s_tri_invw[3];
 static uint32_t s_tri_col[3];
+/* The triangle's three vertices, as the title named them: its position in the
+ * batch's index list, and the index found there. A degenerate triangle means
+ * two different things depending on these -- three equal indices is a strip
+ * stitch the title asked for, three different ones collapsing to a point is
+ * ours to explain. */
+static uint32_t s_tri_pos[3], s_tri_vidx[3];
+
+/* Raised by the point probe when one of the batch's triangles matches, so the
+ * batch can be written out whole once its vertices are still in hand. */
+static int s_batch_hit_probe;
 static int      s_tri_persp;
 /* The homogeneous position before the runtime's divide, when the GPU clips:
  * (X, Y, Z, w) with X = (xwin - c59.x) / rcc(w). Exact even at w = 0, where
@@ -1888,6 +1961,136 @@ static void d3d_triangle(const float *p[3], uint32_t argb,
     s_gpu.drawn_offset = s_gpu.color_offset;
 }
 
+/* Face culling, decided in window coordinates because that is where both
+ * paths agree on a triangle's facing. Neither path read the title's cull
+ * state before, so every model was drawn inside and out: the far side of a
+ * neck or a collar could win the depth test against the near side and show
+ * through it. RECOMP_CULL=0 restores that, RECOMP_CULL_FLIP=1 takes the
+ * opposite facing (the sign convention is the one thing here a register dump
+ * cannot settle). */
+static int tri_culled(const float a[2], const float b[2], const float c[2])
+{
+    static int on = -1, flip;
+    float area;
+    int front;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_CULL");
+        on = !(e && atoi(e) == 0);
+        flip = env_on(ENV_CULL_FLIP);
+    }
+    if (!on || !s_gpu.cull_enable)
+        return 0;
+    if (s_gpu.cull_face == NV_CULL_FACE_FRONT_AND_BACK)
+        return 1;
+    /* A vertex behind the eye comes back from the position reconstruction
+     * mirrored, so its winding means nothing; those go to the clipper. */
+    if (s_tri_has_clip && (s_tri_clip[0][3] <= 0.0f || s_tri_clip[1][3] <= 0.0f
+                                                    || s_tri_clip[2][3] <= 0.0f))
+        return 0;
+    area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    if (area == 0.0f)
+        return 0;
+    /* Window y grows downwards, so a positive signed area is a clockwise
+     * triangle on screen. */
+    front = ((area > 0.0f) == (s_gpu.front_face == NV_FRONT_FACE_CW)) ^ flip;
+    return front ? (s_gpu.cull_face == NV_CULL_FACE_FRONT)
+                 : (s_gpu.cull_face == NV_CULL_FACE_BACK);
+}
+
+/* One pixel, and every triangle that covers it.
+ *
+ * A defect the size of a single triangle is invisible to a per-batch log:
+ * under Def Jam's stray collar triangle, 89 of the frame's 384 batches cover
+ * the pixel and their bounding boxes say nothing at all -- a fighter's mesh
+ * spans most of the screen. RECOMP_TRI_AT=x,y prints the triangles instead,
+ * with the vertices that produced them, during the frame F9 logs. */
+static void tri_at_probe(const float a[2], const float b[2], const float c[2],
+                         const float uv[3][2], int textured)
+{
+#define TRI_AT_POINTS 4
+    static int on = -1, npt;
+    static float px[TRI_AT_POINTS], py[TRI_AT_POINTS], pr[TRI_AT_POINTS];
+    static unsigned shown;
+    float lo_x, hi_x, lo_y, hi_y;
+    int k, hit = 0;
+
+    if (on < 0) {
+        /* "x,y,r" or several such, separated by ';': one frame can only hold
+         * one scene, so points for different scenes can be given at once and
+         * only the one in view answers. */
+        const char *e = getenv("RECOMP_TRI_AT");
+        const char *p = e;
+        npt = 0;
+        while (p && *p && npt < TRI_AT_POINTS) {
+            pr[npt] = 0.0f;
+            if (sscanf(p, "%f,%f,%f", &px[npt], &py[npt], &pr[npt]) < 2)
+                break;
+            npt++;
+            p = strchr(p, ';');
+            if (p) p++;
+        }
+        on = npt > 0;
+    }
+    if (on <= 0 || s_gpu.flips != s_vpf_flip || shown >= 600)
+        return;
+
+    /* Geometry behind the eye comes back mirrored and hundreds of thousands
+     * of pixels wide; its bounding box covers every point on screen and it
+     * drowned the first run's output in 400 lines of noise. It is not what
+     * anybody is looking at. */
+    if (s_tri_has_clip && (s_tri_clip[0][3] <= 0.0f || s_tri_clip[1][3] <= 0.0f
+                                                    || s_tri_clip[2][3] <= 0.0f))
+        return;
+    lo_x = fminf(a[0], fminf(b[0], c[0]));
+    hi_x = fmaxf(a[0], fmaxf(b[0], c[0]));
+    lo_y = fminf(a[1], fminf(b[1], c[1]));
+    hi_y = fmaxf(a[1], fmaxf(b[1], c[1]));
+    if (hi_x - lo_x > 400.0f || hi_y - lo_y > 400.0f)
+        return;
+
+    for (k = 0; k < npt && !hit; k++) {
+        if (pr[k] > 0.0f) {
+            hit = !(hi_x < px[k] - pr[k] || lo_x > px[k] + pr[k]
+                 || hi_y < py[k] - pr[k] || lo_y > py[k] + pr[k]);
+        } else {
+            const float w0 = (b[0]-a[0])*(py[k]-a[1]) - (b[1]-a[1])*(px[k]-a[0]);
+            const float w1 = (c[0]-b[0])*(py[k]-b[1]) - (c[1]-b[1])*(px[k]-b[0]);
+            const float w2 = (a[0]-c[0])*(py[k]-c[1]) - (a[1]-c[1])*(px[k]-c[0]);
+            hit = (w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0);
+        }
+    }
+    if (!hit)
+        return;
+    s_batch_hit_probe = 1;
+    if (++shown == 600)
+        fprintf(stderr, "  [TRIAT] (600 triangles printed, stopping)\n");
+#undef TRI_AT_POINTS
+    fprintf(stderr, "  [TRIAT] b%-3u (%7.1f,%7.1f) (%7.1f,%7.1f) (%7.1f,%7.1f)"
+                    "  z %9.0f %9.0f %9.0f  w %8.3f %8.3f %8.3f"
+                    "  uv (%.0f,%.0f) (%.0f,%.0f) (%.0f,%.0f) t%d"
+                    "  pos %u,%u,%u  vtx %u,%u,%u"
+                    "  d0 %08X %08X %08X  tex 0x%08X\n",
+            s_gpu.batch_in_frame,
+            a[0], a[1], b[0], b[1], c[0], c[1],
+            s_tri_has_z ? s_tri_z[0] : 0.0f,
+            s_tri_has_z ? s_tri_z[1] : 0.0f,
+            s_tri_has_z ? s_tri_z[2] : 0.0f,
+            s_tri_has_clip ? s_tri_clip[0][3] : (s_tri_persp ? 1.0f / s_tri_invw[0] : 1.0f),
+            s_tri_has_clip ? s_tri_clip[1][3] : (s_tri_persp ? 1.0f / s_tri_invw[1] : 1.0f),
+            s_tri_has_clip ? s_tri_clip[2][3] : (s_tri_persp ? 1.0f / s_tri_invw[2] : 1.0f),
+            uv ? uv[0][0] : 0.0f, uv ? uv[0][1] : 0.0f,
+            uv ? uv[1][0] : 0.0f, uv ? uv[1][1] : 0.0f,
+            uv ? uv[2][0] : 0.0f, uv ? uv[2][1] : 0.0f,
+            textured,
+            s_tri_pos[0], s_tri_pos[1], s_tri_pos[2],
+            s_tri_vidx[0], s_tri_vidx[1], s_tri_vidx[2],
+            s_tri_persp ? s_tri_col[0] : 0u,
+            s_tri_persp ? s_tri_col[1] : 0u,
+            s_tri_persp ? s_tri_col[2] : 0u,
+            s_gpu.tex.offset);
+}
+
 /* Half-space fill. Barycentric edge functions rather than scanline slopes:
  * the same test decides both windings, so a title that emits clockwise
  * triangles does not silently render nothing. */
@@ -1907,6 +2110,8 @@ static void raster_triangle(const float a[2], const float b[2],
      * left half of it -- which the display resolve then squeezes into the left
      * half of the screen. Scaling here rather than at every call site keeps
      * the barycentric weights unchanged, so texturing is unaffected. */
+    tri_at_probe(a, b, c, uv, textured);
+
     const float sx = (float)surface_aa_x(), sy = (float)surface_aa_y();
     const float a2[2] = { a[0] * sx, a[1] * sy };
     const float b2[2] = { b[0] * sx, b[1] * sy };
@@ -1916,6 +2121,21 @@ static void raster_triangle(const float a[2], const float b[2],
 
     if (bpp != 4 && bpp != 2)
         return;
+
+    if (s_gpu.cull_enable) {
+        s_gpu.tris_cull_on++;
+        if (s_tri_has_z && env_on(ENV_CULL_TRACE)) {
+            const float ar = (b[0] - a[0]) * (c[1] - a[1])
+                           - (b[1] - a[1]) * (c[0] - a[0]);
+            const double z = ((double)s_tri_z[0] + s_tri_z[1] + s_tri_z[2]) / 3.0;
+            if (ar > 0.0f)      { s_gpu.cw_z_sum  += z; s_gpu.cw_n++;  }
+            else if (ar < 0.0f) { s_gpu.ccw_z_sum += z; s_gpu.ccw_n++; }
+        }
+    }
+    if (tri_culled(a, b, c)) {
+        s_gpu.tris_culled++;
+        return;
+    }
 
     if (bpp == 4 && nvd3d_active()) {
         const float *pts[3];
@@ -2606,14 +2826,19 @@ static void vp_transform(uint32_t index, VpVertex *out)
                 imm_attr_value(a, s.v[a]);
 
     out->ok = vp_run(&s);
+    if (!out->ok)
+        s_gpu.verts_bad_nolast++;     /* the program never reached its last insn */
     s_vp.runs++;
     /* The Xbox D3D runtime ends every program with the viewport transform
      * and the divide -- `rcc r1.x, oPos.w` then `mad oPos.xyz, oPos, r1.x,
      * c59` -- so oPos.xy already are window coordinates. w is kept only for
      * perspective-correct interpolation, which this rasteriser does not do. */
     w = s.o[VP_OUT_POS][3];
-    if (!(w == w) || !(s.o[VP_OUT_POS][0] == s.o[VP_OUT_POS][0]))
+    if (!(w == w) || !(s.o[VP_OUT_POS][0] == s.o[VP_OUT_POS][0])) {
+        if (out->ok)
+            s_gpu.verts_bad_nan++;
         out->ok = 0;
+    }
     /* Behind the eye. There is no clipper here, and a vertex with w <= 0 has
      * been divided into a mirrored position hundreds of thousands of pixels
      * away: the triangle it belongs to then covered the whole screen with
@@ -2714,7 +2939,15 @@ static uint32_t batch_triangles(uint32_t prim, uint32_t n,
         for (i = 0; i + 2 < n; i += 3) TRI(i, i + 1, i + 2, i);
         break;
     case 6:                                        /* strip */
-        for (i = 0; i + 2 < n; i++) TRI(i, i + 1, i + 2, i);
+        /* Every other triangle of a strip comes out mirrored if its three
+         * vertices are taken in order; the hardware swaps the first two so
+         * that the whole strip keeps one facing. It made no difference while
+         * both windings were filled, and it decides the answer once the
+         * title's cull state is honoured. The provoking vertex stays i. */
+        for (i = 0; i + 2 < n; i++) {
+            if (i & 1u) TRI(i + 1, i, i + 2, i);
+            else        TRI(i, i + 1, i + 2, i);
+        }
         break;
     case 7: case 10:                               /* fan, polygon */
         for (i = 1; i + 1 < n; i++) TRI(0, i, i + 1, 0);
@@ -2741,6 +2974,7 @@ static uint32_t batch_triangles(uint32_t prim, uint32_t n,
 /* Set while the GPU path draws: triangles crossing the eye plane go to it
  * whole, and its clipper cuts them where the CPU path could only drop them. */
 static int s_gpu_clips;
+
 
 static void vp_draw_triangle(const VpVertex *p0, const VpVertex *p1,
                              const VpVertex *p2, uint32_t flat, int textured)
@@ -2906,10 +3140,120 @@ static void vp_draw_clipped(const VpVertex *v[3], uint32_t flat, int textured)
 static uint32_t s_vp_tris[NV_MAX_INDICES * 2][4];
 static VpVertex s_vp_verts[NV_MAX_INDICES];
 
+/* A whole batch, written out so it can be taken apart away from the game.
+ *
+ * Reproducing a defect means reaching the same scene by hand, which is slow
+ * and never frames twice the same. Everything a batch needs is knowable at
+ * the moment it draws -- its index list, the raw bytes of every vertex
+ * attribute, the vertex program and its constants -- so RECOMP_BATCH_DUMP
+ * writes that out and the analysis happens offline, as many times as it takes.
+ * Written for the batches the point probe matches, during the frame F9 logs. */
+static void dump_batch(const char *why)
+{
+    static int seq;
+    const char *prefix = getenv("RECOMP_BATCH_DUMP");
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    char path[512];
+    FILE *f;
+    uint32_t i, a, lo = 0xFFFFFFFFu, hi = 0;
+
+    if (!prefix || seq >= 32 || !s_gpu.idx_count)
+        return;
+    snprintf(path, sizeof path, "%s_b%03u_%02d.txt", prefix,
+             s_gpu.batch_in_frame, seq);
+    f = fopen(path, "w");
+    if (!f)
+        return;
+    seq++;
+
+    fprintf(f, "# batch %u of frame %u (%s)\n", s_gpu.batch_in_frame,
+            s_gpu.flips, why);
+    fprintf(f, "prim %u\nindices %u\n", s_gpu.prim, s_gpu.idx_count);
+    fprintf(f, "texture 0x%08X %ux%u fmt 0x%02X\n", s_gpu.tex.offset,
+            s_gpu.tex.width, s_gpu.tex.height, s_gpu.tex.color);
+    fprintf(f, "state depth_test %u func 0x%X mask %u  alpha %u func 0x%X ref %u"
+               "  blend %u  cull %u face 0x%X front 0x%X  inline %u\n",
+            s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
+            s_gpu.alpha_test, s_gpu.alpha_func, s_gpu.alpha_ref,
+            s_gpu.blend_enable, s_gpu.cull_enable, s_gpu.cull_face,
+            s_gpu.front_face, s_gpu.inline_active);
+
+    fprintf(f, "\n# the index list, in the order the title sent it\nidx");
+    for (i = 0; i < s_gpu.idx_count; i++) {
+        fprintf(f, " %u", s_gpu.idx[i]);
+        if (s_gpu.idx[i] < lo) lo = s_gpu.idx[i];
+        if (s_gpu.idx[i] > hi) hi = s_gpu.idx[i];
+    }
+    fprintf(f, "\nindex range %u..%u\n", lo, hi);
+
+    fprintf(f, "\n# vertex attribute streams\n");
+    for (a = 0; a < NV_VERTEX_ATTRS; a++)
+        if (s_gpu.attr[a].size && s_gpu.attr[a].stride)
+            fprintf(f, "attr %u offset 0x%08X type %u size %u stride %u\n",
+                    a, s_gpu.attr[a].offset, s_gpu.attr[a].type,
+                    s_gpu.attr[a].size, s_gpu.attr[a].stride);
+
+    /* The raw bytes behind each vertex, so a decode can be re-done from
+     * scratch rather than trusted. */
+    fprintf(f, "\n# raw vertex bytes, one line per index used\n");
+    if (!s_gpu.inline_active && hi >= lo && hi - lo < 8192) {
+        for (i = lo; i <= hi; i++) {
+            fprintf(f, "v %u", i);
+            for (a = 0; a < NV_VERTEX_ATTRS; a++) {
+                const VertexAttr *at = &s_gpu.attr[a];
+                uint32_t b;
+                if (!at->size || !at->stride || !at->offset)
+                    continue;
+                fprintf(f, " | a%u", a);
+                for (b = 0; b < at->stride && b < 32; b++)
+                    fprintf(f, " %02X", mem[at->offset + (size_t)i * at->stride + b]);
+            }
+            fprintf(f, "\n");
+        }
+    } else if (s_gpu.inline_active) {
+        fprintf(f, "# inline payload, %u dwords\ninline", s_gpu.inline_count);
+        for (i = 0; i < s_gpu.inline_count; i++)
+            fprintf(f, " %08X", s_gpu.inline_buf[i]);
+        fprintf(f, "\n");
+    }
+
+    /* And what our own pipeline made of them, to compare against. */
+    fprintf(f, "\n# transformed, as this executor produced them\n");
+    for (i = 0; i < s_gpu.idx_count; i++) {
+        const VpVertex *p = &s_vp_verts[i];
+        fprintf(f, "t %u idx %u  xy %.4f %.4f  z %.1f  w %.6f"
+                   "  uv %.4f %.4f  d0 %08X ok %d\n",
+                i, s_gpu.idx[i], p->xy[0], p->xy[1], p->z, p->w,
+                p->uv[0], p->uv[1], p->argb, p->ok);
+    }
+
+    fprintf(f, "\n# vertex program from %u, raw instruction words\n", s_vp.start);
+    for (i = s_vp.start; i < VP_MAX_INSNS; i++) {
+        fprintf(f, "i %u %08X %08X %08X %08X\n", i, s_vp.prog[i][0],
+                s_vp.prog[i][1], s_vp.prog[i][2], s_vp.prog[i][3]);
+        if (s_vp.prog[i][3] & 1)
+            break;
+    }
+    fprintf(f, "\n# non-zero constants\n");
+    for (i = 0; i < VP_CONSTANTS; i++)
+        if (s_vp.c[i][0] || s_vp.c[i][1] || s_vp.c[i][2] || s_vp.c[i][3])
+            fprintf(f, "c %u %.6f %.6f %.6f %.6f\n", i, s_vp.c[i][0],
+                    s_vp.c[i][1], s_vp.c[i][2], s_vp.c[i][3]);
+    fclose(f);
+    fprintf(stderr, "  [BATCHDUMP] %s\n", path);
+}
+
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count, t;
     int textured = texcoord_attr()->offset || s_gpu.inline_active;
+
+    /* Numbered so that a triangle printed by the point probe can be traced
+     * back to the batch the frame log describes. */
+    s_gpu.batch_in_frame++;
+    s_gpu.batches_drawn++;
+    s_batch_hit_probe = 0;
 
     if (!textured)
         s_gpu.batches_no_uv++;
@@ -3002,10 +3346,11 @@ static void raster_batch_program(void)
                     s_gpu.color_offset, s_gpu.pitch,
                     s_gpu.stencil_test, s_gpu.stencil_func,
                     s_gpu.stencil_ref, s_gpu.stencil_fmask);
-            fprintf(stderr, "  [VPF] f%u prim %u n %u  x %.1f..%.1f y %.1f..%.1f  d0 %08X"
+            fprintf(stderr, "  [VPF] b%u f%u prim %u n %u  x %.1f..%.1f y %.1f..%.1f  d0 %08X"
                             "  tex 0x%08X %ux%u fmt %02X valid %d  u %.2f..%.2f"
                             " v %.2f..%.2f  blend %u %X/%X eq %X bc %08X  alpha %u %X %02X"
-                            "  cmask %08X tc0 %08X\n",
+                            "  cmask %08X tc0 %08X  cull %u %X front %X\n",
+                    s_gpu.batch_in_frame,
                     s_gpu.flips, s_gpu.prim, n, lx, hx, ly, hy, s_vp_verts[0].argb,
                     s_gpu.tex.offset, s_gpu.tex.width, s_gpu.tex.height,
                     s_gpu.tex.color, s_gpu.tex.valid,
@@ -3013,7 +3358,8 @@ static void raster_batch_program(void)
                     s_gpu.blend_sfactor, s_gpu.blend_dfactor,
                     s_gpu.blend_equation, s_gpu.blend_color,
                     s_gpu.alpha_test, s_gpu.alpha_func, s_gpu.alpha_ref,
-                    s_gpu.color_mask, s_tex_reg[(0x1B0C - NV_TEX_FIRST) / 4]);
+                    s_gpu.color_mask, s_tex_reg[(0x1B0C - NV_TEX_FIRST) / 4],
+                    s_gpu.cull_enable, s_gpu.cull_face, s_gpu.front_face);
             /* The stages past the first. This rasteriser samples stage 0 and
              * nothing else, so a title that combines two stages -- a stencil
              * pattern in one and the matter that fills it in the other -- gets
@@ -3154,13 +3500,22 @@ static void raster_batch_program(void)
     t = batch_triangles(s_gpu.prim, n, s_vp_tris, NV_MAX_INDICES * 2);
     for (i = 0; i < t; i++) {
         const VpVertex *v[3];
+        uint32_t k;
         v[0] = &s_vp_verts[s_vp_tris[i][0]];
         v[1] = &s_vp_verts[s_vp_tris[i][1]];
         v[2] = &s_vp_verts[s_vp_tris[i][2]];
-        if (!v[0]->ok || !v[1]->ok || !v[2]->ok)
+        if (!v[0]->ok || !v[1]->ok || !v[2]->ok) {
+            s_gpu.tris_skipped_badvert++;
             continue;
+        }
+        for (k = 0; k < 3; k++) {
+            s_tri_pos[k]  = s_vp_tris[i][k];
+            s_tri_vidx[k] = s_gpu.idx[s_vp_tris[i][k]];
+        }
         vp_draw_clipped(v, s_vp_verts[s_vp_tris[i][3]].argb, textured);
     }
+    if (s_batch_hit_probe)
+        dump_batch("covers a probe point");
 }
 
 static void raster_batch(void)
@@ -3422,8 +3777,10 @@ static void draw_inline_array(void)
         goto out;
 
     count = (s_gpu.inline_count * 4) / vsize;
-    if (count < 3 || count > NV_MAX_INDICES)
+    if (count < 3 || count > NV_MAX_INDICES) {
+        s_gpu.inline_batches_refused++;
         goto out;
+    }
     for (a = 0; a < NV_VERTEX_ATTRS; a++)
         if (s_gpu.attr[a].size)
             s_gpu.attr[a].stride = vsize;
@@ -3581,6 +3938,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.stencil_op_fail = s_gpu.stencil_op_zfail = s_gpu.stencil_op_zpass = 0x1E00;
         s_gpu.depth_mask = 1;
         s_gpu.depth_func = 0x0201;
+        s_gpu.cull_face = NV_CULL_FACE_BACK;
+        s_gpu.front_face = NV_FRONT_FACE_CCW;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
     }
     /* Bring-up: the first parameters each surface method carries. A wrong
@@ -3650,6 +4009,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_STENCIL_OP_FAIL:     s_gpu.stencil_op_fail = param; break;
     case NV097_SET_STENCIL_OP_ZFAIL:    s_gpu.stencil_op_zfail = param; break;
     case NV097_SET_STENCIL_OP_ZPASS:    s_gpu.stencil_op_zpass = param; break;
+    case NV097_SET_CULL_FACE_ENABLE:
+        /* Counted as well as stored: "no triangle was culled" reads the same
+         * whether the title never switched it on or this is the wrong method
+         * number, and only the count of non-zero writes tells them apart. */
+        s_gpu.cull_sets++;
+        if (param)
+            s_gpu.cull_sets_on++;
+        s_gpu.cull_enable = param;
+        break;
+    case NV097_SET_CULL_FACE:
+        s_gpu.cull_face = param;
+        break;
+    case NV097_SET_FRONT_FACE:
+        s_gpu.front_face = param;
+        break;
     case NV097_SET_DEPTH_TEST_ENABLE:
         s_gpu.depth_test = param;
         break;
@@ -3684,6 +4058,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.idx_count = 0;
             s_gpu.inline_count = 0;
             s_gpu.imm_count = 0;
+            s_batch_overflowed = 0;
+            s_batch_odd_route = s_batch_draw_arrays = 0;
+            s_gpu.begins++;
         } else {
             /* Three ways a batch can have arrived, and only one is in use at
              * a time: vertices completed by SET_VERTEX4F, a payload written
@@ -3692,8 +4069,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 draw_immediate();
             else if (s_gpu.inline_count)
                 draw_inline_array();
-            else
+            else if (s_gpu.idx_count)
                 draw_primitive();
+            else
+                /* Opened, closed, and nothing in between: the title asked for
+                 * a batch by a route this executor did not understand. */
+                s_gpu.begins_empty++;
             s_gpu.prim = 0;
             s_gpu.inline_count = 0;
             s_gpu.imm_count = 0;
@@ -3703,15 +4084,69 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_INLINE_ARRAY:
         /* Vertex data, not a pointer to it. Buffered rather than decoded here
          * because the format is only fully known at END. */
-        if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE)
+        if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE) {
             s_gpu.inline_buf[s_gpu.inline_count++] = param;
+            if (s_gpu.inline_count > s_gpu.inline_max)
+                s_gpu.inline_max = s_gpu.inline_count;
+        } else if (s_gpu.prim) {
+            if (!s_batch_overflowed) { s_batch_overflowed = 1;
+                                       s_gpu.inline_drop_batches++; }
+            s_gpu.inline_dropped++;
+        }
         break;
+
+    case NV097_ARRAY_ELEMENT32:
+        /* One 32-bit index per parameter word. */
+        s_gpu.elem32_seen++;
+        if (!s_batch_odd_route) { s_batch_odd_route = 1;
+                                  s_gpu.batches_with_elem32++; }
+        if (s_gpu.prim && s_gpu.idx_count < NV_MAX_INDICES) {
+            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)param;
+            if (s_gpu.idx_count > s_gpu.idx_max)
+                s_gpu.idx_max = s_gpu.idx_count;
+        } else if (s_gpu.prim) {
+            if (!s_batch_overflowed) { s_batch_overflowed = 1;
+                                       s_gpu.idx_drop_batches++; }
+            s_gpu.idx_dropped++;
+        }
+        break;
+
+    case NV097_DRAW_ARRAYS: {
+        /* Not indices but a run of them: count vertices from start_index.
+         * Expressed as a range because that is all the hardware is given. */
+        uint32_t start = param & 0x00FFFFFFu;
+        uint32_t count = ((param >> 24) & 0xFFu) + 1u;
+        uint32_t k;
+        s_gpu.draw_arrays_seen++;
+        if (!s_batch_draw_arrays) { s_batch_draw_arrays = 1;
+                                    s_gpu.batches_with_draw_arrays++; }
+        if (!s_gpu.prim)
+            break;
+        for (k = 0; k < count; k++) {
+            if (s_gpu.idx_count >= NV_MAX_INDICES) {
+                if (!s_batch_overflowed) { s_batch_overflowed = 1;
+                                           s_gpu.idx_drop_batches++; }
+                s_gpu.idx_dropped++;
+                continue;
+            }
+            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + k);
+        }
+        if (s_gpu.idx_count > s_gpu.idx_max)
+            s_gpu.idx_max = s_gpu.idx_count;
+        break;
+    }
 
     case NV097_ARRAY_ELEMENT16:
         /* Two 16-bit indices per parameter word. */
         if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
+            if (s_gpu.idx_count > s_gpu.idx_max)
+                s_gpu.idx_max = s_gpu.idx_count;
+        } else if (s_gpu.prim) {
+            if (!s_batch_overflowed) { s_batch_overflowed = 1;
+                                       s_gpu.idx_drop_batches++; }
+            s_gpu.idx_dropped += 2;
         }
         break;
     case NV097_SET_TEXTURE_OFFSET:
@@ -3739,6 +4174,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
+        s_gpu.batch_in_frame = 0;
         return;
 
     case NV097_FLIP_STALL:
@@ -4035,6 +4471,43 @@ void nv2a_pb_exec_report(void)
                     " screen-space, %u triangles fully off-surface\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen);
+    /* What honouring the cull bit cost. It reaches every model in the game,
+     * so the share it removes is the number to weigh a regression against:
+     * a few per cent is a title culling its back faces, half of everything
+     * is a sign convention taken the wrong way round. */
+    fprintf(stderr, "[GPU] face culling: %u culled of %u triangles submitted"
+                    " with the bit on (%.1f%%), %u submitted in all;"
+                    " enable written %u times, %u of them non-zero;"
+                    " last state enable %u face %X front %X\n",
+            s_gpu.tris_culled, s_gpu.tris_cull_on,
+            s_gpu.tris_cull_on ? 100.0 * s_gpu.tris_culled / s_gpu.tris_cull_on : 0.0,
+            s_gpu.tris_culled + s_gpu.tris_drawn,
+            s_gpu.cull_sets, s_gpu.cull_sets_on,
+            s_gpu.cull_enable, s_gpu.cull_face, s_gpu.front_face);
+    if (s_gpu.cw_n || s_gpu.ccw_n)
+        fprintf(stderr, "[GPU] facing by depth: clockwise on screen %u tris, mean z %.0f;"
+                        " counter-clockwise %u tris, mean z %.0f"
+                        " -- the nearer one is the side facing us\n",
+                s_gpu.cw_n, s_gpu.cw_n ? s_gpu.cw_z_sum / s_gpu.cw_n : 0.0,
+                s_gpu.ccw_n, s_gpu.ccw_n ? s_gpu.ccw_z_sum / s_gpu.ccw_n : 0.0);
+    /* Geometry dropped without a word. A model with a few triangles missing
+     * and everything else right is what each of these looks like on screen,
+     * so they are printed together, always, rather than reasoned about. */
+    fprintf(stderr, "[GPU] dropped quietly: %u indices over the %u cap in %u batches"
+                    " (most in one batch %u); %u inline dwords over the %u cap"
+                    " in %u batches (most %u), %u inline batches refused whole;"
+                    " %u triangles on a rejected vertex (%u NaN, %u no last insn)\n",
+            s_gpu.idx_dropped, (unsigned)NV_MAX_INDICES, s_gpu.idx_drop_batches,
+            s_gpu.idx_max,
+            s_gpu.inline_dropped, (unsigned)NV_MAX_INLINE, s_gpu.inline_drop_batches,
+            s_gpu.inline_max, s_gpu.inline_batches_refused,
+            s_gpu.tris_skipped_badvert, s_gpu.verts_bad_nan, s_gpu.verts_bad_nolast);
+    fprintf(stderr, "[GPU] batches opened %u, drawn %u, opened and empty %u;"
+                    " ARRAY_ELEMENT32 %u in %u batches,"
+                    " DRAW_ARRAYS %u in %u batches\n",
+            s_gpu.begins, s_gpu.batches_drawn, s_gpu.begins_empty,
+            s_gpu.elem32_seen, s_gpu.batches_with_elem32,
+            s_gpu.draw_arrays_seen, s_gpu.batches_with_draw_arrays);
     fprintf(stderr, "[GPU] vertex programs: mode %u, %u vertices run, %u unknown opcodes\n",
             s_vp.mode, s_vp.runs, s_vp.bad_insns);
 
