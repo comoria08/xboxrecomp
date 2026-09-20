@@ -51,6 +51,10 @@ static ID3D11InputLayout    *s_layout;
 static ID3D11Buffer         *s_vb, *s_cb, *s_cb_present;
 static ID3D11RasterizerState *s_rs;
 static ID3D11SamplerState   *s_lin;
+/* One per wrap/clamp combination, u in bit 0 and v in bit 1. The title
+ * sets the mode per axis and a floor that tiles needs wrap on both. */
+static ID3D11SamplerState   *s_smp[4];
+static int                   s_filter_on = -1;
 static ID3D11BlendState     *s_blend_off;
 static ID3D11DepthStencilState *s_ds_off;
 static IDXGISwapChain1      *s_swap;
@@ -123,15 +127,25 @@ static const char s_hlsl[] =
 "}\n"
 "cbuffer Draw : register(b0) { float4 tex; float4 atest; float4 extra; };\n"
 "Texture2D t0 : register(t0);\n"
+"SamplerState smp : register(s0);\n"
 "float4 ps_main(PSIn i) : SV_Target {\n"
 "  float4 c = i.col;\n"
 "  if (atest.w > 0.5) {\n"
-"    int w = (int)tex.x, h = (int)tex.y;\n"
-"    int u = (int)max(i.uv.x, 0.0), v = (int)max(i.uv.y, 0.0);\n"
-"    u = (tex.z == 1.0) ? (u % w) : min(u, w - 1);\n"
-"    v = (tex.w == 1.0) ? (v % h) : min(v, h - 1);\n"
-"    int sc = (int)extra.x;\n"
-"    c = t0.Load(int3(u * sc, v * sc, 0)) * c;\n"
+"    if (extra.y > 0.5) {\n"
+/* Bilinear, which is what the title asks for: LINEAR on 617460 batches of a
+ * session against 1 mip level, so the filtering is the whole of what was
+ * missing. Coordinates arrive in texels; dividing by the size gives the
+ * normalised form the sampler wants, and the sampler carries the wrap or
+ * clamp the title set per axis. */
+"      c = t0.Sample(smp, i.uv / float2(tex.x, tex.y)) * c;\n"
+"    } else {\n"
+"      int w = (int)tex.x, h = (int)tex.y;\n"
+"      int u = (int)max(i.uv.x, 0.0), v = (int)max(i.uv.y, 0.0);\n"
+"      u = (tex.z == 1.0) ? (u % w) : min(u, w - 1);\n"
+"      v = (tex.w == 1.0) ? (v % h) : min(v, h - 1);\n"
+"      int sc = (int)extra.x;\n"
+"      c = t0.Load(int3(u * sc, v * sc, 0)) * c;\n"
+"    }\n"
 "  }\n"
 "  if (atest.x > 0.5) {\n"
 "    float a = floor(c.a * 255.0 + 0.5), r = atest.z;\n"
@@ -255,6 +269,21 @@ static int init(void)
         sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
         sd.MaxLOD = D3D11_FLOAT32_MAX;
         ID3D11Device_CreateSamplerState(s_dev, &sd, &s_lin);
+    }
+    {
+        int i;
+        for (i = 0; i < 4; i++) {
+            D3D11_SAMPLER_DESC sd;
+            memset(&sd, 0, sizeof sd);
+            sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+            sd.AddressU = (i & 1) ? D3D11_TEXTURE_ADDRESS_WRAP
+                                  : D3D11_TEXTURE_ADDRESS_CLAMP;
+            sd.AddressV = (i & 2) ? D3D11_TEXTURE_ADDRESS_WRAP
+                                  : D3D11_TEXTURE_ADDRESS_CLAMP;
+            sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+            sd.MaxLOD = D3D11_FLOAT32_MAX;
+            ID3D11Device_CreateSamplerState(s_dev, &sd, &s_smp[i]);
+        }
     }
     {
         D3D11_BLEND_DESC bd;
@@ -728,13 +757,25 @@ static void flush(void)
         cb[6] = (float)st->alpha_ref;
         cb[7] = textured ? 1.0f : 0.0f;
         cb[8] = st->texture >= 0x10000 ? (float)S : 1.0f;   /* a render target */
-        cb[9] = cb[10] = cb[11] = 0.0f;
+        /* Point sampling stays reachable with RECOMP_TEX_FILTER=0, and a
+         * texture read back out of a render target keeps it: its copy is S
+         * times larger, and the Load path is what knows that. */
+        if (s_filter_on < 0) {
+            const char *e = getenv("RECOMP_TEX_FILTER");
+            s_filter_on = !(e && atoi(e) == 0);
+        }
+        cb[9] = (s_filter_on && st->texture < 0x10000) ? 1.0f : 0.0f;
+        cb[10] = cb[11] = 0.0f;
         if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb, 0,
                                               D3D11_MAP_WRITE_DISCARD, 0, &m))) {
             memcpy(m.pData, cb, sizeof cb);
             ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb, 0);
         }
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &srv);
+        {
+            int k = (st->addr_u == 1 ? 1 : 0) | (st->addr_v == 1 ? 2 : 0);
+            ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_smp[k]);
+        }
     }
     {
         D3D11_VIEWPORT vp;

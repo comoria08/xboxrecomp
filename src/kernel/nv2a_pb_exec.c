@@ -233,6 +233,10 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_TEXTURE_FORMAT          0x1B04
 #define NV097_SET_TEXTURE_ADDRESS         0x1B08
 #define NV097_SET_TEXTURE_CONTROL1        0x1B10
+/* What the title asks for as filtering, and how many mip levels its
+ * texture carries. Neither was decoded: every texel is taken nearest,
+ * from level 0, whatever was asked. */
+#define NV097_SET_TEXTURE_FILTER          0x1B14
 #define NV097_SET_TEXTURE_IMAGE_RECT      0x1B1C
 #define NV097_SET_TEXTURE_PALETTE         0x1B20   /* offset | DMA bit 0 */
 /* The buffer flip. A title double-buffers by telling the GPU which buffer
@@ -307,6 +311,8 @@ typedef struct {
     uint32_t pitch;                     /* bytes per row, from CONTROL1  */
     uint32_t color;                     /* NV097 colour-format code      */
     uint32_t addr_u, addr_v;            /* wrap mode per axis            */
+    uint32_t filter_min, filter_mag;    /* as asked, not as honoured     */
+    uint32_t lod_bias, mip_levels;
     uint32_t palette;                   /* guest address, 256 D3DCOLORs  */
     int      valid;
 } Texture;
@@ -616,6 +622,47 @@ static void note_texture_use(void)
         s_tex_use[s_tex_use_count].batches = 1;
         s_tex_use_count++;
         dump_texture_bmp((uint32_t)s_tex_use_count - 1);
+    }
+}
+
+/* Which filters the title asks for, and how many mip levels it offers with
+ * them. One line of totals answers the only question that matters here: is a
+ * blurry, aliased floor our sampling, or the texture it was given. */
+static struct { uint32_t min, mag, mips, batches; } s_filt[32];
+static int s_filt_count;
+
+static void note_filter_use(void)
+{
+    int i;
+    for (i = 0; i < s_filt_count; i++)
+        if (s_filt[i].min == s_gpu.tex.filter_min
+         && s_filt[i].mag == s_gpu.tex.filter_mag
+         && s_filt[i].mips == s_gpu.tex.mip_levels) {
+            s_filt[i].batches++;
+            return;
+        }
+    if (s_filt_count < 32) {
+        s_filt[s_filt_count].min     = s_gpu.tex.filter_min;
+        s_filt[s_filt_count].mag     = s_gpu.tex.filter_mag;
+        s_filt[s_filt_count].mips    = s_gpu.tex.mip_levels;
+        s_filt[s_filt_count].batches = 1;
+        s_filt_count++;
+    }
+}
+
+static const char *filter_name(uint32_t f)
+{
+    switch (f) {
+    case 1: return "NEAREST";
+    case 2: return "LINEAR";
+    case 3: return "NEAREST_MIPMAP_NEAREST";
+    case 4: return "LINEAR_MIPMAP_NEAREST";
+    case 5: return "NEAREST_MIPMAP_LINEAR";
+    case 6: return "LINEAR_MIPMAP_LINEAR";
+    case 7: return "TENT_LOD0";
+    case 8: return "TENT_LOD1";
+    case 9: return "TENT_LOD2";
+    default: return "?";
     }
 }
 
@@ -4217,6 +4264,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.tex.width  = 1u << ((param >> 20) & 0xF);
             s_gpu.tex.height = 1u << ((param >> 24) & 0xF);
         }
+        s_gpu.tex.mip_levels = (param >> 16) & 0xF;
+        record_tex_reg(method, param);
+        break;
+
+    case NV097_SET_TEXTURE_FILTER:
+        /* Recorded rather than honoured, which is the point: the gap between
+         * what the title asks and what it gets is the size of the defect. */
+        s_gpu.tex.lod_bias   =  param        & 0x1FFF;
+        s_gpu.tex.filter_min = (param >> 16) & 0xFF;
+        s_gpu.tex.filter_mag = (param >> 24) & 0xF;
+        note_filter_use();
         record_tex_reg(method, param);
         break;
 
@@ -4502,6 +4560,13 @@ void nv2a_pb_exec_report(void)
             s_gpu.inline_dropped, (unsigned)NV_MAX_INLINE, s_gpu.inline_drop_batches,
             s_gpu.inline_max, s_gpu.inline_batches_refused,
             s_gpu.tris_skipped_badvert, s_gpu.verts_bad_nan, s_gpu.verts_bad_nolast);
+    for (i = 0; i < s_filt_count; i++)
+        fprintf(stderr, "  [FILTER] min %s mag %s, %u mip level(s): %u batches"
+                        " -- sampled %s from level 0\n",
+                filter_name(s_filt[i].min), filter_name(s_filt[i].mag),
+                s_filt[i].mips, s_filt[i].batches,
+                getenv("RECOMP_TEX_FILTER")
+                && atoi(getenv("RECOMP_TEX_FILTER")) == 0 ? "nearest" : "bilinear");
     fprintf(stderr, "[GPU] batches opened %u, drawn %u, opened and empty %u;"
                     " ARRAY_ELEMENT32 %u in %u batches,"
                     " DRAW_ARRAYS %u in %u batches\n",
