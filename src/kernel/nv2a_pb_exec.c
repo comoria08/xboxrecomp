@@ -338,6 +338,12 @@ static struct {
      * identical on screen and want opposite fixes: the batch carried no
      * texture coordinates, or it did and the stage was not usable. */
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
+    /* Batches drawn with texture stage 0 switched off, and how many of those
+     * write colour. Honouring that bit everywhere is a change that reaches
+     * every screen, so the cost of announcing it without a number is high:
+     * this is that number, over a whole session rather than one logged frame.
+     * The ones that write no colour are the depth-only batches of point 81. */
+    uint32_t batches_stage_off, batches_stage_off_colour;
     Texture  tex;
 } s_gpu;
 
@@ -378,19 +384,27 @@ static int tex_size_from_format(uint32_t fmt)
  * transparent texel, the alpha test dropped the fragment, no depth was
  * written, and the paper came out as a solid slab over the title.
  *
- * Refusing to sample whenever the bit is clear was too much, and the measure
- * said so: on the character select screen 47 batches have the stage off, but
- * only 5 of them write no colour. The other 42 do write colour, and what they
- * write comes out of the register combiners -- which this rasteriser does not
- * implement at all. Switched to flat vertex colour they came out transparent
- * black, so the fighters vanished from their panels.
+ * Refusing to sample whenever the bit is clear looked too broad at first, and
+ * the measure seemed to say so: on the character select screen 47 batches have
+ * the stage off, only 5 of them write no colour, and switching the other 42 to
+ * flat vertex colour turned them transparent black -- the fighters vanished
+ * from their panels. The reading then was that those 42 take their colour from
+ * the register combiners, which this rasteriser does not implement.
  *
- * So the bit is only acted on where its meaning is not in doubt: a batch with
- * the stage off AND a closed colour mask exists to write depth, and nothing
- * else. For those, the alpha test must not run -- it would be judging a
- * colour we cannot compute, and rejecting the fragment would drop the depth
- * with it. That is precisely what hid the screen titles: the band's depth
- * fill has transparent vertices, and the panels' fills are transparent black.
+ * That reading was wrong, and only half the screen could show it. Their vertex
+ * colour was transparent black for a quite different reason: the one program
+ * that writes it does so with an ADD, whose second source the vertex program
+ * interpreter read from the wrong operand slot. With that fixed, all 42 carry
+ * an opaque colour -- the bar frames, their dark tracks, the green-to-yellow
+ * fills, the blue and red name plates -- and the bit can be honoured wherever
+ * it is clear, which is what the hardware does. Sampled anyway, they came out
+ * black: a disabled stage still has a texture bound, and these batches point
+ * every vertex at texel (0,0) of it.
+ *
+ * A batch with the stage off AND a closed colour mask exists to write depth
+ * and nothing else. For those the alpha test must not run -- it would be
+ * judging a colour we cannot compute, and rejecting the fragment would drop
+ * the depth with it. That is what hid the screen titles.
  *
  * A stage the title never programmed counts as on, which is what this did
  * before. RECOMP_TEX_ENABLE_BIT=0 restores the old behaviour wholesale. */
@@ -1885,7 +1899,7 @@ static void raster_triangle(const float a[2], const float b[2],
     uint32_t bpp = surface_bpp();
     float area;
     int minx, maxx, miny, maxy, x, y;
-    int textured = uv && s_gpu.tex.valid;
+    int textured = uv && s_gpu.tex.valid && tex_stage0_enabled();
 
     /* Vertices arrive in displayed pixels; the surface is addressed in
      * samples. On a multisampled target the two differ, and writing pixel
@@ -2235,6 +2249,11 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
  * goes to the temp register, the ILU result to R1, and one of the two to the
  * output register. R12 is oPos.
  *
+ * The three operand slots are shared by both units, and the MAC unit is a
+ * multiply-add, so an opcode reads the slots its A*B + C form needs: MUL and
+ * the dot products A and B, MAD all three, MOV and ARL A alone, and ADD --
+ * being A*1 + C -- A and C. Every ILU operation reads C.
+ *
  * ponytail: one texture coordinate and one colour are carried to the
  * rasteriser, because that is all it samples. */
 #define NV097_SET_TRANSFORM_EXECUTION_MODE 0x1E94
@@ -2386,15 +2405,24 @@ static void vp_decode(void)
         d->from_ilu = (uint8_t)VP_BITS(w[3], 2, 1);
         d->last = (uint8_t)(w[3] & 1);
 
-        /* Which operands the operations actually read: A for every MAC op,
-         * B for the binary ones, C for MAD and for every ILU op. */
+        /* Which operand slots each operation reads. There are three slots for
+         * the whole instruction, and the MAC unit is a multiply-add: every
+         * operation is expressed as A*B + C, so which slots an opcode uses is
+         * a property of that expression and not of its arity.
+         *
+         * ADD is the one that surprises: it is A*1 + C, so its second source
+         * arrives in slot C, not in slot B. Reading B instead gave the front
+         * end's coloured shapes "a temporary plus the vertex position", which
+         * clamps to transparent black -- the stat bars of the character select
+         * screen, their frames and their fills, all drawn by the one program
+         * whose colour instruction is an ADD (point 82). */
         d->need = 0;
-        if (d->mac)
+        if (d->mac)                                /* A: every MAC op */
             d->need |= 1;
-        if (d->mac >= 2 && d->mac <= 12)
-            d->need |= 2;
-        if (d->mac == 4 || d->ilu)
-            d->need |= 4;
+        if (d->mac == 2 || (d->mac >= 4 && d->mac <= 12))
+            d->need |= 2;                          /* B: MUL, MAD, DP3..SGE */
+        if (d->mac == 3 || d->mac == 4 || d->ilu)
+            d->need |= 4;                          /* C: ADD, MAD, every ILU */
         for (k = 0; k < 3; k++)
             if ((d->need & (1u << k)) && d->mux[k] == 2)
                 s_vp_inputs |= 1u << d->input;
@@ -2471,7 +2499,7 @@ static int vp_run(VpState *s)
         case 0: break;                                      /* NOP */
         case 1: memcpy(m, a, sizeof m); break;              /* MOV */
         case 2: for (k = 0; k < 4; k++) m[k] = a[k] * b[k]; break;
-        case 3: for (k = 0; k < 4; k++) m[k] = a[k] + b[k]; break;
+        case 3: for (k = 0; k < 4; k++) m[k] = a[k] + c[k]; break; /* ADD: A*1+C */
         case 4: for (k = 0; k < 4; k++) m[k] = a[k] * b[k] + c[k]; break;
         case 5:                                             /* DP3 */
             d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -2891,6 +2919,11 @@ static void raster_batch_program(void)
         s_gpu.batches_textured++;
         note_texture_use();
     }
+    if (!tex_stage0_enabled()) {
+        s_gpu.batches_stage_off++;
+        if (s_gpu.color_mask)
+            s_gpu.batches_stage_off_colour++;
+    }
 
     /* A mesh names each vertex several times; run the program once per
      * index. The stamp says whether an index was seen in this batch. */
@@ -3018,13 +3051,46 @@ static void raster_batch_program(void)
                     uint32_t ii;
                     for (ii = 0; ii < s_vp_code_len && ii < 24; ii++) {
                         const VpInsn *d = &s_vp_code[ii];
+                        char src[3][24];
+                        uint32_t k;
+                        /* Name only the slots this opcode reads. A slot an
+                         * operation does not use holds whatever the assembler
+                         * left there, and printing it as a source is how the
+                         * previous reading of ADD looked plausible. */
+                        for (k = 0; k < 3; k++) {
+                            if (!(d->need & (1u << k))) {
+                                snprintf(src[k], sizeof src[k], "-");
+                                continue;
+                            }
+                            switch (d->mux[k]) {
+                            case 1:
+                                snprintf(src[k], sizeof src[k], "%sR%u.%c%c%c%c",
+                                         d->neg[k] ? "-" : "", d->reg[k],
+                                         "xyzw"[(d->swz[k] >> 6) & 3],
+                                         "xyzw"[(d->swz[k] >> 4) & 3],
+                                         "xyzw"[(d->swz[k] >> 2) & 3],
+                                         "xyzw"[ d->swz[k]       & 3]);
+                                break;
+                            case 2:
+                                snprintf(src[k], sizeof src[k], "%sv%u",
+                                         d->neg[k] ? "-" : "", d->input);
+                                break;
+                            case 3:
+                                snprintf(src[k], sizeof src[k], "%sc%u%s",
+                                         d->neg[k] ? "-" : "", d->cidx,
+                                         d->rel ? "+a0" : "");
+                                break;
+                            default:
+                                snprintf(src[k], sizeof src[k], "0");
+                                break;
+                            }
+                        }
                         fprintf(stderr, "  [VPF]   i%-2u mac %2u ilu %u out o%-2u"
-                                        " mask %X mmask %X imask %X c%-3u%s"
-                                        " mux %u/%u/%u in v%u\n",
+                                        " mask %X mmask %X(R%u) imask %X"
+                                        "  A %-10s B %-10s C %-10s\n",
                                 ii, d->mac, d->ilu, d->orb, d->out_mask,
-                                d->mac_mask, d->ilu_mask, d->cidx,
-                                d->rel ? "+a0" : "   ",
-                                d->mux[0], d->mux[1], d->mux[2], d->input);
+                                d->mac_mask, d->tmp, d->ilu_mask,
+                                src[0], src[1], src[2]);
                     }
                 }
                 {
@@ -3129,6 +3195,11 @@ static void raster_batch(void)
         else {
             s_gpu.batches_textured++;
             note_texture_use();
+        }
+        if (!tex_stage0_enabled()) {
+            s_gpu.batches_stage_off++;
+            if (s_gpu.color_mask)
+                s_gpu.batches_stage_off_colour++;
         }
     }
 
@@ -3974,6 +4045,9 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] batches: %u textured, %u with no texcoords,"
                     " %u with texcoords but no usable stage\n",
             s_gpu.batches_textured, s_gpu.batches_no_uv, s_gpu.batches_no_tex);
+    fprintf(stderr, "[GPU] stage 0 switched off in %u batches, %u of them"
+                    " writing colour (drawn in vertex colour, unsampled)\n",
+            s_gpu.batches_stage_off, s_gpu.batches_stage_off_colour);
     for (i = 0; i < s_tex_use_count; i++)
         fprintf(stderr, "  [TEXUSE] 0x%08X %ux%u fmt 0x%02X%s: %u batches\n",
                 s_tex_use[i].offset, s_tex_use[i].width, s_tex_use[i].height,
