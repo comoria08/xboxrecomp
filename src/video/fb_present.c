@@ -105,6 +105,25 @@ void xbox_FramebufferWindowScale(uint32_t scale)
     s_win_scale = scale ? scale : 1;
 }
 
+/* RECOMP_WIDESCREEN=1: the title's picture fills a 16:9 frame instead of its
+ * own 4:3 one. That is the console's own widescreen -- the Xbox always scans
+ * out a 4:3 buffer, and a title told the TV is widescreen renders an
+ * anamorphic picture the set stretches back -- so the stretch belongs at
+ * presentation and the title keeps rendering the size it always did.
+ *
+ * It only means anything paired with a projection told the same thing; on
+ * its own it is a stretched 4:3 picture. 0 when off, so a caller can fall
+ * back to the picture's own aspect. */
+float xbox_WidescreenAspect(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_WIDESCREEN");
+        on = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return on ? 16.0f / 9.0f : 0.0f;
+}
+
 /* F11: borderless full screen on the window's monitor, and back. */
 static void fb_toggle_fullscreen(HWND hwnd)
 {
@@ -387,7 +406,13 @@ static DWORD WINAPI fb_thread(LPVOID unused)
          * aspect) to what fits the desktop work area, frame included. */
         RECT work;
         LONG cw = (LONG)(s_fb_width * s_win_scale), ch = (LONG)(s_fb_height * s_win_scale);
+        const float ws = xbox_WidescreenAspect();
         RECT frame = { 0, 0, 0, 0 };
+        /* In widescreen the picture is stretched to 16:9, so the window opens
+         * at 16:9 as well: sized from the title's width it would still be a
+         * 4:3 picture with bars, which is what the option exists to remove. */
+        if (ws > 0.0f)
+            cw = (LONG)(ch * ws + 0.5f);
         AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
         if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0)) {
             LONG maxw = (work.right - work.left) - (frame.right - frame.left);

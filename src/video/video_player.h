@@ -72,6 +72,10 @@ void xbox_FramebufferWindowSetName(const char *utf8);
  * bytes per sample; xscale is how many samples across make one pixel. */
 void xbox_FramebufferWindowFormat(uint32_t width, uint32_t height,
                                   uint32_t bpp, uint32_t xscale);
+/* RECOMP_WIDESCREEN=1: the aspect the picture is presented at, 16:9,
+ * or 0 when the option is off and the picture keeps its own. */
+float xbox_WidescreenAspect(void);
+
 int  xbox_FramebufferDumpBmp(const char *path);
 
 #endif /* BURNOUT3_VIDEO_PLAYER_H */

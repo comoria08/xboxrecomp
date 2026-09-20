@@ -33,6 +33,7 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void *xbox_FramebufferWindowHwnd(void);
 extern void xbox_FramebufferWindowExternal(void);
+extern float xbox_WidescreenAspect(void);
 
 static int s_state = -1;                 /* -1 unknown, 0 off, 1 on */
 
@@ -1026,10 +1027,15 @@ void nvd3d_present(uint32_t base, const uint32_t rect[4],
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back_rtv, NULL);
         /* The title's picture keeps its aspect (disp_w:disp_h, 4:3 here);
-         * whatever the window adds becomes black bars. */
+         * whatever the window adds becomes black bars. Under
+         * RECOMP_WIDESCREEN the picture is anamorphic instead -- the
+         * title was told 16:9 and rendered a squeezed 4:3 buffer, so
+         * it is presented at 16:9 and comes back out undistorted. */
         {
             static const FLOAT black[4] = { 0, 0, 0, 1 };
-            const float want = (disp_w && disp_h) ? (float)disp_w / (float)disp_h : 4.0f / 3.0f;
+            const float ws = xbox_WidescreenAspect();
+            const float want = ws > 0.0f ? ws
+                : ((disp_w && disp_h) ? (float)disp_w / (float)disp_h : 4.0f / 3.0f);
             float w = (float)s_back_w, h = (float)s_back_h;
             if (w / h > want) w = h * want; else h = w / want;
             ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
