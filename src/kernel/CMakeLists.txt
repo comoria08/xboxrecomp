@@ -42,7 +42,7 @@ if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt winmm
-                          d3d11 dxgi dxguid d3dcompiler)
+                          d3d11 dxgi dxguid d3dcompiler windowscodecs ole32)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)

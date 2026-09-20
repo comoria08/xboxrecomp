@@ -23,6 +23,7 @@
 #include <d3d11_1.h>
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
+#include <wincodec.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -640,12 +641,13 @@ static const char *pack_dump_dir(void)
     return dir;
 }
 
-static void pack_path(char *out, size_t n, const char *dir, uint64_t hash)
+static void pack_path(char *out, size_t n, const char *dir, uint64_t hash,
+                      const char *ext)
 {
-    snprintf(out, n, "%s%s%016llX.bmp", dir,
+    snprintf(out, n, "%s%s%016llX%s", dir,
              (dir[0] && (dir[strlen(dir) - 1] == '\\' || dir[strlen(dir) - 1] == '/'))
                  ? "" : "\\",
-             (unsigned long long)hash);
+             (unsigned long long)hash, ext);
 }
 
 /* Reads 24- or 32-bit uncompressed BMP into fresh BGRA. NULL if absent or
@@ -731,18 +733,90 @@ static void pack_write(const char *path, const uint32_t *bgra, uint32_t w, uint3
     fclose(f);
 }
 
+/* Anything Windows can decode -- PNG, TIFF, JPEG -- through WIC, which ships
+ * with the OS and needs no third-party decoder. That matters because an
+ * upscaler writes PNG or TIFF, not BMP: without this a pack would need a
+ * conversion pass between the tool and the game. BMP still goes through the
+ * reader above, which is ours and cannot lose the alpha we wrote.
+ *
+ * WIC wants COM, which D3D11 does not require, so it is started here and a
+ * thread that already chose a different apartment is left alone. */
+static uint32_t *pack_read_wic(const char *path, uint32_t *pw, uint32_t *ph)
+{
+    static IWICImagingFactory *factory;
+    static int tried;
+    IWICBitmapDecoder   *dec = NULL;
+    IWICBitmapFrameDecode *frame = NULL;
+    IWICFormatConverter *conv = NULL;
+    uint32_t *out = NULL;
+    wchar_t wide[512];
+    UINT w = 0, h = 0;
+
+    if (!tried) {
+        HRESULT hr;
+        tried = 1;
+        hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+        (void)hr;   /* RPC_E_CHANGED_MODE is fine: someone got here first */
+        CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                         &IID_IWICImagingFactory, (void **)&factory);
+    }
+    if (!factory)
+        return NULL;
+    if (!MultiByteToWideChar(CP_ACP, 0, path, -1, wide,
+                             sizeof wide / sizeof wide[0]))
+        return NULL;
+    if (FAILED(IWICImagingFactory_CreateDecoderFromFilename(
+            factory, wide, NULL, GENERIC_READ,
+            WICDecodeMetadataCacheOnDemand, &dec)))
+        return NULL;
+    if (SUCCEEDED(IWICBitmapDecoder_GetFrame(dec, 0, &frame))
+     && SUCCEEDED(IWICImagingFactory_CreateFormatConverter(factory, &conv))
+     && SUCCEEDED(IWICFormatConverter_Initialize(
+            conv, (IWICBitmapSource *)frame, &GUID_WICPixelFormat32bppBGRA,
+            WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom))
+     && SUCCEEDED(IWICFormatConverter_GetSize(conv, &w, &h))
+     && w && h && w <= 8192 && h <= 8192) {
+        out = (uint32_t *)malloc((size_t)w * h * 4);
+        if (out && FAILED(IWICFormatConverter_CopyPixels(
+                conv, NULL, w * 4, (UINT)((size_t)w * h * 4), (BYTE *)out))) {
+            free(out);
+            out = NULL;
+        }
+    }
+    if (conv)  IWICFormatConverter_Release(conv);
+    if (frame) IWICBitmapFrameDecode_Release(frame);
+    if (dec)   IWICBitmapDecoder_Release(dec);
+    if (out) { *pw = w; *ph = h; }
+    return out;
+}
+
+/* The pack file for this fingerprint, whatever its extension. */
+static uint32_t *pack_open(const char *dir, uint64_t hash, uint32_t *pw, uint32_t *ph)
+{
+    static const char *ext[] = { ".bmp", ".png", ".tif", ".tiff", ".jpg", ".jpeg" };
+    char path[512];
+    size_t i;
+
+    for (i = 0; i < sizeof ext / sizeof ext[0]; i++) {
+        uint32_t *pix;
+        pack_path(path, sizeof path, dir, hash, ext[i]);
+        pix = i == 0 ? pack_read(path, pw, ph) : pack_read_wic(path, pw, ph);
+        if (pix)
+            return pix;
+    }
+    return NULL;
+}
+
 /* The replacement for this fingerprint, or NULL. Refuses a different ratio. */
 static uint32_t *pack_lookup(uint64_t hash, uint32_t width, uint32_t height,
                              uint32_t *pw, uint32_t *ph)
 {
     const char *dir = pack_dir();
-    char path[512];
     uint32_t *pix;
 
     if (!dir || !*dir)
         return NULL;
-    pack_path(path, sizeof path, dir, hash);
-    pix = pack_read(path, pw, ph);
+    pix = pack_open(dir, hash, pw, ph);
     if (!pix)
         return NULL;
     if ((uint64_t)*pw * height != (uint64_t)*ph * width) {
@@ -836,7 +910,7 @@ int nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t width, uint32_t
         src = s_decode_buf; sw = width; sh = height;
         if (pack_dump_dir()) {
             char path[512];
-            pack_path(path, sizeof path, pack_dump_dir(), hash);
+            pack_path(path, sizeof path, pack_dump_dir(), hash, ".bmp");
             pack_write(path, s_decode_buf, width, height);
         }
     }
