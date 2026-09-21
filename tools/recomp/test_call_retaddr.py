@@ -206,5 +206,50 @@ def _run():
     print("%d checks passed" % len(fns))
 
 
+
+def test_icall_failure_leaves_cdecl_arguments_to_the_caller():
+    # sub_001B54D0's shape (point 94): one argument, the call through a state
+    # table, and the caller's own `add esp, 4`. When the target is unknown, the
+    # failure path must leave the argument where a real cdecl callee would have
+    # -- the caller removes it -- or esp ends 4 bytes high and the epilogue
+    # pops esi from the wrong slot.
+    lines = [
+        "    ecx = MEM32(eax + 0x30);",
+        "    PUSH32(esp, eax);",
+        "    { uint32_t _icall_target = MEM32(esp + ecx * 4 + 8); PUSH32(esp, 0x001B5A3Au);"
+        " RECOMP_ICALL_SAFE(_icall_target, _icall_esp); } /* indirect call */",
+        "",
+        "loc_001B5A3A: ;",
+        "    esp = esp + 4;",
+        "    POP32(esp, esi);",
+    ]
+    out = "\n".join(_fixup_icall_esp_save(lines))
+    assert "RECOMP_ICALL_SAFE(_icall_target, _icall_esp - 4u);" in out, out
+
+
+def test_icall_failure_rewinds_fully_for_a_callee_that_cleans_up():
+    # No `add esp` after the call: the callee pops its own arguments
+    # (stdcall, thiscall), and the full rewind stays right.
+    lines = [
+        "    PUSH32(esp, eax);",
+        "    PUSH32(esp, 0x00120010u); RECOMP_ICALL_SAFE(edx, _icall_esp); /* indirect call */",
+        "    ecx = eax;",
+    ]
+    out = "\n".join(_fixup_icall_esp_save(lines))
+    assert "RECOMP_ICALL_SAFE(edx, _icall_esp);" in out, out
+
+
+def test_icall_failure_keeps_the_full_rewind_when_the_cleanup_does_not_match():
+    # MSVC sometimes defers: one `add esp` for several calls. A cleanup that is
+    # not exactly this call's arguments proves nothing about this callee.
+    lines = [
+        "    PUSH32(esp, eax);",
+        "    PUSH32(esp, 0x00120010u); RECOMP_ICALL_SAFE(edx, _icall_esp); /* indirect call */",
+        "    esp = esp + 0xC;",
+    ]
+    out = "\n".join(_fixup_icall_esp_save(lines))
+    assert "RECOMP_ICALL_SAFE(edx, _icall_esp);" in out, out
+
+
 if __name__ == "__main__":
     _run()

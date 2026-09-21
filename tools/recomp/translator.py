@@ -94,6 +94,7 @@ def _fixup_icall_esp_save(lines):
 
     # For each ICALL, determine where to insert the save
     insert_before = set()  # map: line_index → True (insert save before this line)
+    caller_cleans = {}     # ICALL line index -> bytes the caller pops after it
     for icall_idx in icall_indices:
         # The ICALL line itself is "PUSH32(esp, <retva>); RECOMP_ICALL_SAFE(...)"
         # Look backwards for consecutive lines containing PUSH32(esp,
@@ -139,12 +140,39 @@ def _fixup_icall_esp_save(lines):
 
         insert_before.add(first_push_idx)
 
+        # Who removes the arguments. _icall_esp is taken before them, so the
+        # failure path rewinds as if the callee had popped them -- right for a
+        # callee that cleans up (stdcall, thiscall), and N bytes too far for a
+        # caller that does (cdecl: `add esp, N` right after the call). The
+        # caller then adds N on top, leaves esp N bytes high, and its own
+        # epilogue pops the wrong slot. That is how one unknown state handler
+        # in the fighters' state machine (0x001D83B0, point 94) came back as
+        # a corrupted esi and a crash in the next fighter's update, far from
+        # anything that named the missing function.
+        #
+        # Only when the very next statement is `esp = esp + N` and N is
+        # exactly what the argument run pushed: a deferred cleanup that
+        # covers several calls, or one that does not match, keeps the old
+        # rewind.
+        pushed = 4 * sum(1 for k in range(first_push_idx, icall_idx)
+                         if lines[k].strip().startswith('PUSH32(esp,'))
+        k = icall_idx + 1
+        while k < len(lines) and (not lines[k].strip()
+                                  or re.match(r'^loc_[0-9A-Fa-f]+:', lines[k].strip())):
+            k += 1
+        if pushed and k < len(lines):
+            m = re.match(r'^esp = esp \+ (0x[0-9A-Fa-f]+|[0-9]+)u?;$', lines[k].strip())
+            if m and int(m.group(1), 0) == pushed:
+                caller_cleans[icall_idx] = pushed
+
     # Build result with saves inserted
     for i, line in enumerate(lines):
         if i in insert_before:
             # Determine indentation from the current line
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}{{ uint32_t _icall_esp = g_esp;")
+        if i in caller_cleans:
+            line = line.replace("_icall_esp);", f"_icall_esp - {caller_cleans[i]}u);")
         result.append(line)
         if 'RECOMP_ICALL_SAFE(' in line:
             indent = line[:len(line) - len(line.lstrip())]
