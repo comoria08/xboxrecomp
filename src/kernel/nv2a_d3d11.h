@@ -65,6 +65,52 @@ int  nvd3d_texture(const uint32_t key[6], uint64_t hash,
 
 void nvd3d_triangle(const NvD3DVertex v[3], const NvD3DState *st);
 
+/* -- Vertex programs on the GPU (RECOMP_VP_GPU) ----------------------------
+ *
+ * The CPU path runs the title's NV2A vertex program in an interpreter, one
+ * vertex at a time, and hands finished triangles over. Measured in a fight,
+ * that interpreter is 55% of the thread every frame waits on, while the GPU
+ * sits idle. Here the program is translated to HLSL once and run as the
+ * vertex shader instead: the batch goes over as its raw attribute bytes, the
+ * constants and a triangle list of vertex indices. */
+
+/* One attribute stream as uploaded: element i starts at base + i * stride in
+ * the data. size 0 means the batch does not supply it; the shader then takes
+ * the value in NvD3DProgramDraw.absent, as the CPU path would. */
+typedef struct {
+    uint32_t base, stride, type, size;
+} NvD3DAttr;
+
+typedef struct {
+    int             vs;                 /* from nvd3d_vs_program */
+    const float   (*consts)[4];         /* the program's 192 constants */
+    uint32_t        consts_gen;         /* changes whenever they do: sent only then */
+    NvD3DAttr       attr[16];
+    float           absent[16][4];
+    const void     *data;               /* the attribute bytes, as described */
+    uint32_t        data_bytes;
+    const uint32_t *index;              /* triangle list of vertex indices */
+    uint32_t        nindex;
+    float           ax, ay;             /* window to NDC, as d3d_triangle */
+    float           uv_scale[2];        /* texels per unit, or 1 */
+    int             textured;
+} NvD3DProgramDraw;
+
+/* The vertex shader for one translated program, compiled once and cached by
+ * hash. -1 if it does not compile: the caller keeps the CPU path for it. With
+ * hlsl NULL it only looks: -2 means not seen yet, so translate and call again. */
+int  nvd3d_vs_program(uint64_t hash, const char *hlsl, size_t len);
+
+/* Draw a whole batch through a translated program, after whatever the CPU
+ * path queued, under the same state d3d_triangle would have used. */
+void nvd3d_draw_program(const NvD3DProgramDraw *d, const NvD3DState *st);
+
+/* The same batch through the same shader, but captured by stream output
+ * instead of drawn: one NvD3DVertex per index, which is exactly what the CPU
+ * path would have handed to nvd3d_triangle. This is how the translation is
+ * checked against the interpreter (RECOMP_VP_GPU=2). Returns the count. */
+uint32_t nvd3d_check_program(const NvD3DProgramDraw *d, NvD3DVertex *out, uint32_t max);
+
 /* Clear on the current target. what: bit 0 depth, bit 1 stencil, bit 2 colour.
  * The colour clear covers rect (x, y, w, h) in samples; depth and stencil the
  * whole buffer, as the CPU path does. */

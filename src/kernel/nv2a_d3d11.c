@@ -43,6 +43,9 @@ static int s_state = -1;                 /* -1 unknown, 0 off, 1 on */
  * sizes, clip rectangles, texel coordinates, read-back pixels -- stays in its
  * own units; only the GPU side is multiplied. */
 static uint32_t S = 1;
+
+static int  tex_mips_on(void);   /* mipmaps and anisotropy: see their definitions */
+static UINT tex_aniso(void);
 extern void xbox_FramebufferWindowScale(uint32_t scale);
 static ID3D11Device         *s_dev;
 static ID3D11DeviceContext  *s_ctx;
@@ -97,6 +100,7 @@ typedef struct {
     uint32_t w, h, used;                  /* the D3D texture's own size */
     uint32_t decl_w, decl_h;              /* what the title declared: the two differ
                                            * when a pack image stands in */
+    int      mipped;                      /* carries a generated mip chain */
     int      rt;                          /* >= 0: really render target #rt */
     ID3D11Texture2D          *tex;
     ID3D11ShaderResourceView *srv;
@@ -171,11 +175,30 @@ static const char s_hlsl[] =
 "  POut o; float2 t = float2((id << 1) & 2, id & 2);\n"
 "  o.uv = t; o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); return o;\n"
 "}\n"
-"cbuffer Present : register(b0) { float4 rect; };\n"
+/* The resolve. foot.xy is how many source texels one output pixel covers on
+ * each axis, foot.zw one source texel in uv. At or under one texel a pixel it
+ * is the single bilinear tap this always was, to the bit. Over it -- a target
+ * drawn larger than the window, which is what RECOMP_D3D11_SCALE is for -- a
+ * single tap reads four texels and drops the rest, so the supersampling that
+ * was paid for never reached the screen. The footprint is averaged instead:
+ * n taps per axis, n = ceil(foot), each bilinear, so taps sit at most a texel
+ * apart and every texel under the footprint counts. In linear light, because
+ * averaging gamma-encoded values darkens every edge it resolves. */
+"cbuffer Present : register(b0) { float4 rect; float4 foot; };\n"
 "Texture2D src : register(t0);\n"
 "SamplerState lin : register(s0);\n"
 "float4 ps_present(POut i) : SV_Target {\n"
-"  return float4(src.Sample(lin, rect.xy + i.uv * rect.zw).rgb, 1.0);\n"
+"  float2 uv = rect.xy + i.uv * rect.zw;\n"
+"  int2 n = int2(clamp(ceil(foot.xy - 0.001), 1.0, 8.0));\n"
+"  if (n.x == 1 && n.y == 1)\n"
+"    return float4(src.SampleLevel(lin, uv, 0).rgb, 1.0);\n"
+"  float3 acc = 0;\n"
+"  [loop] for (int y = 0; y < n.y; y++)\n"
+"    [loop] for (int x = 0; x < n.x; x++) {\n"
+"      float2 o = ((float2(x, y) + 0.5) / float2(n) - 0.5) * foot.xy * foot.zw;\n"
+"      acc += pow(max(src.SampleLevel(lin, uv + o, 0).rgb, 0.0), 2.2);\n"
+"    }\n"
+"  return float4(pow(acc / (float)(n.x * n.y), 1.0 / 2.2), 1.0);\n"
 "}\n";
 
 static ID3DBlob *compile(const char *entry, const char *target)
@@ -278,8 +301,13 @@ static int init(void)
         int i;
         for (i = 0; i < 4; i++) {
             D3D11_SAMPLER_DESC sd;
+            const UINT aniso = tex_aniso();
             memset(&sd, 0, sizeof sd);
-            sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+            /* Anisotropic along the axis a grazing floor is squashed on; the
+             * mip level comes from the other one. See tex_mips_on. */
+            sd.Filter = aniso > 1 ? D3D11_FILTER_ANISOTROPIC
+                                  : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+            sd.MaxAnisotropy = aniso;
             sd.AddressU = (i & 1) ? D3D11_TEXTURE_ADDRESS_WRAP
                                   : D3D11_TEXTURE_ADDRESS_CLAMP;
             sd.AddressV = (i & 2) ? D3D11_TEXTURE_ADDRESS_WRAP
@@ -303,6 +331,16 @@ static int init(void)
         ID3D11Device_CreateDepthStencilState(s_dev, &dd, &s_ds_off);
     }
     fprintf(stderr, "  [D3D11] device ready: triangles are filled on the GPU, scale %u\n", S);
+    {
+        const char *pf = getenv("RECOMP_PRESENT_FILTER");
+        UINT an = tex_aniso();
+        fprintf(stderr, "  [D3D11] textures: %s, anisotropy %s; resolve: %s\n",
+                tex_mips_on() ? "mip chains generated" : "one level (RECOMP_TEX_MIPS=0)",
+                an > 1 ? (an >= 16 ? "16x" : an >= 8 ? "8x" : an >= 4 ? "4x" : "2x")
+                       : "off",
+                (pf && atoi(pf) == 0) ? "single tap (RECOMP_PRESENT_FILTER=0)"
+                                      : "footprint average when the target is larger");
+    }
     return 1;
 }
 
@@ -625,6 +663,42 @@ static size_t    s_decode_cap;
  * is addressed in whole texels, so it is not packable. Those are the title's
  * own frames, not artwork.
  */
+/* ── Mipmaps and anisotropy ──────────────────────────────────────────── */
+/*
+ * The title asks for LINEAR_MIPMAP_LINEAR minification on 617460 batches a
+ * minute and ships ONE mip level everywhere (point 85, measured): so the chain
+ * it asks for has to be made here, and making it is honouring the request,
+ * not embellishing it. GenerateMips after every upload; the samplers were
+ * already MIN_MAG_MIP_LINEAR with an open MaxLOD and the shader already uses
+ * Sample, which picks the level from screen derivatives -- they simply never
+ * had a level to pick.
+ *
+ * It is also what makes an enlarged pack texture behave: Sample picks the
+ * level from the REAL size, so a 2048 standing in for a declared 512 lands on
+ * its 512 level whenever the surface is at 1:1, and shows its extra detail
+ * only up close. Without a chain the same image shimmers at distance.
+ *
+ * RECOMP_TEX_MIPS=0 and RECOMP_TEX_ANISO=0 give back the single level and
+ * the plain trilinear sampler, to compare two passes over one scene.
+ */
+static int tex_mips_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_TEX_MIPS");
+        on = !(e && atoi(e) == 0);
+    }
+    return on;
+}
+
+/* Anisotropy: 16 unless told otherwise; 0 or 1 means off. */
+static UINT tex_aniso(void)
+{
+    const char *e = getenv("RECOMP_TEX_ANISO");
+    int v = e ? atoi(e) : 16;
+    return (UINT)(v < 1 ? 1 : v > 16 ? 16 : v);
+}
+
 static const char *pack_dir(void)
 {
     static const char *dir;
@@ -915,10 +989,12 @@ int nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t width, uint32_t
         }
     }
 
-    if (t->tex && t->w == sw && t->h == sh) {
+    if (t->tex && t->w == sw && t->h == sh && t->mipped == tex_mips_on()) {
         flush();   /* the batch may sample the old contents */
         ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)t->tex, 0, NULL,
                                               src, sw * 4, 0);
+        if (t->mipped)
+            ID3D11DeviceContext_GenerateMips(s_ctx, t->srv);
     } else {
         D3D11_TEXTURE2D_DESC td;
         D3D11_SUBRESOURCE_DATA init;
@@ -926,20 +1002,33 @@ int nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t width, uint32_t
         if (t->srv) ID3D11ShaderResourceView_Release(t->srv);
         if (t->tex) ID3D11Texture2D_Release(t->tex);
         t->srv = NULL; t->tex = NULL;
+        const int mips = tex_mips_on();
         memset(&td, 0, sizeof td);
-        td.Width = sw; td.Height = sh; td.MipLevels = 1; td.ArraySize = 1;
+        td.Width = sw; td.Height = sh; td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        /* GenerateMips wants the texture bindable as a target too; it costs
+         * nothing but the flag. The chain cannot come in as initial data,
+         * so level 0 goes in afterwards. */
+        td.MipLevels = mips ? 0 : 1;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | (mips ? D3D11_BIND_RENDER_TARGET : 0);
+        td.MiscFlags = mips ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0;
         init.pSysMem = src;
         init.SysMemPitch = sw * 4;
         init.SysMemSlicePitch = 0;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, &init, &t->tex))) {
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, mips ? NULL : &init,
+                                                &t->tex))) {
             free(pack);
             return -1;
         }
         ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t->tex, NULL, &t->srv);
+        if (mips) {
+            ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)t->tex, 0, NULL,
+                                                  src, sw * 4, 0);
+            ID3D11DeviceContext_GenerateMips(s_ctx, t->srv);
+        }
+        t->mipped = mips;
     }
     free(pack);
     memcpy(t->key, key, sizeof t->key);
@@ -997,24 +1086,13 @@ static void framelog(const char *fmt, ...)
 
 /* ── Drawing ────────────────────────────────────────────────────────── */
 
-static void flush(void)
+/* Everything a batch needs besides its vertices: the pixel shader constants,
+ * the texture and its sampler, viewport, scissor, blend and depth. Shared by
+ * the CPU path's flush and by a translated program's draw, so the two can
+ * never disagree on what a state means. */
+static void bind_state(const NvD3DState *st)
 {
-    const NvD3DState *st = &s_batch;
     D3D11_MAPPED_SUBRESOURCE m;
-    UINT stride = sizeof(NvD3DVertex), offset = 0;
-
-    if (!s_nverts || s_cur < 0) {
-        s_nverts = 0;
-        return;
-    }
-    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vb, 0,
-                                       D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-        s_nverts = 0;
-        return;
-    }
-    memcpy(m.pData, s_verts, s_nverts * sizeof(NvD3DVertex));
-    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
-
     {
         float cb[12];
         int textured = st->texture >= 0;
@@ -1075,6 +1153,27 @@ static void flush(void)
         ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_state(st), bf, 0xFFFFFFFFu);
         ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, ds_state(st), st->stencil_ref & 0xFF);
     }
+}
+
+static void flush(void)
+{
+    const NvD3DState *st = &s_batch;
+    D3D11_MAPPED_SUBRESOURCE m;
+    UINT stride = sizeof(NvD3DVertex), offset = 0;
+
+    if (!s_nverts || s_cur < 0) {
+        s_nverts = 0;
+        return;
+    }
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vb, 0,
+                                       D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        s_nverts = 0;
+        return;
+    }
+    memcpy(m.pData, s_verts, s_nverts * sizeof(NvD3DVertex));
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
+
+    bind_state(st);
     ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride, &offset);
@@ -1116,6 +1215,321 @@ void nvd3d_triangle(const NvD3DVertex v[3], const NvD3DState *st)
         flush();
     memcpy(s_verts + s_nverts, v, 3 * sizeof *v);
     s_nverts += 3;
+}
+
+/* ── Vertex programs on the GPU ─────────────────────────────────────── */
+/*
+ * See nv2a_d3d11.h. A translated program is an ordinary vs_5_0 shader whose
+ * output struct is the one the pixel shader already takes, so the rest of the
+ * pipeline -- sampling, alpha test, blend, depth -- is untouched. It reads
+ * the batch from a raw buffer (the title's vertex formats are not all DXGI
+ * formats: the 11:11:10 normals are not) indexed by SV_VertexID, which under
+ * DrawIndexed with no vertex buffers is the index itself.
+ */
+#define MAX_VS_PROGRAMS 256
+typedef struct {
+    uint64_t hash;
+    ID3D11VertexShader   *vs;
+    ID3D11GeometryShader *so;           /* the same shader, stream output only */
+    ID3DBlob             *code;
+} VsProgram;
+static VsProgram s_vsp[MAX_VS_PROGRAMS];
+static int       s_nvsp;
+
+static ID3D11Buffer             *s_vp_cbc, *s_vp_cba, *s_vp_ib, *s_vp_data;
+static ID3D11ShaderResourceView *s_vp_data_srv;
+static uint32_t                  s_vp_data_cap, s_vp_ib_cap;
+static ID3D11Buffer             *s_so_buf, *s_so_stage;
+static uint32_t                  s_so_cap;
+/* The batch data and indices go into rings, mapped NO_OVERWRITE and
+ * discarded only on wrap. The first version discarded a 1 MB buffer for
+ * every batch, two triangles or two thousand: the driver renamed a megabyte
+ * each time, and the menus fell from 1160 frames a second to 540. A raw view
+ * of a dynamic buffer may only be mapped NO_OVERWRITE where the driver says
+ * so (D3D11.1); elsewhere the data ring falls back to a discard per batch. */
+static uint32_t s_vp_data_pos, s_vp_ib_pos, s_vp_consts_gen = 0xFFFFFFFFu;
+static int      s_vp_srv_nooverwrite = -1;
+
+static int ring_upload(ID3D11Buffer *b, uint32_t cap, uint32_t *pos, int nooverwrite,
+                       const void *src, uint32_t n, uint32_t *at)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_MAP how = D3D11_MAP_WRITE_NO_OVERWRITE;
+    uint32_t p = (*pos + 15u) & ~15u;
+    if (!nooverwrite || p + n > cap) {
+        p = 0;
+        how = D3D11_MAP_WRITE_DISCARD;
+    }
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)b, 0, how, 0, &m)))
+        return 0;
+    memcpy((uint8_t *)m.pData + p, src, n);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)b, 0);
+    *at = p;
+    *pos = p + n;
+    return 1;
+}
+
+int nvd3d_vs_program(uint64_t hash, const char *hlsl, size_t len)
+{
+    int i;
+    ID3DBlob *code = NULL, *err = NULL;
+    VsProgram *p;
+
+    for (i = 0; i < s_nvsp; i++)
+        if (s_vsp[i].hash == hash)
+            return s_vsp[i].vs ? i : -1;
+    if (!hlsl)
+        return -2;                      /* unknown: the caller translates */
+    if (s_nvsp >= MAX_VS_PROGRAMS || !s_dev)
+        return -1;
+    p = &s_vsp[s_nvsp++];
+    memset(p, 0, sizeof *p);
+    p->hash = hash;
+    if (FAILED(D3DCompile(hlsl, len, "nv2a_vp", NULL, NULL, "vp_main", "vs_5_0",
+                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err))) {
+        static int said;
+        if (said++ < 8)
+            fprintf(stderr, "  [VPGPU] program %016llX does not compile, kept on the CPU: %s\n",
+                    (unsigned long long)hash,
+                    err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+        if (err) ID3D10Blob_Release(err);
+        return -1;                      /* the failure is cached: no retry */
+    }
+    if (err) ID3D10Blob_Release(err);
+    if (FAILED(ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                               ID3D10Blob_GetBufferSize(code), NULL, &p->vs))) {
+        ID3D10Blob_Release(code);
+        return -1;
+    }
+    p->code = code;
+    return (int)(p - s_vsp);
+}
+
+static int vp_upload(ID3D11Buffer *b, const void *src, size_t n)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)b, 0,
+                                       D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return 0;
+    memcpy(m.pData, src, n);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)b, 0);
+    return 1;
+}
+
+/* Buffers, constants and shader: everything common to drawing a batch and
+ * capturing it. 0 if something could not be made. */
+static int vp_setup(const NvD3DProgramDraw *d, UINT *first_index)
+{
+    D3D11_BUFFER_DESC bd;
+    uint32_t want = (d->data_bytes + 15u) & ~15u;
+    uint32_t data_at = 0, ib_at = 0;
+
+    if (d->vs < 0 || d->vs >= s_nvsp || !s_vsp[d->vs].vs)
+        return 0;
+    if (s_vp_srv_nooverwrite < 0) {
+        D3D11_FEATURE_DATA_D3D11_OPTIONS o;
+        memset(&o, 0, sizeof o);
+        s_vp_srv_nooverwrite =
+            SUCCEEDED(ID3D11Device_CheckFeatureSupport(s_dev, D3D11_FEATURE_D3D11_OPTIONS,
+                                                      &o, sizeof o))
+            && o.MapNoOverwriteOnDynamicBufferSRV;
+        fprintf(stderr, "  [VPGPU] batch data ring: %s\n",
+                s_vp_srv_nooverwrite ? "mapped without overwrite"
+                                     : "discarded per batch (driver lacks D3D11.1 option)");
+    }
+    if (!s_vp_cbc) {
+        memset(&bd, 0, sizeof bd);
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        bd.ByteWidth = 192 * 16;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_vp_cbc)))
+            return 0;
+        s_vp_consts_gen = 0xFFFFFFFFu;
+        bd.ByteWidth = 16 * 16 + 16 * 16 + 2 * 16;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_vp_cba)))
+            return 0;
+    }
+    if (want < 16) want = 16;
+    if (want > s_vp_data_cap) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+        if (s_vp_data_srv) ID3D11ShaderResourceView_Release(s_vp_data_srv);
+        if (s_vp_data) ID3D11Buffer_Release(s_vp_data);
+        s_vp_data_srv = NULL; s_vp_data = NULL; s_vp_data_cap = 0;
+        memset(&bd, 0, sizeof bd);
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        bd.ByteWidth = want < (8u << 20) ? (8u << 20) : want * 2;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_vp_data)))
+            return 0;
+        memset(&sd, 0, sizeof sd);
+        sd.Format = DXGI_FORMAT_R32_TYPELESS;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+        sd.BufferEx.NumElements = bd.ByteWidth / 4;
+        sd.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+        if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_vp_data,
+                                                          &sd, &s_vp_data_srv)))
+            return 0;
+        s_vp_data_cap = bd.ByteWidth;
+        s_vp_data_pos = 0;
+    }
+    if (d->nindex * 4u > s_vp_ib_cap) {
+        if (s_vp_ib) ID3D11Buffer_Release(s_vp_ib);
+        s_vp_ib = NULL; s_vp_ib_cap = 0;
+        memset(&bd, 0, sizeof bd);
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        bd.ByteWidth = d->nindex * 4u < (2u << 20) ? (2u << 20) : d->nindex * 8u;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_vp_ib)))
+            return 0;
+        s_vp_ib_cap = bd.ByteWidth;
+        s_vp_ib_pos = 0;
+    }
+
+    if (!ring_upload(s_vp_data, s_vp_data_cap, &s_vp_data_pos, s_vp_srv_nooverwrite,
+                     d->data, d->data_bytes, &data_at)
+     || !ring_upload(s_vp_ib, s_vp_ib_cap, &s_vp_ib_pos, 1,
+                     d->index, d->nindex * 4u, &ib_at))
+        return 0;
+    /* The constants only when the title changed them: most batches in a row
+     * share them, and 3 KB per batch was most of what was left. */
+    if (d->consts_gen != s_vp_consts_gen) {
+        if (!vp_upload(s_vp_cbc, d->consts, 192 * 16))
+            return 0;
+        s_vp_consts_gen = d->consts_gen;
+    }
+    *first_index = ib_at / 4u;
+    {
+        uint8_t cba[16 * 16 + 16 * 16 + 2 * 16];
+        float xf[8];
+        {
+            NvD3DAttr at[16];
+            int k;
+            memcpy(at, d->attr, sizeof at);
+            for (k = 0; k < 16; k++)
+                if (at[k].size)
+                    at[k].base += data_at;        /* modular, as the shader's */
+            memcpy(cba, at, 16 * 16);
+        }
+        memcpy(cba + 256, d->absent, 16 * 16);
+        xf[0] = d->ax; xf[1] = d->ay; xf[2] = d->uv_scale[0]; xf[3] = d->uv_scale[1];
+        xf[4] = d->textured ? 1.0f : 0.0f; xf[5] = xf[6] = xf[7] = 0.0f;
+        memcpy(cba + 512, xf, sizeof xf);
+        if (!vp_upload(s_vp_cba, cba, sizeof cba))
+            return 0;
+    }
+    {
+        ID3D11Buffer *cbs[2];
+        cbs[0] = s_vp_cbc; cbs[1] = s_vp_cba;
+        ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+        ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_vp_ib, DXGI_FORMAT_R32_UINT, 0);
+        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11DeviceContext_VSSetShader(s_ctx, s_vsp[d->vs].vs, NULL, 0);
+        ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 1, 2, cbs);
+        ID3D11DeviceContext_VSSetShaderResources(s_ctx, 1, 1, &s_vp_data_srv);
+    }
+    return 1;
+}
+
+static void vp_unbind(void)
+{
+    ID3D11ShaderResourceView *none = NULL;
+    ID3D11DeviceContext_VSSetShaderResources(s_ctx, 1, 1, &none);
+}
+
+void nvd3d_draw_program(const NvD3DProgramDraw *d, const NvD3DState *st)
+{
+    UINT first = 0;
+
+    if (s_cur < 0 || !d->nindex)
+        return;
+    flush();                            /* what the CPU path queued goes first */
+    bind_state(st);
+    if (!vp_setup(d, &first))
+        return;
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+    ID3D11DeviceContext_DrawIndexed(s_ctx, d->nindex, first, 0);
+    vp_unbind();
+    framelog("prog %5u i  vs %d  tex %d %ux%u  z%u%u f%X  bl%u %X/%X  cm%08X  at%u f%X r%u",
+             d->nindex, d->vs, st->texture, st->tex_w, st->tex_h,
+             st->depth_enable, st->depth_write, st->depth_func,
+             st->blend_enable, st->blend_src, st->blend_dst, st->color_mask,
+             st->alpha_test, st->alpha_func, st->alpha_ref);
+}
+
+uint32_t nvd3d_check_program(const NvD3DProgramDraw *d, NvD3DVertex *out, uint32_t max)
+{
+    VsProgram *p;
+    uint32_t n = d->nindex < max ? d->nindex : max;
+    uint32_t bytes = n * (uint32_t)sizeof(NvD3DVertex);
+    D3D11_MAPPED_SUBRESOURCE m;
+    UINT off = 0, first = 0;
+    ID3D11Buffer *none = NULL;
+
+    if (s_cur < 0 || !n || d->vs < 0 || d->vs >= s_nvsp)
+        return 0;
+    p = &s_vsp[d->vs];
+    flush();
+    if (!p->so) {
+        /* The vertex shader's own output, streamed out without a geometry
+         * stage: the declaration is exactly NvD3DVertex, so what comes back is
+         * comparable field for field with the CPU path's vertices. */
+        static const D3D11_SO_DECLARATION_ENTRY decl[3] = {
+            { 0, "SV_Position", 0, 0, 4, 0 },
+            { 0, "TEXCOORD",    0, 0, 2, 0 },
+            { 0, "COLOR",       0, 0, 4, 0 },
+        };
+        UINT stride = sizeof(NvD3DVertex);
+        if (FAILED(ID3D11Device_CreateGeometryShaderWithStreamOutput(
+                s_dev, ID3D10Blob_GetBufferPointer(p->code), ID3D10Blob_GetBufferSize(p->code),
+                decl, 3, &stride, 1, D3D11_SO_NO_RASTERIZED_STREAM, NULL, &p->so)))
+            return 0;
+    }
+    if (bytes > s_so_cap) {
+        D3D11_BUFFER_DESC bd;
+        if (s_so_buf) ID3D11Buffer_Release(s_so_buf);
+        if (s_so_stage) ID3D11Buffer_Release(s_so_stage);
+        s_so_buf = s_so_stage = NULL; s_so_cap = 0;
+        memset(&bd, 0, sizeof bd);
+        bd.ByteWidth = bytes * 2;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_STREAM_OUTPUT;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_so_buf)))
+            return 0;
+        bd.Usage = D3D11_USAGE_STAGING;
+        bd.BindFlags = 0;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_so_stage)))
+            return 0;
+        s_so_cap = bytes * 2;
+    }
+    {
+        NvD3DProgramDraw dn = *d;
+        dn.nindex = n;
+        if (!vp_setup(&dn, &first))
+            return 0;
+    }
+    ID3D11DeviceContext_GSSetShader(s_ctx, p->so, NULL, 0);
+    ID3D11DeviceContext_SOSetTargets(s_ctx, 1, &s_so_buf, &off);
+    ID3D11DeviceContext_DrawIndexed(s_ctx, n, first, 0);
+    ID3D11DeviceContext_SOSetTargets(s_ctx, 1, &none, &off);
+    ID3D11DeviceContext_GSSetShader(s_ctx, NULL, NULL, 0);
+    vp_unbind();
+    {
+        D3D11_BOX box = { 0, 0, 0, bytes, 1, 1 };
+        ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)s_so_stage, 0, 0, 0, 0,
+                                                  (ID3D11Resource *)s_so_buf, 0, &box);
+    }
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_so_stage, 0,
+                                       D3D11_MAP_READ, 0, &m)))
+        return 0;
+    memcpy(out, m.pData, bytes);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_so_stage, 0);
+    return n;
 }
 
 void nvd3d_clear(uint32_t what, uint32_t argb, float depth, uint8_t stencil,
@@ -1285,16 +1699,11 @@ void nvd3d_present(uint32_t base, const uint32_t rect[4],
         D3D11_MAPPED_SUBRESOURCE m;
         D3D11_VIEWPORT vp;
         ID3D11ShaderResourceView *none = NULL;
-        float cb[4];
+        float cb[8];
         cb[0] = (float)rect[0] / (float)t->w;
         cb[1] = (float)rect[1] / (float)t->h;
         cb[2] = (float)rect[2] / (float)t->w;
         cb[3] = (float)rect[3] / (float)t->h;
-        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_present, 0,
-                                              D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-            memcpy(m.pData, cb, sizeof cb);
-            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_present, 0);
-        }
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back_rtv, NULL);
         /* The title's picture keeps its aspect (disp_w:disp_h, 4:3 here);
@@ -1315,6 +1724,25 @@ void nvd3d_present(uint32_t base, const uint32_t rect[4],
             vp.Width = w; vp.Height = h;
         }
         vp.MinDepth = 0; vp.MaxDepth = 1;
+        /* Source texels per output pixel, and one texel in uv: see ps_present.
+         * RECOMP_PRESENT_FILTER=0 keeps the single tap, to compare two passes
+         * over one scene rather than remember one. */
+        {
+            static int filter = -1;
+            if (filter < 0) {
+                const char *e = getenv("RECOMP_PRESENT_FILTER");
+                filter = !(e && atoi(e) == 0);
+            }
+            cb[4] = filter ? (float)(rect[2] * S) / vp.Width  : 1.0f;
+            cb[5] = filter ? (float)(rect[3] * S) / vp.Height : 1.0f;
+            cb[6] = 1.0f / (float)(t->w * S);
+            cb[7] = 1.0f / (float)(t->h * S);
+        }
+        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_present, 0,
+                                              D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            memcpy(m.pData, cb, sizeof cb);
+            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_present, 0);
+        }
         ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
         {
             D3D11_RECT sc = { 0, 0, (LONG)s_back_w, (LONG)s_back_h };
@@ -1399,6 +1827,11 @@ int  nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t w, uint32_t h,
                    uint32_t mb, uint32_t mn, void (*d)(uint32_t *, uint32_t, uint32_t))
 { (void)key; (void)hash; (void)w; (void)h; (void)mb; (void)mn; (void)d; return -1; }
 void nvd3d_triangle(const NvD3DVertex v[3], const NvD3DState *st) { (void)v; (void)st; }
+int  nvd3d_vs_program(uint64_t hash, const char *hlsl, size_t len)
+{ (void)hash; (void)hlsl; (void)len; return -1; }
+void nvd3d_draw_program(const NvD3DProgramDraw *d, const NvD3DState *st) { (void)d; (void)st; }
+uint32_t nvd3d_check_program(const NvD3DProgramDraw *d, NvD3DVertex *out, uint32_t max)
+{ (void)d; (void)out; (void)max; return 0; }
 void nvd3d_clear(uint32_t w, uint32_t a, float d, uint8_t s, const uint32_t r[4])
 { (void)w; (void)a; (void)d; (void)s; (void)r; }
 void nvd3d_present(uint32_t b, const uint32_t r[4], uint32_t w, uint32_t h)

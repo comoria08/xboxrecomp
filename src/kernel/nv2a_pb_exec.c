@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
@@ -1901,6 +1902,68 @@ static int32_t d3d_texture(void)
     return last;
 }
 
+/* Where a vertex lands, from its position before the divide: window = X *
+ * rcc(w) + c59, scaled to samples, then to NDC -- written out so that it
+ * stays linear in (X, w). clip is X, Y, Z, w. The GPU vertex path computes
+ * the same thing in its shader and is checked against this. */
+static void d3d_clip_pos(const float clip[4], const float c59[3],
+                         float ax, float ay, float pos[4])
+{
+    const float wc = clip[3];
+    pos[0] = clip[0] * ax + (c59[0] * ax - 1.0f) * wc;
+    pos[1] = -clip[1] * ay + (1.0f - c59[1] * ay) * wc;
+    pos[2] = (clip[2] + c59[2] * wc) / 16777215.0f;
+    pos[3] = wc;
+}
+
+/* Everything about a batch that is not its vertices. Constant across a
+ * batch, so the GPU vertex path computes it once for the whole draw. */
+static void d3d_batch_state(NvD3DState *st, int has_z, int textured)
+{
+    memset(st, 0, sizeof *st);
+    if (s_depth_on) {
+        if (has_z) {
+            st->depth_enable = s_gpu.depth_test != 0;
+            st->depth_write  = s_gpu.depth_mask != 0;
+            st->depth_func   = s_gpu.depth_func;
+        }
+        if (s_gpu.stencil_test) {
+            st->stencil_enable = 1;
+            st->stencil_func  = s_gpu.stencil_func;
+            st->stencil_ref   = s_gpu.stencil_ref & 0xFF;
+            st->stencil_rmask = s_gpu.stencil_fmask & 0xFF;
+            st->stencil_wmask = s_gpu.stencil_wmask & 0xFF;
+            st->stencil_fail  = s_gpu.stencil_op_fail;
+            st->stencil_zfail = s_gpu.stencil_op_zfail;
+            st->stencil_zpass = s_gpu.stencil_op_zpass;
+        }
+    }
+    if (s_gpu.blend_enable) {
+        st->blend_enable = 1;
+        st->blend_src    = s_gpu.blend_sfactor;
+        st->blend_dst    = s_gpu.blend_dfactor;
+        st->blend_eq     = s_gpu.blend_equation;
+        st->blend_color  = s_gpu.blend_color;
+    }
+    st->color_mask = s_gpu.color_mask;
+    if (s_gpu.alpha_test && !depth_only_batch()) {
+        st->alpha_test = 1;
+        st->alpha_func = s_gpu.alpha_func;
+        st->alpha_ref  = s_gpu.alpha_ref;
+    }
+    st->texture = textured ? d3d_texture() : -1;
+    if (st->texture >= 0) {
+        st->addr_u = s_gpu.tex.addr_u;
+        st->addr_v = s_gpu.tex.addr_v;
+        st->tex_w  = s_gpu.tex.width;
+        st->tex_h  = s_gpu.tex.height;
+    }
+    st->scissor[0] = s_gpu.clip_x;
+    st->scissor[1] = s_gpu.clip_y;
+    st->scissor[2] = surface_sample_w();
+    st->scissor[3] = surface_sample_h();
+}
+
 /* a, b, c are already in surface samples. */
 static void d3d_triangle(const float *p[3], uint32_t argb,
                          const float uv[3][2], int textured)
@@ -1931,9 +1994,7 @@ static void d3d_triangle(const float *p[3], uint32_t argb,
              * written out so that it stays linear in (X, w). */
             const float ax = (float)surface_aa_x() * 2.0f / W;
             const float ay = (float)surface_aa_y() * 2.0f / H;
-            v[k].pos[0] = s_tri_clip[k][0] * ax + (s_tri_c59[0] * ax - 1.0f) * wc;
-            v[k].pos[1] = -s_tri_clip[k][1] * ay + (1.0f - s_tri_c59[1] * ay) * wc;
-            v[k].pos[2] = (s_tri_clip[k][2] + s_tri_c59[2] * wc) / 16777215.0f;
+            d3d_clip_pos(s_tri_clip[k], s_tri_c59, ax, ay, v[k].pos);
         } else {
             v[k].pos[0] = (p[k][0] / W * 2.0f - 1.0f) * wc;
             v[k].pos[1] = (1.0f - p[k][1] / H * 2.0f) * wc;
@@ -1948,48 +2009,7 @@ static void d3d_triangle(const float *p[3], uint32_t argb,
         v[k].col[3] = (float)((col >> 24) & 0xFF) / 255.0f;
     }
 
-    memset(&st, 0, sizeof st);
-    if (s_depth_on) {
-        if (s_tri_has_z) {
-            st.depth_enable = s_gpu.depth_test != 0;
-            st.depth_write  = s_gpu.depth_mask != 0;
-            st.depth_func   = s_gpu.depth_func;
-        }
-        if (s_gpu.stencil_test) {
-            st.stencil_enable = 1;
-            st.stencil_func  = s_gpu.stencil_func;
-            st.stencil_ref   = s_gpu.stencil_ref & 0xFF;
-            st.stencil_rmask = s_gpu.stencil_fmask & 0xFF;
-            st.stencil_wmask = s_gpu.stencil_wmask & 0xFF;
-            st.stencil_fail  = s_gpu.stencil_op_fail;
-            st.stencil_zfail = s_gpu.stencil_op_zfail;
-            st.stencil_zpass = s_gpu.stencil_op_zpass;
-        }
-    }
-    if (s_gpu.blend_enable) {
-        st.blend_enable = 1;
-        st.blend_src    = s_gpu.blend_sfactor;
-        st.blend_dst    = s_gpu.blend_dfactor;
-        st.blend_eq     = s_gpu.blend_equation;
-        st.blend_color  = s_gpu.blend_color;
-    }
-    st.color_mask = s_gpu.color_mask;
-    if (s_gpu.alpha_test && !depth_only_batch()) {
-        st.alpha_test = 1;
-        st.alpha_func = s_gpu.alpha_func;
-        st.alpha_ref  = s_gpu.alpha_ref;
-    }
-    st.texture = textured ? d3d_texture() : -1;
-    if (st.texture >= 0) {
-        st.addr_u = s_gpu.tex.addr_u;
-        st.addr_v = s_gpu.tex.addr_v;
-        st.tex_w  = s_gpu.tex.width;
-        st.tex_h  = s_gpu.tex.height;
-    }
-    st.scissor[0] = s_gpu.clip_x;
-    st.scissor[1] = s_gpu.clip_y;
-    st.scissor[2] = surface_sample_w();
-    st.scissor[3] = surface_sample_h();
+    d3d_batch_state(&st, s_tri_has_z, textured);
 
     {
         static int trace = -1;
@@ -2554,6 +2574,7 @@ static int vp_active(void)
 /* Bumped whenever the program text or its entry point changes, so the
  * decoded form below is rebuilt only then. */
 static uint32_t s_vp_gen = 1;
+static uint32_t s_vp_c_gen;              /* bumped by every constant write */
 
 static int vp_method(uint32_t method, uint32_t param)
 {
@@ -2584,6 +2605,7 @@ static int vp_method(uint32_t method, uint32_t param)
                 fprintf(stderr, "\n");
             }
             memcpy(&s_vp.c[s_vp.c_load][slot % 4], &param, 4);
+            s_vp_c_gen++;
             if (slot % 4 == 3)
                 s_vp.c_load++;
         }
@@ -2594,10 +2616,12 @@ static int vp_method(uint32_t method, uint32_t param)
      * the runtime appends to every program reads them. */
     if (method >= NV097_SET_VIEWPORT_OFFSET && method < NV097_SET_VIEWPORT_OFFSET + 16) {
         memcpy(&s_vp.c[59][(method - NV097_SET_VIEWPORT_OFFSET) / 4], &param, 4);
+        s_vp_c_gen++;
         return 1;
     }
     if (method >= NV097_SET_VIEWPORT_SCALE && method < NV097_SET_VIEWPORT_SCALE + 16) {
         memcpy(&s_vp.c[58][(method - NV097_SET_VIEWPORT_SCALE) / 4], &param, 4);
+        s_vp_c_gen++;
         return 1;
     }
     switch (method) {
@@ -3291,6 +3315,625 @@ static void dump_batch(const char *why)
 }
 
 
+/* Whether the current frame is the one being logged: RECOMP_VP_FRAME=N,
+ * RECOMP_VP_FRAME_EVERY=N, RECOMP_VP_FRAME_AT=S (the first whole frame after S
+ * seconds), or F9 whenever someone playing wants the current scene. The
+ * keyboard and the clock are looked at once per swapped frame, not once per
+ * batch: that poll was 7% of the NV2A thread in the menus and 1.9% in a fight,
+ * spent asking whether F9 was down. */
+static int vpf_this_frame(void)
+{
+    static int want = -1, every, at;
+    static ULONGLONG start;
+    static uint32_t polled = 0xFFFFFFFFu;
+
+    if (want < 0) {
+        want  = getenv("RECOMP_VP_FRAME") ? atoi(getenv("RECOMP_VP_FRAME")) : 0;
+        every = getenv("RECOMP_VP_FRAME_EVERY") ? atoi(getenv("RECOMP_VP_FRAME_EVERY")) : 0;
+        at    = getenv("RECOMP_VP_FRAME_AT") ? atoi(getenv("RECOMP_VP_FRAME_AT")) : 0;
+        start = GetTickCount64();
+    }
+    if (polled != s_gpu.flips) {
+        polled = s_gpu.flips;
+        if (at > 0 && !want && GetTickCount64() - start >= (ULONGLONG)at * 1000)
+            want = (int)s_gpu.flips + 1;
+        if ((GetAsyncKeyState(VK_F9) & 1) && s_gpu.flips + 1 != (uint32_t)want) {
+            want = (int)s_gpu.flips + 1;
+            fprintf(stderr, "  [VPF] F9: logging frame %d\n", want);
+        }
+    }
+    return (want && s_gpu.flips == (uint32_t)want)
+        || (every > 0 && s_gpu.flips % (uint32_t)every == 0);
+}
+
+/* ── Vertex programs on the GPU (RECOMP_VP_GPU) ─────────────────────── */
+/*
+ * Measured in a fight: the interpreter above -- vp_run, vp_read, fetch_attr,
+ * vp_transform, vp_draw_triangle -- is 55% of the NV2A thread, the thread the
+ * game waits on 88% of its time, while the GPU driver does not even show in
+ * the profile. The work is per vertex, so no reduction of the resolution could
+ * touch it. The program is therefore translated to HLSL, once per program,
+ * and run as the vertex shader; the batch goes over whole.
+ *
+ * The translation is instruction for instruction with vp_run: the same three
+ * operand slots with the same meaning (ADD is A*1 + C, point 83), the same
+ * write order -- MAC to its temporary, then the ILU to R1, then the output --
+ * the same clamps on RCC, and R12 as oPos. The end of the shader is vp_transform
+ * and d3d_triangle's clip branch, through d3d_clip_pos's formula, so the
+ * pixel shader receives exactly what the CPU path would have given it.
+ *
+ * Only the batches where that is certainly true go this way. Everything else
+ * stays on the CPU path, which is the reference and does not change:
+ *   - a batch whose first vertex has z = 0, which may be a flat 2D overlay
+ *     (those change the depth rules, and they are small);
+ *   - culling on (4 writes in 156335 in this title), the logged frame, the
+ *     per-pixel probe and the batch dump -- the diagnostics read the vertices;
+ *   - a program with no end, a 16-bit surface, a range the upload refuses.
+ *
+ * This is the default since it was checked in game (point 93): every program
+ * met in the menus and in three arenas came back identical to the interpreter
+ * within 7e-7, and the same fight went from 49-51 frames a second to the 120
+ * of the display. RECOMP_VP_GPU=0 goes back to the interpreter; =2 draws on
+ * the CPU as before but also runs the first batches of every program through
+ * the shader with stream output, and prints how far the two disagree -- the
+ * way to check a program the title has not shown yet.
+ */
+static int vp_gpu_mode(void)
+{
+    static int m = -1;
+    if (m < 0) {
+        const char *e = getenv("RECOMP_VP_GPU");
+        m = e ? atoi(e) : 1;
+        if (m < 0 || m > 2)
+            m = 0;
+    }
+    return m;
+}
+
+static const char s_vp_hlsl_head[] =
+"cbuffer VpC : register(b1) { float4 c[192]; };\n"
+"cbuffer VpA : register(b2) { uint4 attr[16]; float4 absent[16]; float4 xf0; float4 xf1; };\n"
+"ByteAddressBuffer vd : register(t1);\n"
+"struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; float4 col : COLOR0;\n"
+"               float clip : SV_ClipDistance0; };\n"
+"static const float4 Z4 = float4(0.0, 0.0, 0.0, 0.0);\n"
+/* A dword at any byte address: the title's bytes and shorts need not be
+ * aligned, and a raw buffer only loads aligned dwords. */
+"uint rd32(uint a) {\n"
+"  uint o = a & 3u; uint w0 = vd.Load(a - o);\n"
+"  if (o == 0u) return w0;\n"
+"  return (w0 >> (o * 8u)) | (vd.Load(a - o + 4u) << (32u - o * 8u));\n"
+"}\n"
+"float s16(uint a) { return (float)(asint(rd32(a) << 16) >> 16); }\n"
+"float n16(uint a) { float v = s16(a); return v < -32767.0 ? -1.0 : v / 32767.0; }\n"
+/* fetch_attr, format for format. */
+"float4 vfetch(uint k, uint i) {\n"
+"  uint4 d = attr[k];\n"
+"  if (d.w == 0u) return absent[k];\n"
+"  uint a = d.x + i * d.y;\n"
+"  float4 o = float4(0.0, 0.0, 0.0, 1.0);\n"
+"  if (d.z == 0u) {\n"
+"    uint v = rd32(a);\n"
+"    o = float4((v >> 16) & 255u, (v >> 8) & 255u, v & 255u, v >> 24) / 255.0;\n"
+"  } else if (d.z == 2u) {\n"
+"    o.x = asfloat(rd32(a));\n"
+"    if (d.w > 1u) o.y = asfloat(rd32(a + 4u));\n"
+"    if (d.w > 2u) o.z = asfloat(rd32(a + 8u));\n"
+"    if (d.w > 3u) o.w = asfloat(rd32(a + 12u));\n"
+"  } else if (d.z == 4u) {\n"
+"    uint v = rd32(a);\n"
+"    o.x = (v & 255u) / 255.0;\n"
+"    if (d.w > 1u) o.y = ((v >> 8) & 255u) / 255.0;\n"
+"    if (d.w > 2u) o.z = ((v >> 16) & 255u) / 255.0;\n"
+"    if (d.w > 3u) o.w = (v >> 24) / 255.0;\n"
+"  } else if (d.z == 1u) {\n"
+"    o.x = n16(a);\n"
+"    if (d.w > 1u) o.y = n16(a + 2u);\n"
+"    if (d.w > 2u) o.z = n16(a + 4u);\n"
+"    if (d.w > 3u) o.w = n16(a + 6u);\n"
+"  } else if (d.z == 5u) {\n"
+"    o.x = s16(a);\n"
+"    if (d.w > 1u) o.y = s16(a + 2u);\n"
+"    if (d.w > 2u) o.z = s16(a + 4u);\n"
+"    if (d.w > 3u) o.w = s16(a + 6u);\n"
+"  } else if (d.z == 6u) {\n"
+"    uint v = rd32(a);\n"
+"    o.x = (float)(asint(v << 21) >> 21) / 1023.0;\n"
+"    o.y = (float)(asint(v << 10) >> 21) / 1023.0;\n"
+"    o.z = (float)(asint(v) >> 22) / 511.0;\n"
+"  }\n"
+"  return o;\n"
+"}\n"
+"float4 cr(int i) { return (i >= 0 && i < 192) ? c[clamp(i, 0, 191)] : Z4; }\n"
+/* The ILU, scalar on C.x, with vp_run's clamps and its answers at zero. */
+"float rcp_(float x) { return x != 0.0 ? 1.0 / x : 3.4e38; }\n"
+"float rcc_(float x) {\n"
+"  float d = x != 0.0 ? 1.0 / x : 1.84467e19;\n"
+"  if (d > 0.0) d = d < 5.42101e-20 ? 5.42101e-20 : (d > 1.84467e19 ? 1.84467e19 : d);\n"
+"  else d = d > -5.42101e-20 ? -5.42101e-20 : (d < -1.84467e19 ? -1.84467e19 : d);\n"
+"  return d;\n"
+"}\n"
+"float rsq_(float x) { float d = abs(x); return d != 0.0 ? 1.0 / sqrt(d) : 3.4e38; }\n"
+"float log_(float x) { float d = abs(x); return d != 0.0 ? log2(d) : -3.4e38; }\n"
+"float4 lit_(float4 v) {\n"
+"  float nl = v.x > 0.0 ? v.x : 0.0;\n"
+"  float ex = clamp(v.w, -127.9961, 127.9961);\n"
+"  float b = v.y > 0.0 ? v.y : 0.0;\n"
+"  float p = b > 0.0 ? exp2(ex * log2(b)) : (ex > 0.0 ? 0.0 : (ex == 0.0 ? 1.0 : asfloat(0x7F800000u)));\n"
+"  return float4(1.0, nl, v.x > 0.0 ? p : 0.0, 1.0);\n"
+"}\n";
+
+typedef struct { char *p; size_t n, cap; int over; } VpHlsl;
+
+static void vh(VpHlsl *b, const char *fmt, ...)
+{
+    va_list ap;
+    int k;
+    if (b->over)
+        return;
+    va_start(ap, fmt);
+    k = vsnprintf(b->p + b->n, b->cap - b->n, fmt, ap);
+    va_end(ap);
+    if (k < 0 || (size_t)k >= b->cap - b->n)
+        b->over = 1;
+    else
+        b->n += (size_t)k;
+}
+
+static const char *vh_mask(uint32_t m, char buf[5])
+{
+    int i = 0;
+    if (m & 8) buf[i++] = 'x';
+    if (m & 4) buf[i++] = 'y';
+    if (m & 2) buf[i++] = 'z';
+    if (m & 1) buf[i++] = 'w';
+    buf[i] = 0;
+    return buf;
+}
+
+static void vh_temp(char *out, size_t cap, uint32_t i)
+{
+    if (i == 12)
+        snprintf(out, cap, "O%u", VP_OUT_POS);          /* R12 is oPos */
+    else
+        snprintf(out, cap, "R%u", i < 12 ? i : 0u);     /* as vp_temp */
+}
+
+static void vh_src(char *out, size_t cap, const VpInsn *d, uint32_t k)
+{
+    static const char xyzw[] = "xyzw";
+    char base[40];
+
+    switch (d->mux[k]) {
+    case 1: vh_temp(base, sizeof base, d->reg[k]); break;
+    case 2: snprintf(base, sizeof base, "V%u", d->input); break;
+    case 3:
+        if (d->rel)
+            snprintf(base, sizeof base, "cr(%d + a0)", (int)d->cidx);
+        else if (d->cidx < VP_CONSTANTS)
+            snprintf(base, sizeof base, "c[%u]", d->cidx);
+        else
+            snprintf(base, sizeof base, "Z4");
+        break;
+    default: snprintf(base, sizeof base, "Z4"); break;
+    }
+    if (d->swz[k] != 0x1B)
+        snprintf(out, cap, "%s(%s).%c%c%c%c", d->neg[k] ? "-" : "", base,
+                 xyzw[(d->swz[k] >> 6) & 3], xyzw[(d->swz[k] >> 4) & 3],
+                 xyzw[(d->swz[k] >> 2) & 3], xyzw[d->swz[k] & 3]);
+    else
+        snprintf(out, cap, "%s(%s)", d->neg[k] ? "-" : "", base);
+}
+
+static const char *vh_mac(uint32_t mac)
+{
+    switch (mac) {
+    case 1:  return "A";                                    /* MOV */
+    case 2:  return "A * B";                                /* MUL */
+    case 3:  return "A + C";                                /* ADD: A*1 + C */
+    case 4:  return "A * B + C";                            /* MAD */
+    case 5:  return "dot(A.xyz, B.xyz).xxxx";               /* DP3 */
+    case 6:  return "(dot(A.xyz, B.xyz) + B.w).xxxx";       /* DPH */
+    case 7:  return "dot(A, B).xxxx";                       /* DP4 */
+    case 8:  return "float4(1.0, A.y * B.y, A.z, B.w)";     /* DST */
+    case 9:  return "(A < B ? A : B)";                      /* MIN, as vp_run */
+    case 10: return "(A > B ? A : B)";                      /* MAX */
+    case 11: return "(float4)(A < B)";                      /* SLT */
+    case 12: return "(float4)(A >= B)";                     /* SGE */
+    default: return "Z4";                                   /* vp_run writes 0 */
+    }
+}
+
+static const char *vh_ilu(uint32_t ilu)
+{
+    switch (ilu) {
+    case 1:  return "C";                                    /* MOV */
+    case 2:  return "rcp_(C.x).xxxx";
+    case 3:  return "rcc_(C.x).xxxx";
+    case 4:  return "rsq_(C.x).xxxx";
+    case 5:  return "exp2(C.x).xxxx";
+    case 6:  return "log_(C.x).xxxx";
+    case 7:  return "lit_(C)";
+    default: return "Z4";
+    }
+}
+
+/* The current program as HLSL. 0 if it does not fit. */
+static int vp_hlsl(VpHlsl *b)
+{
+    uint32_t pc, a, k;
+    char mask[5], dst[16];
+
+    vh(b, "%s", s_vp_hlsl_head);
+    vh(b, "VSOut vp_main(uint vid : SV_VertexID) {\n");
+    for (a = 0; a < 12; a++)
+        vh(b, "  float4 R%u = Z4;\n", a);
+    for (a = 0; a < 16; a++)
+        vh(b, "  float4 O%u = Z4;\n", a);
+    vh(b, "  O%u.w = 1.0;\n  int a0 = 0;\n", VP_OUT_D0);
+    for (a = 0; a < NV_VERTEX_ATTRS; a++)
+        if ((s_vp_inputs >> a) & 1)
+            vh(b, "  float4 V%u = vfetch(%uu, vid);\n", a, a);
+
+    for (pc = 0; pc < s_vp_code_len; pc++) {
+        const VpInsn *d = &s_vp_code[pc];
+        vh(b, "  { /* i%u mac %u ilu %u */\n    float4 M = Z4, L = Z4;\n", pc, d->mac, d->ilu);
+        for (k = 0; k < 3; k++)
+            if (d->need & (1u << k)) {
+                char src[64];
+                vh_src(src, sizeof src, d, k);
+                vh(b, "    float4 %c = %s;\n", "ABC"[k], src);
+            }
+        if (d->mac == 13)
+            vh(b, "    a0 = (int)floor(A.x + 0.001);\n");
+        else if (d->mac)
+            vh(b, "    M = %s;\n", vh_mac(d->mac));
+        if (d->ilu)
+            vh(b, "    L = %s;\n", vh_ilu(d->ilu));
+        if (d->mac && d->mac != 13 && d->mac_mask) {
+            vh_temp(dst, sizeof dst, d->tmp);
+            vh_mask(d->mac_mask, mask);
+            vh(b, "    %s.%s = M.%s;\n", dst, mask, mask);
+        }
+        if (d->ilu && d->ilu_mask) {
+            vh_mask(d->ilu_mask, mask);
+            vh(b, "    R1.%s = L.%s;\n", mask, mask);
+        }
+        if (d->orb < 16 && d->out_mask) {
+            vh_mask(d->out_mask, mask);
+            vh(b, "    O%u.%s = %s.%s;\n", d->orb, mask, d->from_ilu ? "L" : "M", mask);
+        }
+        vh(b, "  }\n");
+    }
+
+    /* vp_transform's rcc and clip, then d3d_clip_pos. */
+    vh(b, "  float w = O%u.w;\n", VP_OUT_POS);
+    vh(b, "  float rc = rcc_(w);\n");
+    vh(b, "  float3 X = (O%u.xyz - c[59].xyz) / rc;\n", VP_OUT_POS);
+    vh(b, "  VSOut o;\n");
+    vh(b, "  o.pos.x = X.x * xf0.x + (c[59].x * xf0.x - 1.0) * w;\n");
+    vh(b, "  o.pos.y = -X.y * xf0.y + (1.0 - c[59].y * xf0.y) * w;\n");
+    vh(b, "  o.pos.z = (X.z + c[59].z * w) / 16777215.0;\n");
+    vh(b, "  o.pos.w = w;\n");
+    vh(b, "  o.uv = xf1.x > 0.5 ? O%u.xy * xf0.zw : float2(0.0, 0.0);\n", VP_OUT_T0);
+    vh(b, "  o.col = floor(saturate(O%u) * 255.0 + 0.5) / 255.0;\n", VP_OUT_D0);
+    vh(b, "  o.clip = o.pos.z;\n  return o;\n}\n");
+    return !b->over;
+}
+
+/* The program's identity: the words it runs, from its start to its last. */
+static uint64_t vp_program_hash(void)
+{
+    uint64_t h = 1469598103934665603ull;
+    uint32_t pc, k;
+    for (pc = s_vp.start; pc < VP_MAX_INSNS; pc++) {
+        for (k = 1; k < 4; k++)
+            h = (h ^ s_vp.prog[pc][k]) * 0x100000001B3ull;
+        if (s_vp.prog[pc][3] & 1)
+            break;
+    }
+    return h;
+}
+
+static uint8_t *s_vpg_data;
+static uint32_t s_vpg_data_cap;
+static uint32_t s_vpg_index[NV_MAX_INDICES * 2 * 3];
+static uint32_t s_vpg_batches, s_vpg_tris;
+static uint32_t s_vpg_cpu_flat, s_vpg_cpu_diag, s_vpg_cpu_nolast, s_vpg_cpu_compile,
+                s_vpg_cpu_gather, s_vpg_cpu_small, s_vpg_eligible, s_vpg_eligible_tris;
+
+static uint32_t vp_elem_bytes(const VertexAttr *a)
+{
+    const uint32_t n = a->size < 4 ? a->size : 4;
+    switch (a->type) {
+    case 0: case 6: return 4;
+    case 2:         return 4 * n;
+    case 4:         return n;
+    case 1: case 5: return 2 * n;
+    default:        return 0;
+    }
+}
+
+static int vp_guest_range_ok(uint64_t lo, uint64_t hi)
+{
+    if (lo >= hi)
+        return 0;
+    if (lo >= 0x00010000u && hi <= 0x04000000u)
+        return 1;
+    if (lo >= XBOX_CONTIG_BASE && hi <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        return 1;
+    return 0;
+}
+
+/* The attributes the program reads, copied as they are, each from its lowest
+ * to its highest index in the batch. 0 if one cannot be taken safely. */
+static int vp_gather(NvD3DProgramDraw *d, uint32_t lo, uint32_t hi)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t a, pos = 0;
+
+    for (a = 0; a < NV_VERTEX_ATTRS; a++) {
+        const VertexAttr *va = &s_gpu.attr[a];
+        NvD3DAttr *o = &d->attr[a];
+        uint32_t eb;
+        uint64_t first, last, span;
+        const uint8_t *src;
+
+        memset(o, 0, sizeof *o);
+        d->absent[a][0] = d->absent[a][1] = d->absent[a][2] = 0.0f;
+        d->absent[a][3] = 1.0f;
+        if (!((s_vp_inputs >> a) & 1))
+            continue;
+        eb = vp_elem_bytes(va);
+        if (!va->size || !va->stride || !eb || (!s_gpu.inline_active && !va->offset)) {
+            imm_attr_value(a, d->absent[a]);      /* else (0,0,0,1), as fetch_attr */
+            continue;
+        }
+        first = (uint64_t)va->offset + (uint64_t)lo * va->stride;
+        last  = (uint64_t)va->offset + (uint64_t)hi * va->stride + eb;
+        span  = last - first;
+        if (span > (8u << 20))
+            return 0;
+        if (s_gpu.inline_active) {
+            if (last > (uint64_t)s_gpu.inline_count * 4)
+                return 0;
+            src = (const uint8_t *)s_gpu.inline_buf + first;
+        } else {
+            if (!vp_guest_range_ok(first, last))
+                return 0;
+            src = mem + first;
+        }
+        if (pos + span + 8 > s_vpg_data_cap) {
+            uint32_t cap = (uint32_t)(pos + span + 8) * 2;
+            uint8_t *nb = (uint8_t *)realloc(s_vpg_data, cap < (1u << 20) ? (1u << 20) : cap);
+            if (!nb)
+                return 0;
+            s_vpg_data = nb;
+            s_vpg_data_cap = cap < (1u << 20) ? (1u << 20) : cap;
+        }
+        memcpy(s_vpg_data + pos, src, (size_t)span);
+        memset(s_vpg_data + pos + span, 0, 8);   /* the shader's dword reads run past */
+        o->base = pos - lo * va->stride;          /* modular, as the shader's */
+        o->stride = va->stride;
+        o->type = va->type;
+        o->size = va->size < 4 ? va->size : 4;
+        pos = (uint32_t)((pos + span + 8 + 3) & ~(uint64_t)3);
+    }
+    d->data = s_vpg_data;
+    d->data_bytes = pos ? pos : 4;
+    if (!s_vpg_data) {
+        s_vpg_data = (uint8_t *)calloc(1, 1u << 20);
+        if (!s_vpg_data)
+            return 0;
+        s_vpg_data_cap = 1u << 20;
+        d->data = s_vpg_data;
+    }
+    return 1;
+}
+
+/* RECOMP_VP_GPU=2: the batch through the shader, captured, against vp_run. */
+#define VPG_CHECK_MAX 8192
+static NvD3DVertex s_vpg_seen[VPG_CHECK_MAX];
+
+static void vp_gpu_check(const NvD3DProgramDraw *d, uint64_t hash, uint32_t tris)
+{
+    static uint64_t prog[128];
+    static int      runs[128], nprog;
+    int slot, j, bad = 0, compared = 0;
+    uint32_t n;
+    float e_ndc = 0, e_z = 0, e_w = 0, e_uv = 0, e_col = 0;
+
+    for (slot = 0; slot < nprog; slot++)
+        if (prog[slot] == hash)
+            break;
+    if (slot == nprog) {
+        if (nprog >= 128)
+            return;
+        prog[nprog] = hash;
+        runs[nprog++] = 0;
+    }
+    if (runs[slot]++ >= 3)
+        return;
+    n = nvd3d_check_program(d, s_vpg_seen, VPG_CHECK_MAX);
+    for (j = 0; j < (int)n; j++) {
+        VpVertex v;
+        float ref[4], clip[4], e, uv[2];
+        const NvD3DVertex *g = &s_vpg_seen[j];
+        int k;
+
+        vp_transform(d->index[j], &v);
+        if (!v.ok)
+            continue;
+        compared++;
+        clip[0] = v.clip[0]; clip[1] = v.clip[1]; clip[2] = v.clip[2]; clip[3] = v.w;
+        d3d_clip_pos(clip, s_vp.c[59], d->ax, d->ay, ref);
+        if (fabsf(ref[3]) > 1e-3f && fabsf(g->pos[3]) > 1e-3f) {
+            for (k = 0; k < 2; k++) {
+                e = fabsf(g->pos[k] / g->pos[3] - ref[k] / ref[3]);
+                if (e > e_ndc) e_ndc = e;
+            }
+            e = fabsf(g->pos[2] / g->pos[3] - ref[2] / ref[3]);
+            if (e > e_z) e_z = e;
+        }
+        e = fabsf(g->pos[3] - ref[3]) / (fabsf(ref[3]) > 1.0f ? fabsf(ref[3]) : 1.0f);
+        if (e > e_w) e_w = e;
+        uv[0] = d->textured ? v.uv[0] : 0.0f;
+        uv[1] = d->textured ? v.uv[1] : 0.0f;
+        for (k = 0; k < 2; k++) {
+            e = fabsf(g->uv[k] - uv[k]);
+            if (e > e_uv) e_uv = e;
+        }
+        {
+            const float col[4] = {
+                (float)((v.argb >> 16) & 0xFF), (float)((v.argb >> 8) & 0xFF),
+                (float)(v.argb & 0xFF), (float)((v.argb >> 24) & 0xFF) };
+            for (k = 0; k < 4; k++) {
+                e = fabsf(g->col[k] * 255.0f - col[k]);
+                if (e > e_col) e_col = e;
+            }
+        }
+        if (e_ndc > 1e-3f || e_uv > 0.02f || e_col > 1.5f)
+            bad++;
+    }
+    fprintf(stderr, "  [VPGPU] check %016llX run %d: %u tris, %d vertices compared,"
+                    " max ndc %.2e depth %.2e w %.2e uv %.4f col %.1f/255 -- %s\n",
+            (unsigned long long)hash, runs[slot], tris, compared,
+            e_ndc, e_z, e_w, e_uv, e_col, bad ? "OUTSIDE TOLERANCE" : "same");
+    fflush(stderr);
+}
+
+/* Where the batches went, every 600 frames, in both modes: a batch that
+ * silently stays on the CPU is exactly what would hide a gap in coverage. */
+static void vp_gpu_summary(void)
+{
+    static uint32_t last_flip;
+    if (s_gpu.flips - last_flip < 600)
+        return;
+    last_flip = s_gpu.flips;
+    fprintf(stderr, "  [VPGPU] %u batches (%u triangles) %s by translated programs;"
+                    " kept on the CPU: %u small, %u possibly flat, %u diagnostics, %u no end,"
+                    " %u not compiled, %u upload refused\n",
+            s_vpg_eligible, s_vpg_eligible_tris,
+            vp_gpu_mode() == 2 ? "could be drawn" : "drawn",
+            s_vpg_cpu_small, s_vpg_cpu_flat, s_vpg_cpu_diag, s_vpg_cpu_nolast,
+            s_vpg_cpu_compile, s_vpg_cpu_gather);
+    fflush(stderr);
+}
+
+/* Draw the current batch through its translated program. 1 if it was drawn
+ * (or, under RECOMP_VP_GPU=2, never: the CPU path then draws it as always). */
+static int vp_gpu_batch(int textured_src)
+{
+    static int diag = -1;
+    const int mode = vp_gpu_mode();
+    uint32_t n = s_gpu.idx_count, i, t, lo = 0xFFFFFFFFu, hi = 0;
+    NvD3DProgramDraw d;
+    NvD3DState st;
+    VpVertex v0;
+    uint64_t hash;
+    int vs, textured;
+    float W, H;
+
+    if (!mode || !nvd3d_active() || surface_bpp() != 4)
+        return 0;
+    vp_gpu_summary();
+    /* No batch is too small, measured: with the batch data in rings, the
+     * menus -- nothing but two-triangle quads -- run at 2118 frames a second
+     * with every batch sent through here, against 1160 on the CPU path.
+     * (The first version said the opposite, 540 against 1160; that was a
+     * whole megabyte renamed per batch, not the GPU.) RECOMP_VP_GPU_MIN=
+     * <indices> keeps smaller batches on the CPU, for experiments. */
+    {
+        static int min_n = -1;
+        if (min_n < 0) {
+            const char *e = getenv("RECOMP_VP_GPU_MIN");
+            min_n = e ? atoi(e) : 3;
+            if (min_n < 3) min_n = 3;
+        }
+        if (mode == 1 && n < (uint32_t)min_n) {
+            s_vpg_cpu_small++;
+            return 0;
+        }
+    }
+    if (diag < 0)
+        diag = getenv("RECOMP_TRI_AT") || getenv("RECOMP_BATCH_DUMP") || env_on(ENV_VP_TRACE);
+    if (diag || s_gpu.cull_enable || vpf_this_frame() || tex_skipped(s_gpu.tex.offset)) {
+        s_vpg_cpu_diag++;
+        return 0;
+    }
+    if (s_vp_code_gen != s_vp_gen)
+        vp_decode();
+    if (!s_vp_code_len || !s_vp_code[s_vp_code_len - 1].last) {
+        s_vpg_cpu_nolast++;
+        return 0;
+    }
+    vp_transform(s_gpu.idx[0], &v0);
+    if (!v0.ok || v0.z == 0.0f) {
+        s_vpg_cpu_flat++;
+        return 0;
+    }
+
+    hash = vp_program_hash();
+    vs = nvd3d_vs_program(hash, NULL, 0);
+    if (vs == -2) {
+        static char text[96 * 1024];
+        VpHlsl b;
+        b.p = text; b.n = 0; b.cap = sizeof text; b.over = 0;
+        if (!vp_hlsl(&b)) {
+            s_vpg_cpu_compile++;
+            return 0;
+        }
+        vs = nvd3d_vs_program(hash, text, b.n);
+    }
+    if (vs < 0) {
+        s_vpg_cpu_compile++;
+        return 0;
+    }
+
+    for (i = 0; i < n; i++) {
+        if (s_gpu.idx[i] < lo) lo = s_gpu.idx[i];
+        if (s_gpu.idx[i] > hi) hi = s_gpu.idx[i];
+    }
+    memset(&d, 0, sizeof d);
+    if (!vp_gather(&d, lo, hi) || !d3d_bind_target()) {
+        s_vpg_cpu_gather++;
+        return 0;
+    }
+    t = batch_triangles(s_gpu.prim, n, s_vp_tris, NV_MAX_INDICES * 2);
+    for (i = 0; i < t; i++) {
+        s_vpg_index[3 * i]     = s_gpu.idx[s_vp_tris[i][0]];
+        s_vpg_index[3 * i + 1] = s_gpu.idx[s_vp_tris[i][1]];
+        s_vpg_index[3 * i + 2] = s_gpu.idx[s_vp_tris[i][2]];
+    }
+    W = (float)(s_gpu.pitch / 4);
+    H = (float)s_d3d_rt_h;
+    textured = textured_src && s_gpu.tex.valid && tex_stage0_enabled();
+    d.vs = vs;
+    d.consts = (const float (*)[4])s_vp.c;
+    d.consts_gen = s_vp_c_gen;
+    d.index = s_vpg_index;
+    d.nindex = 3 * t;
+    d.ax = (float)surface_aa_x() * 2.0f / W;
+    d.ay = (float)surface_aa_y() * 2.0f / H;
+    d.uv_scale[0] = tex_size_from_format(s_gpu.tex.color) ? (float)s_gpu.tex.width : 1.0f;
+    d.uv_scale[1] = tex_size_from_format(s_gpu.tex.color) ? (float)s_gpu.tex.height : 1.0f;
+    d.textured = textured;
+    d3d_batch_state(&st, 1, textured);
+    s_vpg_eligible++;
+    s_vpg_eligible_tris += t;
+
+    if (mode == 2) {
+        vp_gpu_check(&d, hash, t);
+        return 0;
+    }
+    nvd3d_draw_program(&d, &st);
+    s_gpu.tris_drawn += t;
+    s_gpu.drawn_offset = s_gpu.color_offset;
+    s_vpg_batches++;
+    s_vpg_tris += t;
+    return 1;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count, t;
@@ -3315,6 +3958,10 @@ static void raster_batch_program(void)
         if (s_gpu.color_mask)
             s_gpu.batches_stage_off_colour++;
     }
+
+    /* The whole batch on the GPU, when that is certainly the same thing. */
+    if (vp_gpu_batch(textured))
+        return;
 
     /* A mesh names each vertex several times; run the program once per
      * index. The stamp says whether an index was seen in this batch. */
@@ -3341,30 +3988,7 @@ static void raster_batch_program(void)
     /* RECOMP_VP_FRAME=N: every batch of the N-th swapped frame, with where it
      * lands and what it samples. */
     {
-        static int want = -1;
-        if (want < 0)
-            want = getenv("RECOMP_VP_FRAME") ? atoi(getenv("RECOMP_VP_FRAME")) : 0;
-        static int every = -1;
-        if (every < 0)
-            every = getenv("RECOMP_VP_FRAME_EVERY") ? atoi(getenv("RECOMP_VP_FRAME_EVERY")) : 0;
-        /* RECOMP_VP_FRAME_AT=S: the first whole frame after S seconds. */
-        {
-            static ULONGLONG start;
-            static int at = -1;
-            if (at < 0) {
-                at = getenv("RECOMP_VP_FRAME_AT") ? atoi(getenv("RECOMP_VP_FRAME_AT")) : 0;
-                start = GetTickCount64();
-            }
-            if (at > 0 && !want && GetTickCount64() - start >= (ULONGLONG)at * 1000)
-                want = (int)s_gpu.flips + 1;
-            /* F9, whenever someone playing wants the current scene logged. */
-            if ((GetAsyncKeyState(VK_F9) & 1) && s_gpu.flips + 1 != (uint32_t)want) {
-                want = (int)s_gpu.flips + 1;
-                fprintf(stderr, "  [VPF] F9: logging frame %d\n", want);
-            }
-        }
-        if ((want && s_gpu.flips == (uint32_t)want)
-                || (every > 0 && s_gpu.flips % (uint32_t)every == 0)) {
+        if (vpf_this_frame()) {
             float lx = 1e30f, hx = -1e30f, ly = 1e30f, hy = -1e30f;
             /* Which part of the texture the batch samples, not just where it
              * lands. A quad showing the wrong picture is either reading the
@@ -4222,6 +4846,29 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
         s_gpu.batch_in_frame = 0;
+        /* RECOMP_FPS_LOG=1: frames a second, every five seconds, without a
+         * window. The title bar is the only other place this is shown, and
+         * comparing two ways of drawing is best done headless, where
+         * nothing but the drawing differs between the runs. */
+        {
+            static int on = -1;
+            static ULONGLONG t0;
+            static uint32_t f0;
+            if (on < 0) {
+                on = getenv("RECOMP_FPS_LOG") != NULL;
+                t0 = GetTickCount64();
+                f0 = s_gpu.flips;
+            }
+            if (on) {
+                ULONGLONG now = GetTickCount64();
+                if (now - t0 >= 5000) {
+                    fprintf(stderr, "  [FPS] %.1f frames/s" "\n",
+                            (double)(s_gpu.flips - f0) * 1000.0 / (double)(now - t0));
+                    t0 = now;
+                    f0 = s_gpu.flips;
+                }
+            }
+        }
         return;
 
     case NV097_FLIP_STALL:
