@@ -541,6 +541,14 @@ const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
+/*
+ * Le calque mods : TRUE si <game_dir>\mods\<disc_relative> est un fichier.
+ * Tout chemin du disque qui y a un équivalent est ouvert depuis mods ; cette
+ * question sert au code d'un titre qui veut rediriger une lecture que le titre
+ * ne ferait pas lui-même par un chemin (une entrée d'archive, par exemple).
+ */
+BOOL xbox_ModsHas(const char* disc_relative);
+
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
  * ============================================================================ */

@@ -14,6 +14,7 @@
 
 #include "kernel.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -89,6 +90,31 @@ static const path_rule s_rules[] = {
     { "\\??\\T:\\",                           1, "\\TitleData","/TitleData"  },
 };
 #define PATH_RULE_COUNT ((int)(sizeof(s_rules) / sizeof(s_rules[0])))
+
+/*
+ * Le dossier mods : un calque posé sur le disque du titre.
+ *
+ * Tout ce que le titre lit sur son disque (\Device\CdRom0\, D:\) est d'abord
+ * cherché dans <game_dir>\mods, au même chemin relatif : un fichier qui s'y
+ * trouve est ouvert à la place de l'original, sans que l'original soit touché,
+ * et son absence ne change rien. Seuls les fichiers comptent -- un dossier de
+ * mods ne masque pas le dossier du disque.
+ *
+ * Pourquoi au niveau du chemin : c'est le seul endroit par où passent toutes les
+ * lectures, quelle que soit la bibliothèque du titre qui les demande. Un titre
+ * qui cherche un fichier libre avant son archive (Def Jam le fait pour ses
+ * flux audio et ses chemins nus) devient moddable sans une ligne de plus ; pour
+ * les entrées qu'il ne cherche que dans l'archive, le projet réécrit la demande
+ * et s'appuie sur xbox_ModsHas() pour savoir quand.
+ *
+ * Actif si le dossier existe au lancement ; RECOMP_MODS=0 le coupe.
+ */
+static int is_disc_rule(const path_rule *r)
+{
+    return strstr(r->prefix, "CdRom0") != NULL
+        || match_prefix(r->prefix, "D:\\")
+        || match_prefix(r->prefix, "\\??\\D:\\");
+}
 
 /*
  * Rewrite a path through a drive letter the title mapped for itself.
@@ -170,7 +196,30 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
 
 static WCHAR s_game_dir[MAX_PATH];
 static WCHAR s_save_dir[MAX_PATH];
+static WCHAR s_mods_dir[MAX_PATH];      /* vide : pas de calque */
 static BOOL  s_initialized = FALSE;
+
+/* <mods>\<rel> s'il existe et que c'est un fichier ; rel en séparateurs Win32. */
+static BOOL mods_file(const WCHAR *rel, WCHAR *out, DWORD n)
+{
+    DWORD a;
+    if (!s_mods_dir[0] || !rel || !*rel)
+        return FALSE;
+    swprintf_s(out, n, L"%s\\%s", s_mods_dir, rel);
+    a = GetFileAttributesW(out);
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+BOOL xbox_ModsHas(const char *disc_relative)
+{
+    WCHAR rel[MAX_PATH], host[MAX_PATH];
+    if (!s_initialized)
+        xbox_path_init(NULL, NULL);
+    MultiByteToWideChar(CP_ACP, 0, disc_relative, -1, rel, MAX_PATH);
+    for (WCHAR *p = rel; *p; p++)
+        if (*p == L'/') *p = L'\\';
+    return mods_file(rel, host, MAX_PATH);
+}
 
 /*
  * The raw disk device, \Device\Harddisk0\Partition0.
@@ -356,6 +405,18 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         }
     }
 
+    {
+        const char *m = getenv("RECOMP_MODS");
+        DWORD a;
+        swprintf_s(s_mods_dir, MAX_PATH, L"%s\\mods", s_game_dir);
+        a = GetFileAttributesW(s_mods_dir);
+        if ((m && *m == '0') || a == INVALID_FILE_ATTRIBUTES
+            || !(a & FILE_ATTRIBUTE_DIRECTORY))
+            s_mods_dir[0] = L'\0';
+        else
+            fprintf(stderr, "  [MODS] calque actif : %S\n", s_mods_dir);
+    }
+
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S", s_game_dir, s_save_dir);
 }
@@ -387,6 +448,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     const WCHAR* base_dir  = NULL;
     const char*  sub_dir   = NULL;
     int          skip;
+    int          disc      = 0;
 
     if (!xbox_path || !host_path_buf || buf_size == 0)
         return FALSE;
@@ -412,6 +474,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
             sub_dir   = s_rules[i].sub_win;
+            disc      = is_disc_rule(&s_rules[i]);
             goto translate;
         }
     }
@@ -456,6 +519,15 @@ translate:
                 host_path_buf[--n] = L'\0';
         }
 
+        if (disc && !sub_dir) {
+            WCHAR modded[MAX_PATH];
+            if (mods_file(remainder_wide, modded, MAX_PATH)) {
+                wcscpy_s(host_path_buf, buf_size, modded);
+                fprintf(stderr, "  [MODS] %s -> %S\n", xbox_path, modded);
+                fflush(stderr);
+            }
+        }
+
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %S", xbox_path, host_path_buf);
         xbox_remember_host_path(host_path_buf);
         return TRUE;
@@ -474,7 +546,29 @@ translate:
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
+static char s_mods_dir[MAX_PATH];       /* vide : pas de calque */
 static BOOL s_initialized = FALSE;
+
+/* <mods>/<rel> s'il existe et que c'est un fichier ; rel en séparateurs POSIX. */
+static BOOL mods_file(const char *rel, char *out, size_t n)
+{
+    struct stat st;
+    if (!s_mods_dir[0] || !rel || !*rel)
+        return FALSE;
+    snprintf(out, n, "%s/%s", s_mods_dir, rel);
+    return stat(out, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+BOOL xbox_ModsHas(const char *disc_relative)
+{
+    char rel[MAX_PATH], host[MAX_PATH];
+    if (!s_initialized)
+        xbox_path_init(NULL, NULL);
+    snprintf(rel, sizeof(rel), "%s", disc_relative);
+    for (char *p = rel; *p; p++)
+        if (*p == '\\') *p = '/';
+    return mods_file(rel, host, sizeof(host));
+}
 
 /* Strip a single trailing '/' (but never the root '/'). */
 static void strip_trailing_slash(char* s)
@@ -534,6 +628,16 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     strip_trailing_slash(s_game_dir);
     strip_trailing_slash(s_save_dir);
 
+    {
+        const char *m = getenv("RECOMP_MODS");
+        struct stat st;
+        snprintf(s_mods_dir, sizeof(s_mods_dir), "%s/mods", s_game_dir);
+        if ((m && *m == '0') || stat(s_mods_dir, &st) != 0 || !S_ISDIR(st.st_mode))
+            s_mods_dir[0] = '\0';
+        else
+            fprintf(stderr, "  [MODS] calque actif : %s\n", s_mods_dir);
+    }
+
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s",
              s_game_dir, s_save_dir);
@@ -545,6 +649,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     const char* base_dir  = NULL;
     const char* sub_dir   = NULL;
     int         skip;
+    int         disc      = 0;
 
     if (!xbox_path || !host_path_buf || buf_size == 0)
         return FALSE;
@@ -564,6 +669,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
             sub_dir   = s_rules[i].sub_posix;
+            disc      = is_disc_rule(&s_rules[i]);
             goto translate;
         }
     }
@@ -600,6 +706,15 @@ translate:
             size_t n = strlen(host_path_buf);
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
+        }
+
+        if (disc && !sub_dir) {
+            char modded[MAX_PATH];
+            if (mods_file(remainder_posix, modded, sizeof(modded))) {
+                snprintf(host_path_buf, buf_size, "%s", modded);
+                fprintf(stderr, "  [MODS] %s -> %s\n", xbox_path, modded);
+                fflush(stderr);
+            }
         }
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
