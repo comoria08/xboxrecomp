@@ -3228,8 +3228,14 @@ static void dump_batch(const char *why)
     FILE *f;
     uint32_t i, a, lo = 0xFFFFFFFFu, hi = 0;
 
-    if (!prefix || seq >= 32 || !s_gpu.idx_count)
+    if (!prefix || !s_gpu.idx_count)
         return;
+    {   /* La foule a elle aussi cinq flux et se dessine avant les combattants :
+         * trente-deux fichiers ne suffisent pas a les atteindre. */
+        const char *max = getenv("RECOMP_BATCH_DUMP_MAX");
+        if (seq >= (max ? atoi(max) : 32))
+            return;
+    }
     snprintf(path, sizeof path, "%s_b%03u_%02d.txt", prefix,
              s_gpu.batch_in_frame, seq);
     f = fopen(path, "w");
