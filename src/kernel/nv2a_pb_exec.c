@@ -4187,6 +4187,17 @@ static void raster_batch_program(void)
     }
     if (s_batch_hit_probe)
         dump_batch("covers a probe point");
+    else if (getenv("RECOMP_BATCH_DUMP_SKIN")) {
+        /* Les combattants sont les seuls lots a cinq flux (position, UV,
+         * couleur, normale, indice de palette d'os) : c'est le critere le plus
+         * sur pour attraper leurs matrices sans viser un point de l'ecran. */
+        uint32_t a2, flux = 0;
+        for (a2 = 0; a2 < NV_VERTEX_ATTRS; a2++)
+            if (s_gpu.attr[a2].size && s_gpu.attr[a2].stride)
+                flux++;
+        if (flux >= 5)
+            dump_batch("lot de combattant (cinq flux)");
+    }
 }
 
 static void raster_batch(void)
