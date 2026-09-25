@@ -78,6 +78,13 @@
  * with STATUS_BREAKPOINT the first time a title tried to print. */
 void recomp_debug_service(uint32_t service, uint32_t arg_va);
 
+/* Called by every stub in <prefix>_stubs_unresolved.c: a call target the
+ * disassembler never detected as a function, so its body does nothing but
+ * return. Reports each address the first time the title reaches it, with the
+ * return address its caller pushed, then at 10, 100, 1000... calls -- which
+ * stubs matter is a measurement, not something the static pass can know. */
+void recomp_unresolved_hit(uint32_t va, uint32_t ret_va);
+
 /* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent.
  * The auto-generated code emits __debugbreak for x86 INT 3 instructions. */
 #if !defined(_MSC_VER) && !defined(__debugbreak)

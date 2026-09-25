@@ -18,6 +18,16 @@
 
 #include "xbox_memory_layout.h"
 
+#if defined(_WIN32)
+#include <windows.h>
+#define TRACE_CAS32(p, want, cmp) \
+    ((uint32_t)InterlockedCompareExchange((volatile LONG *)(p), (LONG)(want), (LONG)(cmp)))
+#define TRACE_INC32(p) ((uint32_t)InterlockedIncrement((volatile LONG *)(p)))
+#else
+#define TRACE_CAS32(p, want, cmp) __sync_val_compare_and_swap((p), (cmp), (want))
+#define TRACE_INC32(p) __sync_add_and_fetch((p), 1u)
+#endif
+
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
 
@@ -268,4 +278,49 @@ void recomp_debug_service(uint32_t service, uint32_t arg_va)
     if (length && ((const char *)(mem + buffer_va))[length - 1] != '\n')
         fputc('\n', stderr);
     fflush(stderr);
+}
+
+/* ---------------------------------------------------------------------------
+ * Unresolved call targets actually reached.
+ *
+ * tools.recomp stubs every call target the disassembler never detected as a
+ * function: the stub pops the return address and does nothing else. Most of
+ * them are never called; the ones that are silently skip whatever the title
+ * meant to run there. Each stub reports here, so a play session lists the
+ * stubs that matter, the call site each came from (the return address its
+ * caller pushed), and roughly how often -- at 1, 10, 100, 1000... calls.
+ *
+ * Several guest threads can land in stubs at once: the table is filled with
+ * compare-exchange and counted with interlocked increments, no lock.
+ * ------------------------------------------------------------------------- */
+
+#define UNRESOLVED_SLOTS 512u           /* a power of two, far above any title's stub count */
+
+static volatile uint32_t s_unresolved_va[UNRESOLVED_SLOTS];
+static volatile uint32_t s_unresolved_calls[UNRESOLVED_SLOTS];
+
+void recomp_unresolved_hit(uint32_t va, uint32_t ret_va)
+{
+    uint32_t i = (va * 2654435761u) >> 23, probe;
+
+    for (probe = 0; probe < UNRESOLVED_SLOTS; probe++, i = (i + 1) & (UNRESOLVED_SLOTS - 1)) {
+        uint32_t cur = s_unresolved_va[i], n, p;
+
+        if (cur == 0) {
+            cur = TRACE_CAS32(&s_unresolved_va[i], va, 0u);
+            if (cur == 0)
+                cur = va;
+        }
+        if (cur != va)
+            continue;
+
+        n = TRACE_INC32(&s_unresolved_calls[i]);
+        for (p = 1; p <= n && p <= 1000000000u; p *= 10)
+            if (p == n) {
+                fprintf(stderr, "[STUB] 0x%08X reached, call %u, from 0x%08X\n",
+                        va, n, ret_va);
+                break;
+            }
+        return;
+    }
 }

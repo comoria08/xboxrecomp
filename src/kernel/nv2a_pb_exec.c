@@ -240,6 +240,23 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_TEXTURE_FILTER          0x1B14
 #define NV097_SET_TEXTURE_IMAGE_RECT      0x1B1C
 #define NV097_SET_TEXTURE_PALETTE         0x1B20   /* offset | DMA bit 0 */
+/* The fragment pipeline beyond stage 0, captured for the frame log and the
+ * inventory (RECOMP_INVENT), not executed. Values copied from
+ * src/nv2a/nv2a_regs.h, which this file does not include. */
+#define NV097_SET_COMBINER_ALPHA_ICW      0x0260   /* +i*4, 8 stages */
+#define NV097_SET_COMBINER_SPECULAR_FOG_CW0 0x0288 /* final combiner, CW1 at +4 */
+#define NV097_SET_FOG_MODE                0x029C
+#define NV097_SET_FOG_GEN_MODE            0x02A0
+#define NV097_SET_FOG_ENABLE              0x02A4
+#define NV097_SET_COMBINER_FACTOR0        0x0A60   /* +i*4 */
+#define NV097_SET_COMBINER_FACTOR1        0x0A80
+#define NV097_SET_COMBINER_ALPHA_OCW      0x0AA0
+#define NV097_SET_COMBINER_COLOR_ICW      0x0AC0
+#define NV097_SET_COLOR_KEY_COLOR         0x0AE0   /* +i*4, 4 stages */
+#define NV097_SET_COMBINER_COLOR_OCW      0x1E40   /* +i*4, 8 stages */
+#define NV097_SET_COMBINER_CONTROL        0x1E60
+#define NV097_SET_SHADER_STAGE_PROGRAM    0x1E70
+#define NV097_SET_SHADER_OTHER_STAGE_INPUT 0x1E78
 /* The buffer flip. A title double-buffers by telling the GPU which buffer
  * the CRTC reads and which it draws into, advancing the write index and
  * then stalling until the flip has happened. Ignoring these means the
@@ -501,28 +518,39 @@ static uint32_t s_comb_ctrl, s_comb_fog0, s_comb_fog1;
 static uint32_t s_comb_color_icw[8], s_comb_color_ocw[8];
 static uint32_t s_comb_alpha_icw[8], s_comb_alpha_ocw[8];
 static uint32_t s_comb_factor0[8], s_comb_factor1[8];
+/* The rest of the fragment pipeline the title programs and this rasteriser
+ * does not run: the texture shader's per-stage modes, the colour keys, fog. */
+static uint32_t s_shader_prog, s_shader_other, s_color_key[4];
+static uint32_t s_fog_enable, s_fog_mode, s_fog_gen;
 
 static int record_combiner_reg(uint32_t method, uint32_t param)
 {
-    /* Addresses confirmed against the method inventory (RECOMP_PB_SCAN): the
-     * title sends 0x0260-0x027C, 0x0288/0x028C, 0x0A60-0x0ADC and
-     * 0x0AE0-0x0AEC, and nothing at 0x0280 or 0x1288 -- which is where a
-     * first guess had put the output words and the final combiner. */
-    if (method >= 0x0260 && method < 0x0280)
-        s_comb_alpha_icw[(method - 0x0260) / 4] = param;
-    else if (method == 0x0288) s_comb_fog0 = param;   /* final combiner */
-    else if (method == 0x028C) s_comb_fog1 = param;
-    else if (method >= 0x0A60 && method < 0x0A80)
-        s_comb_factor0[(method - 0x0A60) / 4] = param;
-    else if (method >= 0x0A80 && method < 0x0AA0)
-        s_comb_factor1[(method - 0x0A80) / 4] = param;
-    else if (method >= 0x0AA0 && method < 0x0AC0)
-        s_comb_alpha_ocw[(method - 0x0AA0) / 4] = param;
-    else if (method >= 0x0AC0 && method < 0x0AE0)
-        s_comb_color_icw[(method - 0x0AC0) / 4] = param;
-    else if (method >= 0x0AE0 && method < 0x0AF0)
-        s_comb_color_ocw[(method - 0x0AE0) / 4] = param;
-    else if (method == 0x1294) s_comb_ctrl = param;
+    /* Numbers from nv2a_regs.h. A first version filed SET_COLOR_KEY_COLOR
+     * (0x0AE0) as the colour output words and read the combiner control at
+     * 0x1294; the real ones, 0x1E40 and 0x1E60, were never captured, so the
+     * frame log's "cocw" and "ctrl" meant nothing until point 139. */
+    if (method >= NV097_SET_COMBINER_ALPHA_ICW && method < NV097_SET_COMBINER_ALPHA_ICW + 0x20)
+        s_comb_alpha_icw[(method - NV097_SET_COMBINER_ALPHA_ICW) / 4] = param;
+    else if (method == NV097_SET_COMBINER_SPECULAR_FOG_CW0) s_comb_fog0 = param;
+    else if (method == NV097_SET_COMBINER_SPECULAR_FOG_CW0 + 4) s_comb_fog1 = param;
+    else if (method >= NV097_SET_COMBINER_FACTOR0 && method < NV097_SET_COMBINER_FACTOR0 + 0x20)
+        s_comb_factor0[(method - NV097_SET_COMBINER_FACTOR0) / 4] = param;
+    else if (method >= NV097_SET_COMBINER_FACTOR1 && method < NV097_SET_COMBINER_FACTOR1 + 0x20)
+        s_comb_factor1[(method - NV097_SET_COMBINER_FACTOR1) / 4] = param;
+    else if (method >= NV097_SET_COMBINER_ALPHA_OCW && method < NV097_SET_COMBINER_ALPHA_OCW + 0x20)
+        s_comb_alpha_ocw[(method - NV097_SET_COMBINER_ALPHA_OCW) / 4] = param;
+    else if (method >= NV097_SET_COMBINER_COLOR_ICW && method < NV097_SET_COMBINER_COLOR_ICW + 0x20)
+        s_comb_color_icw[(method - NV097_SET_COMBINER_COLOR_ICW) / 4] = param;
+    else if (method >= NV097_SET_COLOR_KEY_COLOR && method < NV097_SET_COLOR_KEY_COLOR + 0x10)
+        s_color_key[(method - NV097_SET_COLOR_KEY_COLOR) / 4] = param;
+    else if (method >= NV097_SET_COMBINER_COLOR_OCW && method < NV097_SET_COMBINER_COLOR_OCW + 0x20)
+        s_comb_color_ocw[(method - NV097_SET_COMBINER_COLOR_OCW) / 4] = param;
+    else if (method == NV097_SET_COMBINER_CONTROL) s_comb_ctrl = param;
+    else if (method == NV097_SET_SHADER_STAGE_PROGRAM) s_shader_prog = param;
+    else if (method == NV097_SET_SHADER_OTHER_STAGE_INPUT) s_shader_other = param;
+    else if (method == NV097_SET_FOG_ENABLE) s_fog_enable = param;
+    else if (method == NV097_SET_FOG_MODE) s_fog_mode = param;
+    else if (method == NV097_SET_FOG_GEN_MODE) s_fog_gen = param;
     else return 0;
     return 1;
 }
@@ -546,6 +574,118 @@ static void record_tex_reg(uint32_t method, uint32_t param)
     s_gpu.tex.valid = s_gpu.tex.offset && s_gpu.tex.width && s_gpu.tex.height
                    && (tex_size_from_format(s_gpu.tex.color)
                        || s_gpu.tex.pitch);
+}
+
+/* RECOMP_INVENT=1: what each batch asks of the fragment pipeline (point 139).
+ *
+ * This executor draws triangles and quads, samples stage 0 and multiplies it
+ * by the vertex colour. Whatever a title asks beyond that -- points and lines,
+ * stages 1 to 3, a texture shader mode, register combiners with more than one
+ * stage, colour keys, alpha kill, fog -- comes out wrong or not at all, and
+ * nothing said how often. Each distinct request is a signature: its first
+ * batch is described once ("new"), and every signature's count is printed
+ * every 7200 swaps. Measure what the title uses before implementing any of it.
+ *
+ * route: 0 indices, 1 inline array, 2 immediate vertices, 3 opened and closed
+ * with nothing in between (the begins_empty of the [GPU] report). stages: bit
+ * n set when stage n is enabled; a stage 0 never programmed counts as on, as
+ * in tex_stage0_enabled. key: CONTROL0 bits 0-2 (colour key mode, alpha kill)
+ * of each enabled stage, four bits per stage. comb: a hash of the general
+ * stages the control word says are in use, and of the final combiner. */
+typedef struct {
+    uint32_t prim, route, stages, prog, ctrl, comb, fog, key;
+    uint32_t batches, first_flip, tex, tex_w, tex_h, n;
+} InventSig;
+
+#define INVENT_MAX 256
+static InventSig s_invent[INVENT_MAX];
+static uint32_t s_invent_count, s_invent_lost, s_invent_report = 7200;
+
+static uint32_t invent_hash(uint32_t h, uint32_t v)
+{
+    int k;
+    for (k = 0; k < 4; k++, v >>= 8)
+        h = (h ^ (v & 0xFF)) * 16777619u;          /* FNV-1a */
+    return h;
+}
+
+static void invent_batch(uint32_t route, uint32_t n)
+{
+    static int on = -1;
+    InventSig s;
+    uint32_t i, st, used;
+
+    if (on < 0)
+        on = getenv("RECOMP_INVENT") != NULL;
+    if (!on)
+        return;
+
+    memset(&s, 0, sizeof s);
+    s.prim  = s_gpu.prim;
+    s.route = route;
+    for (st = 0; st < 4; st++) {
+        const uint32_t c0 = (0x1B0C + st * 0x40 - NV_TEX_FIRST) / 4;
+        int enabled = s_tex_set[c0] ? (s_tex_reg[c0] & (1u << 30)) != 0 : st == 0;
+        if (!enabled)
+            continue;
+        s.stages |= 1u << st;
+        s.key |= (s_tex_set[c0] ? s_tex_reg[c0] & 7u : 0u) << (4 * st);
+    }
+    s.prog = s_shader_prog;
+    s.ctrl = s_comb_ctrl;
+    used = s_comb_ctrl & 0xFF;
+    if (used < 1) used = 1;
+    if (used > 8) used = 8;
+    s.comb = 2166136261u;
+    for (i = 0; i < used; i++) {
+        s.comb = invent_hash(s.comb, s_comb_color_icw[i]);
+        s.comb = invent_hash(s.comb, s_comb_color_ocw[i]);
+        s.comb = invent_hash(s.comb, s_comb_alpha_icw[i]);
+        s.comb = invent_hash(s.comb, s_comb_alpha_ocw[i]);
+    }
+    s.comb = invent_hash(s.comb, s_comb_fog0);
+    s.comb = invent_hash(s.comb, s_comb_fog1);
+    s.fog = s_fog_enable ? 0x80000000u | (s_fog_mode & 0xFFFFu) << 8 | (s_fog_gen & 0xFFu) : 0;
+
+    for (i = 0; i < s_invent_count; i++) {
+        InventSig *e = &s_invent[i];
+        if (e->prim == s.prim && e->route == s.route && e->stages == s.stages
+                && e->prog == s.prog && e->ctrl == s.ctrl && e->comb == s.comb
+                && e->fog == s.fog && e->key == s.key) {
+            e->batches++;
+            break;
+        }
+    }
+    if (i == s_invent_count) {
+        if (s_invent_count < INVENT_MAX) {
+            s.batches = 1;
+            s.first_flip = s_gpu.flips;
+            s.tex = s_gpu.tex.offset;
+            s.tex_w = s_gpu.tex.width;
+            s.tex_h = s_gpu.tex.height;
+            s.n = n;
+            s_invent[s_invent_count++] = s;
+            fprintf(stderr, "  [INVENT] new #%u swap %u  prim %u route %u n %u  stages %X key %04X"
+                            "  prog %08X other %08X  ctrl %08X comb %08X  fog %08X"
+                            "  tex 0x%08X %ux%u\n",
+                    s_invent_count - 1, s.first_flip, s.prim, s.route, n, s.stages, s.key,
+                    s.prog, s_shader_other, s.ctrl, s.comb, s.fog, s.tex, s.tex_w, s.tex_h);
+        } else {
+            s_invent_lost++;
+        }
+    }
+
+    if (s_gpu.flips >= s_invent_report) {
+        static char line[INVENT_MAX * 24];
+        size_t len = 0;
+        s_invent_report = s_gpu.flips + 7200;
+        for (i = 0; i < s_invent_count && len + 24 < sizeof line; i++)
+            len += (size_t)snprintf(line + len, sizeof line - len, " #%u:%u", i,
+                                    s_invent[i].batches);
+        line[len] = 0;
+        fprintf(stderr, "  [INVENT] swap %u, %u signatures, %u batches over the table, batches per"
+                        " signature:%s\n", s_gpu.flips, s_invent_count, s_invent_lost, line);
+    }
 }
 
 /* Every distinct texture a batch was drawn with, and how many batches used it.
@@ -1173,6 +1313,47 @@ static uint32_t s_d3d_show_base;           /* surface the window shows */
  * already set up the next surface, with another pitch. */
 static uint32_t s_d3d_show_rect[4], s_d3d_show_pitch, s_d3d_show_disp[2];
 
+extern float xbox_WidescreenAspect(void);
+
+/* The surface clip in samples: x, y, width, height -- what the GPU scissor and
+ * a rectangle clear are given (point 139).
+ *
+ * SET_SURFACE_CLIP is in displayed pixels, and the render target is in
+ * samples: Def Jam draws 640x480 with 2x multisampling across, so its target
+ * is 1280 samples wide. The width was converted and the origin was not. That
+ * is invisible while the clip starts at 0, which is the whole screen; a
+ * sub-window starting at x = 319 was cut at (319 + 2*296)/2 = 455.5 pixels --
+ * the trophy shown half on the trophy card, the mugshot with no head.
+ *
+ * Under RECOMP_WIDESCREEN the cutscenes' letterbox is opened as well: the
+ * title restricts them to a full-width band centred in the displayed surface
+ * (640x360 from y = 60, a 16:9 picture inside its 4:3 one). With the picture
+ * already presented 16:9, the band only shrinks it to 2.37:1, so the clip
+ * takes the surface's full height and what the projection puts above and
+ * below the band is drawn instead of the black. The projection is not touched.
+ * RECOMP_WIDESCREEN_CINE=0 keeps the bands. */
+static void clip_in_samples(uint32_t out[4])
+{
+    static int open_cine = -1;
+    uint32_t y = s_gpu.clip_y, h = s_gpu.clip_h;
+
+    if (open_cine < 0) {
+        const char *e = getenv("RECOMP_WIDESCREEN_CINE");
+        open_cine = xbox_WidescreenAspect() > 0.0f && !(e && *e == '0');
+    }
+    if (open_cine && y > 0 && s_gpu.clip_x == 0
+            && s_gpu.clip_w == s_d3d_show_disp[0]
+            && 2 * y + h == s_d3d_show_disp[1]
+            && dma_resolve(s_gpu.color_offset) == s_d3d_show_base) {
+        h += 2 * y;
+        y = 0;
+    }
+    out[0] = s_gpu.clip_x * surface_aa_x();
+    out[1] = y * surface_aa_y();
+    out[2] = s_gpu.clip_w * surface_aa_x();
+    out[3] = h * surface_aa_y();
+}
+
 static void clear_surface(uint32_t param)
 {
     if (s_gpu.flips == s_vpf_flip)
@@ -1193,10 +1374,7 @@ static void clear_surface(uint32_t param)
         uint32_t rect[4];
         uint32_t what = ((param & 1) ? 1u : 0u) | ((param & 2) ? 2u : 0u)
                       | ((param & NV097_CLEAR_COLOR_MASK) ? 4u : 0u);
-        rect[0] = s_gpu.clip_x;
-        rect[1] = s_gpu.clip_y;
-        rect[2] = surface_sample_w();
-        rect[3] = surface_sample_h();
+        clip_in_samples(rect);
         nvd3d_clear(what, s_gpu.clear_color,
                     (float)(s_gpu.zclear >> 8) / 16777215.0f,
                     (uint8_t)(s_gpu.zclear & 0xFF), rect);
@@ -1215,8 +1393,8 @@ static void clear_surface(uint32_t param)
             s_d3d_show_base = s_gpu.color_base;
             memcpy(s_d3d_show_rect, rect, sizeof s_d3d_show_rect);
             s_d3d_show_pitch = s_gpu.pitch;
-            s_d3d_show_disp[0] = s_gpu.clip_w;
-            s_d3d_show_disp[1] = s_gpu.clip_h;
+            s_d3d_show_disp[0] = rect[2] / surface_aa_x();   /* clip_w, clip_h -- */
+            s_d3d_show_disp[1] = rect[3] / surface_aa_y();   /* or the opened band */
             xbox_FramebufferWindowSet(s_gpu.color_base, s_gpu.pitch);
             xbox_FramebufferWindowFormat(s_gpu.clip_w, s_gpu.clip_h,
                                          surface_bpp(), surface_aa_x());
@@ -1958,10 +2136,7 @@ static void d3d_batch_state(NvD3DState *st, int has_z, int textured)
         st->tex_w  = s_gpu.tex.width;
         st->tex_h  = s_gpu.tex.height;
     }
-    st->scissor[0] = s_gpu.clip_x;
-    st->scissor[1] = s_gpu.clip_y;
-    st->scissor[2] = surface_sample_w();
-    st->scissor[3] = surface_sample_h();
+    clip_in_samples(st->scissor);
 }
 
 /* a, b, c are already in surface samples. */
@@ -4794,6 +4969,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             /* Three ways a batch can have arrived, and only one is in use at
              * a time: vertices completed by SET_VERTEX4F, a payload written
              * with INLINE_ARRAY, or indices into the title's own arrays. */
+            if (s_gpu.imm_count)
+                invent_batch(2, s_gpu.imm_count);
+            else if (s_gpu.inline_count)
+                invent_batch(1, s_gpu.inline_count);
+            else
+                invent_batch(s_gpu.idx_count ? 0 : 3, s_gpu.idx_count);
             if (s_gpu.imm_count)
                 draw_immediate();
             else if (s_gpu.inline_count)

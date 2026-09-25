@@ -1687,7 +1687,9 @@ class BatchTranslator:
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
+                    f"void {unresolved[addr]}(void) {{ "
+                    f"recomp_unresolved_hit(0x{addr:08X}u, MEM32(g_esp)); "
+                    f"g_esp += {4 + popped}; "
                     f"/* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")
