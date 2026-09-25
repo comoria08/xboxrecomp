@@ -2533,8 +2533,9 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
  *             output from ILU 2, relative addressing 1, last 0
  *
  * Muxes: 1 temp, 2 input, 3 constant. Masks have x in bit 3. The MAC result
- * goes to the temp register, the ILU result to R1, and one of the two to the
- * output register. R12 is oPos.
+ * goes to the temp register, the ILU result to R1 when a MAC operation shares
+ * the instruction and to the temp register when it does not, and one of the
+ * two to the output register. R12 is oPos.
  *
  * The three operand slots are shared by both units, and the MAC unit is a
  * multiply-add, so an opcode reads the slots its A*B + C form needs: MUL and
@@ -2854,8 +2855,12 @@ static int vp_run(VpState *s)
 
         if (mac && mac != 13)
             vp_write(vp_temp(s, ins->tmp), m, ins->mac_mask);
+        /* The ILU writes R1 only when it is paired with a MAC operation; alone,
+         * it writes the instruction's own temporary. The ring ropes of Club 357
+         * end on an unpaired "rcp R11.x, R12.w" and read R11.x back: sent to R1,
+         * every vertex collapsed onto the viewport centre (point 138). */
         if (ilu)
-            vp_write(s->r[1], l, ins->ilu_mask);
+            vp_write(mac ? s->r[1] : vp_temp(s, ins->tmp), l, ins->ilu_mask);
         if (ins->orb < 16)
             vp_write(s->o[ins->orb], ins->from_ilu ? l : m, ins->out_mask);
         if (ins->last)
@@ -3363,7 +3368,7 @@ static int vpf_this_frame(void)
  *
  * The translation is instruction for instruction with vp_run: the same three
  * operand slots with the same meaning (ADD is A*1 + C, point 83), the same
- * write order -- MAC to its temporary, then the ILU to R1, then the output --
+ * write order -- MAC to its temporary, then the ILU (to R1 if paired), then the output --
  * the same clamps on RCC, and R12 as oPos. The end of the shader is vp_transform
  * and d3d_triangle's clip branch, through d3d_clip_pos's formula, so the
  * pixel shader receives exactly what the CPU path would have given it.
@@ -3602,8 +3607,13 @@ static int vp_hlsl(VpHlsl *b)
             vh(b, "    %s.%s = M.%s;\n", dst, mask, mask);
         }
         if (d->ilu && d->ilu_mask) {
+            /* R1 when paired with a MAC operation, the temporary otherwise, as vp_run. */
+            if (d->mac)
+                snprintf(dst, sizeof dst, "R1");
+            else
+                vh_temp(dst, sizeof dst, d->tmp);
             vh_mask(d->ilu_mask, mask);
-            vh(b, "    R1.%s = L.%s;\n", mask, mask);
+            vh(b, "    %s.%s = L.%s;\n", dst, mask, mask);
         }
         if (d->orb < 16 && d->out_mask) {
             vh_mask(d->out_mask, mask);
@@ -3940,6 +3950,35 @@ static int vp_gpu_batch(int textured_src)
     return 1;
 }
 
+/* RECOMP_BATCH_DUMP_IDX=<n>[,<n>...] : vider les lots qui ont exactement ce
+ * nombre d'indices. Un modele connu se reconnait a la longueur de son ruban
+ * (la corde du Club 357 : 266 indices, quatre flux, donc invisible au critere
+ * des cinq flux), sans viser un point de l'ecran. */
+static int dump_idx_wanted(uint32_t n)
+{
+    static int parsed;
+    static uint32_t want[8];
+    static int nwant;
+    int i;
+
+    if (!parsed) {
+        const char *e = getenv("RECOMP_BATCH_DUMP_IDX");
+        parsed = 1;
+        while (e && *e && nwant < 8) {
+            char *end;
+            unsigned long v = strtoul(e, &end, 10);
+            if (end == e)
+                break;
+            want[nwant++] = (uint32_t)v;
+            e = (*end == ',') ? end + 1 : end;
+        }
+    }
+    for (i = 0; i < nwant; i++)
+        if (want[i] == n)
+            return 1;
+    return 0;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count, t;
@@ -4204,6 +4243,8 @@ static void raster_batch_program(void)
         if (flux >= 5)
             dump_batch("lot de combattant (cinq flux)");
     }
+    else if (dump_idx_wanted(s_gpu.idx_count))
+        dump_batch("nombre d'indices demande");
 }
 
 static void raster_batch(void)
