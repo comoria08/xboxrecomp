@@ -437,6 +437,13 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     hdc = GetDC(hwnd);
     SetWindowTextW(hwnd, name);
     s_hwnd = hwnd;
+    /* RECOMP_FULLSCREEN=1: open the way F11 leaves it, borderless on the
+     * window's monitor -- a setting a launcher can offer. */
+    {
+        const char *fs = getenv("RECOMP_FULLSCREEN");
+        if (fs && *fs && *fs != '0')
+            fb_toggle_fullscreen(hwnd);
+    }
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
