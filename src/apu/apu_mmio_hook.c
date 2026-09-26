@@ -7,6 +7,7 @@
 
 #include "apu.h"
 #include <stdio.h>
+#include <stdlib.h>   /* getenv: implicit, it returned a truncated int on x64 */
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -71,6 +72,61 @@ static int decode_modrm_len(const uint8_t *ip, int has_rex_b)
     else if (mod == 1) len += 1;
     else if (mod == 2) len += 4;
     return len;
+}
+
+/* Flags an emulated instruction leaves, as the CPU would. AF is not kept:
+ * nothing compiled from C tests it. */
+#define FL_CF 0x0001u
+#define FL_PF 0x0004u
+#define FL_ZF 0x0040u
+#define FL_SF 0x0080u
+#define FL_OF 0x0800u
+
+static uint64_t size_mask(int size)
+{
+    return size == 8 ? ~0ULL : (1ULL << (size * 8)) - 1;
+}
+
+static void set_flags_szp(PCONTEXT ctx, uint64_t r, int size)
+{
+    uint8_t b = (uint8_t)r;
+    r &= size_mask(size);
+    if (!r) ctx->EFlags |= FL_ZF;
+    if ((r >> (size * 8 - 1)) & 1) ctx->EFlags |= FL_SF;
+    b ^= b >> 4; b ^= b >> 2; b ^= b >> 1;
+    if (!(b & 1)) ctx->EFlags |= FL_PF;
+}
+
+static void set_flags_logic(PCONTEXT ctx, uint64_t r, int size)
+{
+    ctx->EFlags &= ~(FL_CF | FL_PF | FL_ZF | FL_SF | FL_OF);
+    set_flags_szp(ctx, r, size);
+}
+
+static void set_flags_arith(PCONTEXT ctx, uint64_t a, uint64_t b, int size, int sub)
+{
+    const uint64_t m = size_mask(size);
+    const int top = size * 8 - 1;
+    uint64_t r;
+    int sa, sb, sr;
+    a &= m; b &= m;
+    r = (sub ? a - b : a + b) & m;
+    sa = (int)((a >> top) & 1); sb = (int)((b >> top) & 1); sr = (int)((r >> top) & 1);
+    ctx->EFlags &= ~(FL_CF | FL_PF | FL_ZF | FL_SF | FL_OF);
+    if (sub ? a < b : r < a) ctx->EFlags |= FL_CF;
+    if (sub ? (sa != sb && sr != sa) : (sa == sb && sr != sa)) ctx->EFlags |= FL_OF;
+    set_flags_szp(ctx, r, size);
+}
+
+/* The immediate after a ModRM operand: imm8 for the byte forms and 83,
+ * imm16 under a 66 prefix, imm32 otherwise (sign-extended for REX.W). */
+static uint64_t read_imm(const uint8_t *p, int opcode, int access_size, int *len)
+{
+    if (opcode == 0x80 || opcode == 0xF6) { *len = 1; return p[0]; }
+    if (opcode == 0x83) { *len = 1; return (uint64_t)(int64_t)(int8_t)p[0]; }
+    if (access_size == 2) { *len = 2; return *(const uint16_t *)p; }
+    *len = 4;
+    return (uint64_t)(int64_t)*(const int32_t *)p;
 }
 
 /* ============================================================
@@ -236,6 +292,54 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
         mcpx_apu_mmio_write(g_apu_state, mmio_offset, mem_val & reg_val, access_size);
         ctx->Rip += prefix_len + 1 + modrm_len;
         g_apu_mmio_write_count++;
+        return true;
+    }
+
+    /* The forms below are ones Clang emits where MSVC did not. Measured on
+     * Def Jam built with llvm-mingw: "test dword ptr [mem], imm32" on the
+     * first APU register the title polls, which killed the game at boot. */
+
+    /* TEST r/m, imm (F6 /0 ib, F7 /0 id) - read */
+    if ((opcode[0] == 0xF6 || opcode[0] == 0xF7) && ((opcode[1] >> 3) & 7) == 0) {
+        int imm_len;
+        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+        uint64_t imm, mem_val;
+        if (opcode[0] == 0xF6) access_size = 1;
+        imm = read_imm(opcode + 1 + modrm_len, opcode[0], access_size, &imm_len);
+        mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
+        set_flags_logic(ctx, mem_val & imm, access_size);
+        ctx->Rip += prefix_len + 1 + modrm_len + imm_len;
+        g_apu_mmio_read_count++;
+        return true;
+    }
+
+    /* ADD, OR, AND, SUB, XOR, CMP r/m, imm (80 /n ib, 81 /n id, 83 /n ib).
+     * CMP only reads; the others write the result back. ADC and SBB would
+     * need the incoming carry and are left to the failure below. */
+    if ((opcode[0] == 0x80 || opcode[0] == 0x81 || opcode[0] == 0x83) &&
+        ((opcode[1] >> 3) & 7) != 2 && ((opcode[1] >> 3) & 7) != 3) {
+        int op = (opcode[1] >> 3) & 7;
+        int imm_len;
+        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+        uint64_t imm, m, r;
+        if (opcode[0] == 0x80) access_size = 1;
+        imm = read_imm(opcode + 1 + modrm_len, opcode[0], access_size, &imm_len)
+            & size_mask(access_size);
+        m = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size) & size_mask(access_size);
+        switch (op) {
+        case 0:  r = m + imm; set_flags_arith(ctx, m, imm, access_size, 0); break;
+        case 1:  r = m | imm; set_flags_logic(ctx, r, access_size); break;
+        case 4:  r = m & imm; set_flags_logic(ctx, r, access_size); break;
+        case 6:  r = m ^ imm; set_flags_logic(ctx, r, access_size); break;
+        default: r = m - imm; set_flags_arith(ctx, m, imm, access_size, 1); break;  /* 5, 7 */
+        }
+        if (op != 7) {
+            mcpx_apu_mmio_write(g_apu_state, mmio_offset, r & size_mask(access_size), access_size);
+            g_apu_mmio_write_count++;
+        } else {
+            g_apu_mmio_read_count++;
+        }
+        ctx->Rip += prefix_len + 1 + modrm_len + imm_len;
         return true;
     }
 
