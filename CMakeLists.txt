@@ -22,6 +22,12 @@ add_compile_definitions(
     NOMINMAX
 )
 
+# MinGW's headers default to an older Windows than the SDK MSVC builds with,
+# and hide the Windows 10 API (SetProcessDpiAwarenessContext): same floor.
+if(MINGW)
+    add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)
+endif()
+
 # Option to build examples
 
 # ── Runtime Libraries ─────────────────────────────────────────

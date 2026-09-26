@@ -48,3 +48,9 @@ else()
     find_package(SDL2 REQUIRED)
     target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
 endif()
+
+# MSVC links XAudio2 through the #pragma comment(lib) in apu_xaudio2.c. MinGW
+# has no xaudio2.lib, only versioned import libraries; 2.9 is Windows 10's.
+if(MINGW)
+    target_link_libraries(xbox_apu PRIVATE xaudio2_9)
+endif()

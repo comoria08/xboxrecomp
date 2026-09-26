@@ -26,6 +26,9 @@
 #include "apu_state.h"
 #include "fpconv.h"
 
+/* Defined with the tracing below; used from the first voice on. */
+static int apu_trace_on(void);
+
 /* #define DEBUG_MCPX */
 
 #ifdef DEBUG_MCPX
@@ -1258,8 +1261,6 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
 /* ============================================================
  * Voice processing (main per-voice function)
  * ============================================================ */
-
-static int apu_trace_on(void);
 
 static void voice_process(MCPXAPUState *d,
                           float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],

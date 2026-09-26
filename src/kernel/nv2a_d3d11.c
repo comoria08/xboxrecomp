@@ -238,7 +238,7 @@ static int init(void)
         fprintf(stderr, "  [D3D11] no device (0x%08lX), staying on the CPU\n", (unsigned long)hr);
         return 0;
     }
-    if (FAILED(ID3D11DeviceContext_QueryInterface(s_ctx, &IID_ID3D11DeviceContext1, &s_ctx1)))
+    if (FAILED(ID3D11DeviceContext_QueryInterface(s_ctx, &IID_ID3D11DeviceContext1, (void **)&s_ctx1)))
         s_ctx1 = NULL;
 
     vs = compile("vs_main", "vs_5_0");
@@ -1695,9 +1695,9 @@ static int swap_ready(void)
         IDXGIFactory2 *fac = NULL;
         DXGI_SWAP_CHAIN_DESC1 sd;
         HRESULT hr;
-        ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice, &dxdev);
+        ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice, (void **)&dxdev);
         IDXGIDevice_GetAdapter(dxdev, &ad);
-        IDXGIAdapter_GetParent(ad, &IID_IDXGIFactory2, &fac);
+        IDXGIAdapter_GetParent(ad, &IID_IDXGIFactory2, (void **)&fac);
         memset(&sd, 0, sizeof sd);
         sd.Width = w; sd.Height = h;
         sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -1726,7 +1726,7 @@ static int swap_ready(void)
             s_back_rtv = NULL;
         }
         IDXGISwapChain1_ResizeBuffers(s_swap, 0, w, h, DXGI_FORMAT_UNKNOWN, 0);
-        IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, &bb);
+        IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&bb);
         ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)bb, NULL, &s_back_rtv);
         ID3D11Texture2D_Release(bb);
         s_back_w = w; s_back_h = h;
