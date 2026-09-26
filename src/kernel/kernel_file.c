@@ -17,6 +17,7 @@
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #include "kernel.h"
 #include <string.h>
+#include <stdlib.h>   /* getenv: implicit, it returned a truncated int on x64 */
 #include <stdio.h>
 
 #if !defined(_WIN32)
