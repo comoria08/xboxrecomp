@@ -17,6 +17,11 @@
  *
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
+ *
+ * Modified for xboxrecomp, 2026-09-18 to 2026-09-19, for the Def Jam: Fight
+ * for NY port: audio buffers in the contiguous memory window reached at
+ * their real address, the GP and EP MMIO windows, frame pacing by the sound
+ * card's queue depth, recovery from a trap nobody answers. See NOTICE.
  */
 
 #include "apu_state.h"

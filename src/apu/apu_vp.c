@@ -17,6 +17,10 @@
  *
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
+ *
+ * Modified for xboxrecomp, 2026-09-18 to 2026-09-19, for the Def Jam: Fight
+ * for NY port: voice buffer addresses translated like the core's, output
+ * taken from what the voices produce, tracing, trap recovery. See NOTICE.
  */
 
 #include "apu_state.h"

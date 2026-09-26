@@ -21,6 +21,10 @@
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *
+ * Modified for xboxrecomp, 2026-09-18 to 2026-09-19, for the Def Jam: Fight
+ * for NY port: no assert on an unknown opcode (the core parks instead), a
+ * cycle budget, diagnostics; each marked "xboxrecomp" in place. See NOTICE.
  */
 
 #include "dsp_compat.h"

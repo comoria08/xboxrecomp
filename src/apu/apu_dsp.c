@@ -22,6 +22,10 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  *
+ * Modified for xboxrecomp, 2026-09-18 to 2026-09-19, for the Def Jam: Fight
+ * for NY port: all six channels of a 5.1 mix read, address translation, and
+ * the differences listed under "What differs from xemu" below. See NOTICE.
+ *
  * ── What differs from xemu, and why ─────────────────────────────────────
  *
  * 1. No asserts on the scatter-gather path. In QEMU a title that programs a
