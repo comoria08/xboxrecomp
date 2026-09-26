@@ -1086,6 +1086,106 @@ static void framelog(const char *fmt, ...)
 
 /* ── Drawing ────────────────────────────────────────────────────────── */
 
+/* Register-combiner pixel shaders (point 140), one per configuration the
+ * executor translated, and their constants in register b3: the factors of
+ * each stage, then the size and kind of the textures on stages 1-3. */
+#define MAX_PS_PROGRAMS 256
+typedef struct { uint64_t hash; ID3D11PixelShader *ps; } PsProgram;
+static PsProgram     s_psp[MAX_PS_PROGRAMS];
+static int           s_npsp;
+static ID3D11Buffer *s_cb_comb;
+#define COMB_CB_FLOAT4S (8 + 8 + 4)
+
+int nvd3d_ps_program(uint64_t hash, const char *hlsl, size_t len)
+{
+    int i;
+    ID3DBlob *code = NULL, *err = NULL;
+    PsProgram *p;
+
+    for (i = 0; i < s_npsp; i++)
+        if (s_psp[i].hash == hash)
+            return s_psp[i].ps ? i : -1;
+    if (!hlsl)
+        return -2;                      /* unknown: the caller translates */
+    if (s_npsp >= MAX_PS_PROGRAMS || !s_dev)
+        return -1;
+    p = &s_psp[s_npsp++];
+    memset(p, 0, sizeof *p);
+    p->hash = hash;
+    if (!len)
+        return -1;                      /* refused by the translation: cached as such */
+    if (FAILED(D3DCompile(hlsl, len, "nv2a_comb", NULL, NULL, "ps_comb", "ps_5_0",
+                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err))) {
+        static int said;
+        if (said++ < 8)
+            fprintf(stderr, "  [COMB] configuration %016llX does not compile, drawn texel x colour: %s\n",
+                    (unsigned long long)hash,
+                    err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+        if (err) ID3D10Blob_Release(err);
+        return -1;                      /* the failure is cached: no retry */
+    }
+    if (err) ID3D10Blob_Release(err);
+    if (FAILED(ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                              ID3D10Blob_GetBufferSize(code), NULL, &p->ps))) {
+        ID3D10Blob_Release(code);
+        return -1;
+    }
+    ID3D10Blob_Release(code);
+    return (int)(p - s_psp);
+}
+
+/* The combiners' own constants and textures, for a batch that has a
+ * translated configuration. Stage 0 keeps register t0/s0 and the Draw
+ * constants, exactly as the fixed shader reads them. */
+static void bind_combiners(const NvD3DState *st)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    float cb[COMB_CB_FLOAT4S * 4];
+    int k;
+
+    if (!s_cb_comb) {
+        D3D11_BUFFER_DESC bd;
+        memset(&bd, 0, sizeof bd);
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        bd.ByteWidth = sizeof cb;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb_comb)))
+            return;
+    }
+    memset(cb, 0, sizeof cb);
+    for (k = 0; k < 8; k++) {
+        const uint32_t f0 = st->factor0[k], f1 = st->factor1[k];
+        cb[k * 4 + 0] = (float)((f0 >> 16) & 0xFF) / 255.0f;
+        cb[k * 4 + 1] = (float)((f0 >>  8) & 0xFF) / 255.0f;
+        cb[k * 4 + 2] = (float)( f0        & 0xFF) / 255.0f;
+        cb[k * 4 + 3] = (float)((f0 >> 24) & 0xFF) / 255.0f;
+        cb[32 + k * 4 + 0] = (float)((f1 >> 16) & 0xFF) / 255.0f;
+        cb[32 + k * 4 + 1] = (float)((f1 >>  8) & 0xFF) / 255.0f;
+        cb[32 + k * 4 + 2] = (float)( f1        & 0xFF) / 255.0f;
+        cb[32 + k * 4 + 3] = (float)((f1 >> 24) & 0xFF) / 255.0f;
+    }
+    for (k = 0; k < 3; k++) {
+        cb[64 + k * 4 + 0] = (float)(st->stage_wh[k][0] ? st->stage_wh[k][0] : 1);
+        cb[64 + k * 4 + 1] = (float)(st->stage_wh[k][1] ? st->stage_wh[k][1] : 1);
+        cb[64 + k * 4 + 2] = st->stage_linear[k] ? 1.0f : 0.0f;
+        cb[64 + k * 4 + 3] = st->stage_tex[k] >= 0 ? 1.0f : 0.0f;
+    }
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_comb, 0,
+                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        memcpy(m.pData, cb, sizeof cb);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_comb, 0);
+    }
+    for (k = 0; k < 3; k++) {
+        ID3D11ShaderResourceView *srv = st->stage_tex[k] >= 0 ? texture_view(st->stage_tex[k]) : NULL;
+        const uint32_t au = st->stage_addr[k] & 0xF, av = (st->stage_addr[k] >> 4) & 0xF;
+        const int s = (au == 1 ? 1 : 0) | (av == 1 ? 2 : 0);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 1 + k, 1, &srv);
+        ID3D11DeviceContext_PSSetSamplers(s_ctx, 1 + k, 1, &s_smp[s]);
+    }
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 3, 1, &s_cb_comb);
+}
+
 /* Everything a batch needs besides its vertices: the pixel shader constants,
  * the texture and its sampler, viewport, scissor, blend and depth. Shared by
  * the CPU path's flush and by a translated program's draw, so the two can
@@ -1416,7 +1516,9 @@ static int vp_setup(const NvD3DProgramDraw *d, UINT *first_index)
         }
         memcpy(cba + 256, d->absent, 16 * 16);
         xf[0] = d->ax; xf[1] = d->ay; xf[2] = d->uv_scale[0]; xf[3] = d->uv_scale[1];
-        xf[4] = d->textured ? 1.0f : 0.0f; xf[5] = xf[6] = xf[7] = 0.0f;
+        xf[4] = d->textured ? 1.0f : 0.0f;
+        xf[5] = d->points ? 1.0f : 0.0f;     /* xf1.y: indices carry a sprite corner */
+        xf[6] = xf[7] = 0.0f;
         memcpy(cba + 512, xf, sizeof xf);
         if (!vp_upload(s_vp_cba, cba, sizeof cba))
             return 0;
@@ -1450,9 +1552,18 @@ void nvd3d_draw_program(const NvD3DProgramDraw *d, const NvD3DState *st)
     bind_state(st);
     if (!vp_setup(d, &first))
         return;
-    ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
+    if (st->ps >= 0 && st->ps < s_npsp && s_psp[st->ps].ps) {
+        bind_combiners(st);
+        ID3D11DeviceContext_PSSetShader(s_ctx, s_psp[st->ps].ps, NULL, 0);
+    } else {
+        ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
+    }
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+    if (d->lines)
+        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
     ID3D11DeviceContext_DrawIndexed(s_ctx, d->nindex, first, 0);
+    if (d->lines)
+        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     vp_unbind();
     framelog("prog %5u i  vs %d  tex %d %ux%u  z%u%u f%X  bl%u %X/%X  cm%08X  at%u f%X r%u",
              d->nindex, d->vs, st->texture, st->tex_w, st->tex_h,
@@ -1828,6 +1939,8 @@ int  nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t w, uint32_t h,
 { (void)key; (void)hash; (void)w; (void)h; (void)mb; (void)mn; (void)d; return -1; }
 void nvd3d_triangle(const NvD3DVertex v[3], const NvD3DState *st) { (void)v; (void)st; }
 int  nvd3d_vs_program(uint64_t hash, const char *hlsl, size_t len)
+{ (void)hash; (void)hlsl; (void)len; return -1; }
+int  nvd3d_ps_program(uint64_t hash, const char *hlsl, size_t len)
 { (void)hash; (void)hlsl; (void)len; return -1; }
 void nvd3d_draw_program(const NvD3DProgramDraw *d, const NvD3DState *st) { (void)d; (void)st; }
 uint32_t nvd3d_check_program(const NvD3DProgramDraw *d, NvD3DVertex *out, uint32_t max)

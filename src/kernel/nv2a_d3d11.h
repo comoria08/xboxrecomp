@@ -41,6 +41,17 @@ typedef struct {
     uint32_t addr_u, addr_v;            /* 1 wrap, anything else clamp */
     uint32_t tex_w, tex_h;
     uint32_t scissor[4];                /* x, y, w, h in surface samples */
+    /* The register combiners (point 140). ps is a handle from
+     * nvd3d_ps_program, or -1 for the fixed texel-times-colour shader that
+     * every batch the combiners would draw the same way keeps. Only a
+     * translated vertex program carries what they read -- the specular colour
+     * and the coordinates of stages 1-3 -- so the CPU path always has -1. */
+    int32_t  ps;
+    int32_t  stage_tex[3];              /* stages 1-3: handle from nvd3d_texture, -1 none */
+    uint32_t stage_wh[3][2];            /* their size in texels */
+    uint32_t stage_addr[3];             /* addr_u | addr_v << 4, as addr_u/addr_v */
+    uint32_t stage_linear[3];           /* 1: a linear image, coordinates in texels */
+    uint32_t factor0[8], factor1[8];    /* combiner constants per stage, ARGB */
 } NvD3DState;
 
 /* Non-zero once RECOMP_D3D11 is set and the device came up. */
@@ -94,12 +105,24 @@ typedef struct {
     float           ax, ay;             /* window to NDC, as d3d_triangle */
     float           uv_scale[2];        /* texels per unit, or 1 */
     int             textured;
+    /* Point sprites (point 140): each index is vertex << 2 | corner, six per
+     * point, and the shader moves each corner by the size the program wrote
+     * in oPts and gives stage 3 its 0..1 sprite coordinates. */
+    int             points;
+    /* Lines (primitives 2-4, point 140): the index list is pairs, drawn as a
+     * D3D11 line list, one sample wide as the NV2A draws them. */
+    int             lines;
 } NvD3DProgramDraw;
 
 /* The vertex shader for one translated program, compiled once and cached by
  * hash. -1 if it does not compile: the caller keeps the CPU path for it. With
  * hlsl NULL it only looks: -2 means not seen yet, so translate and call again. */
 int  nvd3d_vs_program(uint64_t hash, const char *hlsl, size_t len);
+
+/* The pixel shader for one register-combiner configuration, translated by the
+ * executor and compiled once, cached by hash exactly as nvd3d_vs_program:
+ * -2 not seen yet (translate and call again), -1 does not compile. */
+int  nvd3d_ps_program(uint64_t hash, const char *hlsl, size_t len);
 
 /* Draw a whole batch through a translated program, after whatever the CPU
  * path queued, under the same state d3d_triangle would have used. */

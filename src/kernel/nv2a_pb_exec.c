@@ -1768,9 +1768,8 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
  * black, so alpha is composited onto mid-grey to stay legible; that is a
  * viewing choice, not a decode. One file per distinct texture, first use only.
  */
-static void dump_texture_bmp(uint32_t seq)
+static void dump_texture_bmp_to(const char *prefix, uint32_t seq)
 {
-    const char *prefix = getenv("RECOMP_TEX_DUMP");
     uint32_t w = s_gpu.tex.width, h = s_gpu.tex.height, x, y;
     uint32_t row_bytes, pad, filesz;
     uint8_t hdr[54];
@@ -1819,6 +1818,100 @@ static void dump_texture_bmp(uint32_t seq)
     fprintf(stderr, "  [TEXDUMP] %s (%ux%u fmt 0x%02X)\n",
             path, w, h, s_gpu.tex.color);
     fflush(stderr);
+}
+
+static void dump_texture_bmp(uint32_t seq)
+{
+    dump_texture_bmp_to(getenv("RECOMP_TEX_DUMP"), seq);
+}
+
+/* Texture stage n (0-3) decoded from its registers, the way the method cases
+ * decode stage 0 into s_gpu.tex. Stages 1-3 are only recorded as they arrive;
+ * this reads them back, so the frame log and the dump below can describe what
+ * the title binds there. Returns 0 if the stage was never programmed. */
+static int tex_from_stage(uint32_t n, Texture *t)
+{
+    const uint32_t i = (0x1B00 + n * 0x40 - NV_TEX_FIRST) / 4;
+    uint32_t fmt;
+
+    memset(t, 0, sizeof *t);
+    if (n > 3 || !s_tex_set[i] || !s_tex_set[i + 1])
+        return 0;
+    fmt = s_tex_reg[i + 1];                            /* +0x04 FORMAT */
+    t->offset = dma_resolve(s_tex_reg[i]);             /* +0x00 OFFSET */
+    t->color = (fmt >> 8) & 0xFF;
+    t->mip_levels = (fmt >> 16) & 0xF;
+    if (tex_size_from_format(t->color)) {
+        t->width  = 1u << ((fmt >> 20) & 0xF);
+        t->height = 1u << ((fmt >> 24) & 0xF);
+    } else {                                           /* +0x1C IMAGE_RECT */
+        t->width  = s_tex_reg[i + 7] >> 16;
+        t->height = s_tex_reg[i + 7] & 0xFFFF;
+    }
+    t->addr_u = s_tex_reg[i + 2] & 0xF;                /* +0x08 ADDRESS */
+    t->addr_v = (s_tex_reg[i + 2] >> 8) & 0xF;
+    t->pitch = s_tex_reg[i + 4] >> 16;                 /* +0x10 CONTROL1 */
+    t->lod_bias = s_tex_reg[i + 5] & 0x1FFF;           /* +0x14 FILTER */
+    t->filter_min = (s_tex_reg[i + 5] >> 16) & 0xFF;
+    t->filter_mag = (s_tex_reg[i + 5] >> 24) & 0xF;
+    t->palette = dma_resolve(s_tex_reg[i + 8] & ~0x3Fu); /* +0x20 PALETTE */
+    t->valid = t->offset && t->width && t->height
+            && (tex_size_from_format(t->color) || t->pitch);
+    return 1;
+}
+
+/* The fragment pipeline of the batch the frame log is describing (point 140):
+ * the texture shader program, every combiner stage the control word enables,
+ * the final combiner, and stages 1-3 decoded. With RECOMP_STAGE_DUMP=<prefix>
+ * each distinct texture bound to stages 1-3 is also written out once, through
+ * the same sampler as stage 0 -- what a second stage holds (a light map, an
+ * environment, a detail layer) is a question for the eye before it is one for
+ * the combiner code. */
+static void vpf_fragment_state(void)
+{
+    static uint32_t dumped[256];
+    static uint32_t ndumped;
+    const char *prefix = getenv("RECOMP_STAGE_DUMP");
+    uint32_t used = s_comb_ctrl & 0xFF, i, st;
+
+    if (used < 1) used = 1;
+    if (used > 8) used = 8;
+    fprintf(stderr, "  [VPF]   shader prog %08X other %08X  comb ctrl %08X final %08X %08X\n",
+            s_shader_prog, s_shader_other, s_comb_ctrl, s_comb_fog0, s_comb_fog1);
+    for (i = 0; i < used; i++)
+        fprintf(stderr, "  [VPF]   comb s%u cicw %08X cocw %08X aicw %08X aocw %08X"
+                        "  f0 %08X f1 %08X\n",
+                i, s_comb_color_icw[i], s_comb_color_ocw[i],
+                s_comb_alpha_icw[i], s_comb_alpha_ocw[i],
+                s_comb_factor0[i], s_comb_factor1[i]);
+
+    for (st = 1; st < 4; st++) {
+        const uint32_t c0 = (0x1B0C + st * 0x40 - NV_TEX_FIRST) / 4;
+        Texture t;
+        if (!tex_from_stage(st, &t))
+            continue;
+        fprintf(stderr, "  [VPF]   stage%u offset 0x%08X %ux%u fmt %02X ctrl0 %08X addr %X/%X"
+                        " filter %02X/%X mips %u  mode %u\n",
+                st, t.offset, t.width, t.height, t.color, s_tex_reg[c0],
+                t.addr_u, t.addr_v, t.filter_min, t.filter_mag, t.mip_levels,
+                (s_shader_prog >> (5 * st)) & 0x1F);
+        if (prefix && t.valid && ((s_shader_prog >> (5 * st)) & 0x1F) && ndumped < 256) {
+            uint32_t k;
+            for (k = 0; k < ndumped && dumped[k] != t.offset; k++)
+                ;
+            if (k == ndumped) {
+                /* sample_texture reads s_gpu.tex: lend it the stage. The stage
+                 * number goes in the name so the files sort by stage. */
+                const Texture keep = s_gpu.tex;
+                char pre[512];
+                dumped[ndumped++] = t.offset;
+                snprintf(pre, sizeof pre, "%sst%u_", prefix, st);
+                s_gpu.tex = t;
+                dump_texture_bmp_to(pre, ndumped);
+                s_gpu.tex = keep;
+            }
+        }
+    }
 }
 
 /* The surface, resolved once per batch.
@@ -2038,13 +2131,16 @@ static void d3d_decode(uint32_t *dst, uint32_t w, uint32_t h)
                 dst[(size_t)y * w + x] = 0xFFFFFFFFu;
 }
 
-/* The GPU texture for stage 0, looked at once per frame per binding: a video
- * or a font page rewritten between frames is uploaded again. */
-static int32_t d3d_texture(void)
+/* The GPU texture for what s_gpu.tex describes, looked at once per frame per
+ * binding: a video or a font page rewritten between frames is uploaded again.
+ * One remembered binding per stage (point 140): stages 1-3 lend their texture
+ * to s_gpu.tex for the call, and sharing stage 0's memory would re-hash both
+ * textures on every batch that uses two. */
+static int32_t d3d_texture_slot(int slot)
 {
-    static uint32_t last_key[6];
-    static uint32_t last_flip = 0xFFFFFFFFu;
-    static int32_t  last = -1;
+    static uint32_t last_key[4][6];
+    static uint32_t last_flip[4] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
+    static int32_t  last[4] = { -1, -1, -1, -1 };
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t key[6], probe, bytes;
     uint64_t h;
@@ -2054,11 +2150,11 @@ static int32_t d3d_texture(void)
     key[0] = s_gpu.tex.offset; key[1] = s_gpu.tex.color;
     key[2] = s_gpu.tex.width;  key[3] = s_gpu.tex.height;
     key[4] = s_gpu.tex.palette; key[5] = s_gpu.tex.pitch;
-    if (last_flip == s_gpu.flips && !memcmp(key, last_key, sizeof key))
-        return last;
-    memcpy(last_key, key, sizeof key);
-    last_flip = s_gpu.flips;
-    last = -1;
+    if (last_flip[slot] == s_gpu.flips && !memcmp(key, last_key[slot], sizeof key))
+        return last[slot];
+    memcpy(last_key[slot], key, sizeof key);
+    last_flip[slot] = s_gpu.flips;
+    last[slot] = -1;
     if (!sample_texture(0, 0, &probe)) {
         if (nvd3d_trace()) {
             static int said;
@@ -2075,9 +2171,14 @@ static int32_t d3d_texture(void)
     h = d3d_hash(mem + s_gpu.tex.offset, bytes, 1469598103934665603ull);
     if (s_gpu.tex.color == 0x0B && s_gpu.tex.palette)
         h = d3d_hash(mem + s_gpu.tex.palette, 1024, h);
-    last = nvd3d_texture(key, h, s_gpu.tex.width, s_gpu.tex.height,
-                         s_gpu.tex.offset, bytes, d3d_decode);
-    return last;
+    last[slot] = nvd3d_texture(key, h, s_gpu.tex.width, s_gpu.tex.height,
+                               s_gpu.tex.offset, bytes, d3d_decode);
+    return last[slot];
+}
+
+static int32_t d3d_texture(void)
+{
+    return d3d_texture_slot(0);
 }
 
 /* Where a vertex lands, from its position before the divide: window = X *
@@ -2094,11 +2195,17 @@ static void d3d_clip_pos(const float clip[4], const float c59[3],
     pos[3] = wc;
 }
 
+static void comb_state(NvD3DState *st);   /* the combiners, with the vertex programs */
+
 /* Everything about a batch that is not its vertices. Constant across a
- * batch, so the GPU vertex path computes it once for the whole draw. */
-static void d3d_batch_state(NvD3DState *st, int has_z, int textured)
+ * batch, so the GPU vertex path computes it once for the whole draw. program:
+ * drawn through a translated vertex program, the only path that carries what
+ * the register combiners read (point 140). */
+static void d3d_batch_state(NvD3DState *st, int has_z, int textured, int program)
 {
     memset(st, 0, sizeof *st);
+    st->ps = -1;
+    st->stage_tex[0] = st->stage_tex[1] = st->stage_tex[2] = -1;
     if (s_depth_on) {
         if (has_z) {
             st->depth_enable = s_gpu.depth_test != 0;
@@ -2137,6 +2244,8 @@ static void d3d_batch_state(NvD3DState *st, int has_z, int textured)
         st->tex_h  = s_gpu.tex.height;
     }
     clip_in_samples(st->scissor);
+    if (program)
+        comb_state(st);
 }
 
 /* a, b, c are already in surface samples. */
@@ -2184,7 +2293,7 @@ static void d3d_triangle(const float *p[3], uint32_t argb,
         v[k].col[3] = (float)((col >> 24) & 0xFF) / 255.0f;
     }
 
-    d3d_batch_state(&st, s_tri_has_z, textured);
+    d3d_batch_state(&st, s_tri_has_z, textured, 0);
 
     {
         static int trace = -1;
@@ -2733,6 +2842,8 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 #define VP_OUT_POS    0
 #define VP_OUT_D0     3
 #define VP_OUT_T0     9
+#define VP_OUT_D1     4             /* the specular colour, read by the combiners */
+#define VP_OUT_PTS    6             /* a point sprite's size in pixels */
 
 static struct {
     uint32_t prog[VP_MAX_INSNS][4];
@@ -3580,8 +3691,12 @@ static const char s_vp_hlsl_head[] =
 "cbuffer VpC : register(b1) { float4 c[192]; };\n"
 "cbuffer VpA : register(b2) { uint4 attr[16]; float4 absent[16]; float4 xf0; float4 xf1; };\n"
 "ByteAddressBuffer vd : register(t1);\n"
+/* The fields after clip are what the register combiners read (point 140): the
+ * specular colour and the coordinates of stages 1-3. They come last so that
+ * the fixed pixel shader, which declares only the first three, still links. */
 "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; float4 col : COLOR0;\n"
-"               float clip : SV_ClipDistance0; };\n"
+"               float clip : SV_ClipDistance0; float4 col1 : COLOR1;\n"
+"               float4 uv1 : TEXCOORD1; float4 uv2 : TEXCOORD2; float4 uv3 : TEXCOORD3; };\n"
 "static const float4 Z4 = float4(0.0, 0.0, 0.0, 0.0);\n"
 /* A dword at any byte address: the title's bytes and shorts need not be
  * aligned, and a raw buffer only loads aligned dwords. */
@@ -3757,9 +3872,11 @@ static int vp_hlsl(VpHlsl *b)
     for (a = 0; a < 16; a++)
         vh(b, "  float4 O%u = Z4;\n", a);
     vh(b, "  O%u.w = 1.0;\n  int a0 = 0;\n", VP_OUT_D0);
+    /* A point sprite's indices carry the corner in their low two bits. */
+    vh(b, "  uint vi = xf1.y > 0.5 ? (vid >> 2) : vid;\n");
     for (a = 0; a < NV_VERTEX_ATTRS; a++)
         if ((s_vp_inputs >> a) & 1)
-            vh(b, "  float4 V%u = vfetch(%uu, vid);\n", a, a);
+            vh(b, "  float4 V%u = vfetch(%uu, vi);\n", a, a);
 
     for (pc = 0; pc < s_vp_code_len; pc++) {
         const VpInsn *d = &s_vp_code[pc];
@@ -3808,8 +3925,366 @@ static int vp_hlsl(VpHlsl *b)
     vh(b, "  o.pos.w = w;\n");
     vh(b, "  o.uv = xf1.x > 0.5 ? O%u.xy * xf0.zw : float2(0.0, 0.0);\n", VP_OUT_T0);
     vh(b, "  o.col = floor(saturate(O%u) * 255.0 + 0.5) / 255.0;\n", VP_OUT_D0);
+    vh(b, "  o.col1 = floor(saturate(O%u) * 255.0 + 0.5) / 255.0;\n", VP_OUT_D1);
+    vh(b, "  o.uv1 = O%u; o.uv2 = O%u; o.uv3 = O%u;\n", VP_OUT_T0 + 1, VP_OUT_T0 + 2,
+       VP_OUT_T0 + 3);
+    /* A point sprite (point 140): the corner moved by half the size the
+     * program wrote in oPts, in window pixels as xf0 converts them, and stage
+     * 3 given the sprite's own coordinates, as the NV2A does. */
+    vh(b, "  if (xf1.y > 0.5) {\n"
+          "    uint corner = vid & 3u;\n"
+          "    float ps = clamp(O%u.x, 1.0, 256.0);\n"
+          "    float2 cs = float2((corner & 1u) ? 0.5 : -0.5, (corner & 2u) ? 0.5 : -0.5);\n"
+          "    o.pos.x += cs.x * ps * xf0.x * o.pos.w;\n"
+          "    o.pos.y -= cs.y * ps * xf0.y * o.pos.w;\n"
+          "    o.uv3 = float4((corner & 1u) ? 1.0 : 0.0, (corner & 2u) ? 1.0 : 0.0, 0.0, 1.0);\n"
+          "  }\n", VP_OUT_PTS);
     vh(b, "  o.clip = o.pos.z;\n  return o;\n}\n");
     return !b->over;
+}
+
+/* ── Register combiners on the GPU (point 140) ──────────────────────────
+ *
+ * The NV2A computes a fragment's colour in up to eight general combiner
+ * stages and a final combiner, from the texture stages the texture shader
+ * samples, the diffuse and specular colours, and constants. The fixed shader
+ * does one thing: texel times diffuse. Measured in two arenas, the title asks
+ * for four things, and two of them add to that product -- the specular colour
+ * (V1, written by 216 vertex programs) and a second texture, light pools,
+ * window light and environment reflections (point 140).
+ *
+ * The configuration is translated to HLSL, compiled once, cached by hash, as
+ * the vertex programs are. Only where it differs from the fixed shader: a
+ * configuration that passes R0 = texel x diffuse straight through keeps the
+ * fixed shader, so what was already right cannot change. Word layouts are the
+ * XDK's (PS_COMBINERINPUTS, PS_COMBINEROUTPUTS, PS_FINALCOMBINERINPUTS_*);
+ * src/d3d/d3d8_combiners.h disagrees on the output word and on registers 14
+ * and 15 and was never used by this title. A texture-shader mode other than
+ * none or 2D, or a blue-to-alpha output, keeps the fixed shader and is
+ * counted. RECOMP_COMBINERS=0 turns all of it off, to compare.
+ *
+ * Only the translated vertex programs carry V1 and the stage 1-3 coordinates,
+ * so batches on the CPU vertex path -- the frame F9 logs, diagnostics, the
+ * few "possibly flat" ones -- are still drawn texel x diffuse. */
+
+static const char s_comb_head[] =
+"struct PSIn2 { float4 pos : SV_Position; float2 uv : TEXCOORD0; float4 col : COLOR0;\n"
+"               float clip : SV_ClipDistance0; float4 col1 : COLOR1;\n"
+"               float4 uv1 : TEXCOORD1; float4 uv2 : TEXCOORD2; float4 uv3 : TEXCOORD3; };\n"
+"cbuffer Draw : register(b0) { float4 tex; float4 atest; float4 extra; };\n"
+"cbuffer Comb : register(b3) { float4 fc0[8]; float4 fc1[8]; float4 tsz[4]; };\n"
+"Texture2D t0 : register(t0); Texture2D t1 : register(t1);\n"
+"Texture2D t2 : register(t2); Texture2D t3 : register(t3);\n"
+"SamplerState s0 : register(s0); SamplerState s1 : register(s1);\n"
+"SamplerState s2 : register(s2); SamplerState s3 : register(s3);\n"
+"static const float4 Z4 = float4(0.0, 0.0, 0.0, 0.0);\n"
+/* Input mappings, PS_INPUTMAPPING_* */
+"float4 m0(float4 x) { return max(x, 0.0); }\n"
+"float4 m1(float4 x) { return 1.0 - saturate(x); }\n"
+"float4 m2(float4 x) { return 2.0 * max(x, 0.0) - 1.0; }\n"
+"float4 m3(float4 x) { return -2.0 * max(x, 0.0) + 1.0; }\n"
+"float4 m4(float4 x) { return max(x, 0.0) - 0.5; }\n"
+"float4 m5(float4 x) { return -max(x, 0.0) + 0.5; }\n"
+"float4 m6(float4 x) { return x; }\n"
+"float4 m7(float4 x) { return -x; }\n"
+/* Stage 0 exactly as the fixed shader samples it: texel coordinates, the Load
+ * path for a texture read back out of a render target. */
+"float4 sample0(float2 uv) {\n"
+"  if (extra.y > 0.5) return t0.Sample(s0, uv / float2(tex.x, tex.y));\n"
+"  int w = (int)tex.x, h = (int)tex.y;\n"
+"  int u = (int)max(uv.x, 0.0), v = (int)max(uv.y, 0.0);\n"
+"  u = (tex.z == 1.0) ? (u % w) : min(u, w - 1);\n"
+"  v = (tex.w == 1.0) ? (v % h) : min(v, h - 1);\n"
+"  int sc = (int)extra.x;\n"
+"  return t0.Load(int3(u * sc, v * sc, 0));\n"
+"}\n"
+/* Stages 1-3 in 2D mode: the coordinate as the program wrote it, divided by q
+ * when it wrote one, normalised when the image is linear (texel units). */
+"float4 sampleN(Texture2D t, SamplerState s, float4 q, float4 sz) {\n"
+"  if (sz.w < 0.5) return Z4;\n"
+"  float2 uv = q.xy / (q.w != 0.0 ? q.w : 1.0);\n"
+"  if (sz.z > 0.5) uv /= sz.xy;\n"
+"  return t.Sample(s, uv);\n"
+"}\n";
+
+static int comb_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_COMBINERS");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+static uint32_t s_comb_translated, s_comb_unsupported, s_comb_batches;
+
+/* The fixed shader already draws this: one general stage, texture shader on
+ * stage 0 at most, and a final combiner that passes R0 through (D = R0, A, B,
+ * C zero, alpha from R0.a). */
+static int comb_fixed_is_enough(void)
+{
+    return (s_comb_ctrl & 0xFF) <= 1 && (s_shader_prog >> 5) == 0
+        && s_comb_fog0 == 0x0000000Cu && ((s_comb_fog1 >> 8) & 0xFF) == 0x1C;
+}
+
+/* A register as an HLSL value. C0 and C1 are the stage's own factors when the
+ * control word says each stage has its own, else stage 0's. */
+static void ch_reg(char *out, size_t cap, uint32_t reg, uint32_t stage)
+{
+    const uint32_t k0 = (s_comb_ctrl & (1u << 12)) ? stage : 0;
+    const uint32_t k1 = (s_comb_ctrl & (1u << 16)) ? stage : 0;
+    static const char *const names[16] = {
+        "Z4", NULL, NULL, "FOG", "V0", "V1", "Z4", "Z4",
+        "T0", "T1", "T2", "T3", "R0", "R1", "V1R0", "EFP"
+    };
+    if (reg == 1)      snprintf(out, cap, "fc0[%u]", k0);
+    else if (reg == 2) snprintf(out, cap, "fc1[%u]", k1);
+    else               snprintf(out, cap, "%s", names[reg & 0xF]);
+}
+
+/* One input byte of a general stage: register, channel, mapping. The RGB half
+ * reads .rgb or the alpha replicated; the alpha half the alpha or the blue. */
+static void ch_input(char *out, size_t cap, uint32_t byte, int alpha_half, uint32_t stage)
+{
+    char r[24];
+    const int a = (byte >> 4) & 1;
+    ch_reg(r, sizeof r, byte & 0xF, stage);
+    snprintf(out, cap, "m%u(%s%s)", (byte >> 5) & 7, r,
+             alpha_half ? (a ? ".aaaa" : ".bbbb") : (a ? ".aaaa" : ""));
+}
+
+/* One input of the final combiner: unsigned only, identity or invert. */
+static void ch_final_input(char *out, size_t cap, uint32_t byte, int alpha_only)
+{
+    char r[24];
+    const int a = (byte >> 4) & 1;
+    ch_reg(r, sizeof r, byte & 0xF, 0);
+    snprintf(out, cap, "%s(saturate(%s%s))", ((byte >> 5) & 7) == 1 ? "1.0 - " : "", r,
+             alpha_only ? (a ? ".aaaa" : ".bbbb") : (a ? ".aaaa" : ""));
+}
+
+/* An output scale/bias, PS_COMBINEROUTPUT_*, then the registers' [-1, 1]. */
+static const char *ch_outmap(uint32_t m)
+{
+    switch (m) {
+    case 1:  return "(%s - 0.5)";
+    case 2:  return "(%s * 2.0)";
+    case 3:  return "((%s - 0.5) * 2.0)";
+    case 4:  return "(%s * 4.0)";
+    case 6:  return "(%s * 0.5)";
+    default: return "(%s)";
+    }
+}
+
+static void ch_write(VpHlsl *b, uint32_t dst, const char *mask, const char *val)
+{
+    static const char *const regs[16] = {
+        NULL, NULL, NULL, NULL, "V0", "V1", NULL, NULL,
+        "T0", "T1", "T2", "T3", "R0", "R1", NULL, NULL
+    };
+    if (dst < 16 && regs[dst])
+        vh(b, "    %s.%s = %s;\n", regs[dst], mask, val);
+}
+
+/* The current combiner state as a pixel shader. 0 if it uses something the
+ * translation does not do. */
+static int comb_hlsl(VpHlsl *b)
+{
+    const uint32_t stages = (s_comb_ctrl & 0xFF) < 1 ? 1 : ((s_comb_ctrl & 0xFF) > 8 ? 8 : s_comb_ctrl & 0xFF);
+    const char *mux = (s_comb_ctrl & (1u << 8)) ? "(R0.a >= 0.5)"
+                                                : "(fmod(floor(R0.a * 255.0 + 0.5), 2.0) >= 1.0)";
+    uint32_t st, k, m;
+    char in[4][48], fmt[48], val[96];
+
+    for (st = 0; st < 4; st++) {
+        m = (s_shader_prog >> (5 * st)) & 0x1F;
+        if (m > 1)
+            return 0;                           /* only none and 2D are done */
+    }
+    for (st = 0; st < stages; st++)
+        if (s_comb_color_ocw[st] & (3u << 18))
+            return 0;                           /* blue-to-alpha */
+
+    vh(b, "%s", s_comb_head);
+    vh(b, "float4 ps_comb(PSIn2 i) : SV_Target {\n");
+    vh(b, "  float4 V0 = i.col, V1 = i.col1, FOG = Z4;\n");
+    if (s_shader_prog & 0x1F)
+        vh(b, "  float4 T0 = atest.w > 0.5 ? sample0(i.uv) : float4(1.0, 1.0, 1.0, 1.0);\n");
+    else
+        vh(b, "  float4 T0 = Z4;\n");
+    for (st = 1; st < 4; st++) {
+        if ((s_shader_prog >> (5 * st)) & 0x1F)
+            vh(b, "  float4 T%u = sampleN(t%u, s%u, i.uv%u, tsz[%u]);\n", st, st, st, st, st - 1);
+        else
+            vh(b, "  float4 T%u = Z4;\n", st);
+    }
+    vh(b, "  float4 R0 = float4(0.0, 0.0, 0.0, T0.a), R1 = Z4;\n");
+
+    for (st = 0; st < stages; st++) {
+        const uint32_t cicw = s_comb_color_icw[st], aicw = s_comb_alpha_icw[st];
+        const uint32_t cocw = s_comb_color_ocw[st], aocw = s_comb_alpha_ocw[st];
+        vh(b, "  { /* stage %u */\n", st);
+        for (k = 0; k < 4; k++) {
+            ch_input(in[k], sizeof in[k], (cicw >> (24 - 8 * k)) & 0xFF, 0, st);
+            vh(b, "    float4 c%c = %s;\n", "ABCD"[k], in[k]);
+        }
+        for (k = 0; k < 4; k++) {
+            ch_input(in[k], sizeof in[k], (aicw >> (24 - 8 * k)) & 0xFF, 1, st);
+            vh(b, "    float4 a%c = %s;\n", "ABCD"[k], in[k]);
+        }
+        /* Every read above, every write below: a stage sees the registers as
+         * they were when it began. */
+        vh(b, "    float4 cab = %s;\n", (cocw & (1u << 13)) ? "dot(cA.rgb, cB.rgb).xxxx" : "cA * cB");
+        vh(b, "    float4 ccd = %s;\n", (cocw & (1u << 12)) ? "dot(cC.rgb, cD.rgb).xxxx" : "cC * cD");
+        vh(b, "    float4 csum = %s;\n", (cocw & (1u << 14)) ? "Z4" : "cab + ccd");
+        if (cocw & (1u << 14))
+            vh(b, "    csum = %s ? ccd : cab;\n", mux);
+        vh(b, "    float4 aab = aA * aB, acd = aC * aD;\n");
+        vh(b, "    float4 asum = %s;\n", (aocw & (1u << 14)) ? "Z4" : "aab + acd");
+        if (aocw & (1u << 14))
+            vh(b, "    asum = %s ? acd : aab;\n", mux);
+        snprintf(fmt, sizeof fmt, "%s", ch_outmap((cocw >> 15) & 7));
+        vh(b, "    cab = clamp(%s, -1.0, 1.0);\n", (snprintf(val, sizeof val, fmt, "cab"), val));
+        vh(b, "    ccd = clamp(%s, -1.0, 1.0);\n", (snprintf(val, sizeof val, fmt, "ccd"), val));
+        vh(b, "    csum = clamp(%s, -1.0, 1.0);\n", (snprintf(val, sizeof val, fmt, "csum"), val));
+        snprintf(fmt, sizeof fmt, "%s", ch_outmap((aocw >> 15) & 7));
+        vh(b, "    aab = clamp(%s, -1.0, 1.0);\n", (snprintf(val, sizeof val, fmt, "aab"), val));
+        vh(b, "    acd = clamp(%s, -1.0, 1.0);\n", (snprintf(val, sizeof val, fmt, "acd"), val));
+        vh(b, "    asum = clamp(%s, -1.0, 1.0);\n", (snprintf(val, sizeof val, fmt, "asum"), val));
+        ch_write(b, (cocw >> 4) & 0xF, "rgb", "cab.rgb");
+        ch_write(b, cocw & 0xF, "rgb", "ccd.rgb");
+        ch_write(b, (cocw >> 8) & 0xF, "rgb", "csum.rgb");
+        ch_write(b, (aocw >> 4) & 0xF, "a", "aab.x");
+        ch_write(b, aocw & 0xF, "a", "acd.x");
+        ch_write(b, (aocw >> 8) & 0xF, "a", "asum.x");
+        vh(b, "  }\n");
+    }
+
+    /* The final combiner: rgb = A*B + (1-A)*C + D, alpha = G, with the two
+     * registers only it can read -- V1 + R0 and E * F. */
+    ch_final_input(in[0], sizeof in[0], (s_comb_fog1 >> 24) & 0xFF, 0);
+    ch_final_input(in[1], sizeof in[1], (s_comb_fog1 >> 16) & 0xFF, 0);
+    vh(b, "  float4 EFP = %s * %s;\n", in[0], in[1]);
+    vh(b, "  float4 V1R0 = %s + %s;\n",
+       (s_comb_fog1 & 0x40) ? "(1.0 - V1)" : "V1", (s_comb_fog1 & 0x20) ? "(1.0 - R0)" : "R0");
+    if (s_comb_fog1 & 0x80)
+        vh(b, "  V1R0 = saturate(V1R0);\n");
+    for (k = 0; k < 4; k++) {
+        ch_final_input(in[k], sizeof in[k], (s_comb_fog0 >> (24 - 8 * k)) & 0xFF, 0);
+        vh(b, "  float4 f%c = %s;\n", "ABCD"[k], in[k]);
+    }
+    ch_final_input(in[0], sizeof in[0], (s_comb_fog1 >> 8) & 0xFF, 1);
+    vh(b, "  float4 c = saturate(float4(fA.rgb * fB.rgb + (1.0 - fA.rgb) * fC.rgb + fD.rgb, %s.x));\n",
+       in[0]);
+    /* The alpha test, as the fixed shader runs it. */
+    vh(b, "  if (atest.x > 0.5) {\n"
+          "    float a = floor(c.a * 255.0 + 0.5), r = atest.z;\n"
+          "    int f = (int)atest.y;\n"
+          "    bool ok = true;\n"
+          "    if (f == 0) ok = false;\n"
+          "    else if (f == 1) ok = a <  r;\n"
+          "    else if (f == 2) ok = a == r;\n"
+          "    else if (f == 3) ok = a <= r;\n"
+          "    else if (f == 4) ok = a >  r;\n"
+          "    else if (f == 5) ok = a != r;\n"
+          "    else if (f == 6) ok = a >= r;\n"
+          "    if (!ok) discard;\n"
+          "  }\n"
+          "  return c;\n}\n");
+    return !b->over;
+}
+
+static uint64_t comb_hash(void)
+{
+    const uint32_t stages = (s_comb_ctrl & 0xFF) < 1 ? 1 : ((s_comb_ctrl & 0xFF) > 8 ? 8 : s_comb_ctrl & 0xFF);
+    uint64_t h = 1469598103934665603ull;
+    uint32_t st;
+    h = (h ^ s_shader_prog) * 0x100000001B3ull;
+    h = (h ^ s_comb_ctrl) * 0x100000001B3ull;
+    h = (h ^ s_comb_fog0) * 0x100000001B3ull;
+    h = (h ^ s_comb_fog1) * 0x100000001B3ull;
+    for (st = 0; st < stages; st++) {
+        h = (h ^ s_comb_color_icw[st]) * 0x100000001B3ull;
+        h = (h ^ s_comb_color_ocw[st]) * 0x100000001B3ull;
+        h = (h ^ s_comb_alpha_icw[st]) * 0x100000001B3ull;
+        h = (h ^ s_comb_alpha_ocw[st]) * 0x100000001B3ull;
+    }
+    return h;
+}
+
+/* The combiner part of a program draw's state: which pixel shader, the
+ * textures of stages 1-3 and the factors. */
+static void comb_state(NvD3DState *st)
+{
+    static uint64_t last_hash;
+    static int      last_ps = -1;
+    uint64_t hash;
+    int ps, k;
+
+    if (!comb_on() || comb_fixed_is_enough())
+        return;
+    hash = comb_hash();
+    if (hash == last_hash && last_ps >= 0) {
+        ps = last_ps;
+    } else {
+        ps = nvd3d_ps_program(hash, NULL, 0);
+        if (ps == -2) {
+            static char text[32 * 1024];
+            VpHlsl b;
+            b.p = text; b.n = 0; b.cap = sizeof text; b.over = 0;
+            if (!comb_hlsl(&b)) {
+                s_comb_unsupported++;
+                ps = nvd3d_ps_program(hash, "", 0);      /* cache the refusal */
+            } else {
+                /* RECOMP_COMB_DUMP=<dir>: every translation, one file each,
+                 * to read what a configuration became. */
+                const char *dir = getenv("RECOMP_COMB_DUMP");
+                if (dir) {
+                    char path[512];
+                    FILE *f;
+                    snprintf(path, sizeof path, "%s/comb_%016llX.hlsl", dir,
+                             (unsigned long long)hash);
+                    f = fopen(path, "w");
+                    if (f) {
+                        fwrite(text, 1, b.n, f);
+                        fclose(f);
+                    }
+                }
+                ps = nvd3d_ps_program(hash, text, b.n);
+                s_comb_translated++;
+                fprintf(stderr, "  [COMB] configuration %016llX: %u stage(s), texture shader %08X,"
+                                " final %08X %08X -> %s\n",
+                        (unsigned long long)hash, s_comb_ctrl & 0xFF, s_shader_prog,
+                        s_comb_fog0, s_comb_fog1, ps >= 0 ? "translated" : "does not compile");
+            }
+        }
+        last_hash = hash;
+        last_ps = ps;
+    }
+    if (ps < 0)
+        return;
+    st->ps = ps;
+    s_comb_batches++;
+    for (k = 0; k < 8; k++) {
+        st->factor0[k] = s_comb_factor0[k];
+        st->factor1[k] = s_comb_factor1[k];
+    }
+    for (k = 1; k < 4; k++) {
+        Texture t;
+        if (!((s_shader_prog >> (5 * k)) & 0x1F) || !tex_from_stage((uint32_t)k, &t) || !t.valid)
+            continue;
+        {
+            const Texture keep = s_gpu.tex;
+            s_gpu.tex = t;                      /* d3d_texture_slot reads s_gpu.tex */
+            st->stage_tex[k - 1] = d3d_texture_slot(k);
+            s_gpu.tex = keep;
+        }
+        st->stage_wh[k - 1][0] = t.width;
+        st->stage_wh[k - 1][1] = t.height;
+        st->stage_addr[k - 1] = (t.addr_u & 0xF) | ((t.addr_v & 0xF) << 4);
+        st->stage_linear[k - 1] = !tex_size_from_format(t.color);
+    }
 }
 
 /* The program's identity: the words it runs, from its start to its last. */
@@ -3832,6 +4307,8 @@ static uint32_t s_vpg_index[NV_MAX_INDICES * 2 * 3];
 static uint32_t s_vpg_batches, s_vpg_tris;
 static uint32_t s_vpg_cpu_flat, s_vpg_cpu_diag, s_vpg_cpu_nolast, s_vpg_cpu_compile,
                 s_vpg_cpu_gather, s_vpg_cpu_small, s_vpg_eligible, s_vpg_eligible_tris;
+static uint32_t s_vpg_points;                /* point-sprite batches drawn (point 140) */
+static uint32_t s_vpg_lines;                 /* line batches drawn (point 140) */
 
 static uint32_t vp_elem_bytes(const VertexAttr *a)
 {
@@ -4008,6 +4485,9 @@ static void vp_gpu_summary(void)
             vp_gpu_mode() == 2 ? "could be drawn" : "drawn",
             s_vpg_cpu_small, s_vpg_cpu_flat, s_vpg_cpu_diag, s_vpg_cpu_nolast,
             s_vpg_cpu_compile, s_vpg_cpu_gather);
+    fprintf(stderr, "  [COMB] %u configurations translated, %u refused, %u batches through"
+                    " them; %u point-sprite batches, %u line batches\n",
+            s_comb_translated, s_comb_unsupported, s_comb_batches, s_vpg_points, s_vpg_lines);
     fflush(stderr);
 }
 
@@ -4090,11 +4570,56 @@ static int vp_gpu_batch(int textured_src)
         s_vpg_cpu_gather++;
         return 0;
     }
-    t = batch_triangles(s_gpu.prim, n, s_vp_tris, NV_MAX_INDICES * 2);
-    for (i = 0; i < t; i++) {
-        s_vpg_index[3 * i]     = s_gpu.idx[s_vp_tris[i][0]];
-        s_vpg_index[3 * i + 1] = s_gpu.idx[s_vp_tris[i][1]];
-        s_vpg_index[3 * i + 2] = s_gpu.idx[s_vp_tris[i][2]];
+    if (s_gpu.prim == 1) {
+        /* Points (point 140): the bling on the fighters' jewellery. Two
+         * triangles a point, the corner in the index's low bits. Off with
+         * RECOMP_POINTS=0, which leaves them undrawn as before. */
+        static int points_on = -1;
+        if (points_on < 0) {
+            const char *e = getenv("RECOMP_POINTS");
+            points_on = !(e && *e == '0');
+        }
+        if (!points_on)
+            return 0;
+        for (i = 0, t = 0; i < n && t + 2 <= NV_MAX_INDICES * 2; i++, t += 2) {
+            const uint32_t v = s_gpu.idx[i] << 2;
+            s_vpg_index[3 * t]     = v | 0; s_vpg_index[3 * t + 1] = v | 1;
+            s_vpg_index[3 * t + 2] = v | 2; s_vpg_index[3 * t + 3] = v | 2;
+            s_vpg_index[3 * t + 4] = v | 1; s_vpg_index[3 * t + 5] = v | 3;
+        }
+        s_vpg_points++;
+    } else if (s_gpu.prim >= 2 && s_gpu.prim <= 4) {
+        /* Lines, line loop, line strip (point 140): a menu of the title draws
+         * outlines with them, and nothing drew lines at all. As index pairs, t
+         * counting segments; the draw is a D3D11 line list. RECOMP_LINES=0
+         * leaves them undrawn. */
+        static int lines_on = -1;
+        uint32_t segs = 0, k;
+        if (lines_on < 0) {
+            const char *e = getenv("RECOMP_LINES");
+            lines_on = !(e && *e == '0');
+        }
+        if (!lines_on)
+            return 0;
+        for (k = 0; k + 1 < n && 2 * (segs + 1) <= NV_MAX_INDICES * 6; k += (s_gpu.prim == 2 ? 2 : 1)) {
+            s_vpg_index[2 * segs]     = s_gpu.idx[k];
+            s_vpg_index[2 * segs + 1] = s_gpu.idx[k + 1];
+            segs++;
+        }
+        if (s_gpu.prim == 3 && n > 2) {                  /* the loop closes */
+            s_vpg_index[2 * segs]     = s_gpu.idx[n - 1];
+            s_vpg_index[2 * segs + 1] = s_gpu.idx[0];
+            segs++;
+        }
+        t = segs;
+        s_vpg_lines++;
+    } else {
+        t = batch_triangles(s_gpu.prim, n, s_vp_tris, NV_MAX_INDICES * 2);
+        for (i = 0; i < t; i++) {
+            s_vpg_index[3 * i]     = s_gpu.idx[s_vp_tris[i][0]];
+            s_vpg_index[3 * i + 1] = s_gpu.idx[s_vp_tris[i][1]];
+            s_vpg_index[3 * i + 2] = s_gpu.idx[s_vp_tris[i][2]];
+        }
     }
     W = (float)(s_gpu.pitch / 4);
     H = (float)s_d3d_rt_h;
@@ -4103,17 +4628,21 @@ static int vp_gpu_batch(int textured_src)
     d.consts = (const float (*)[4])s_vp.c;
     d.consts_gen = s_vp_c_gen;
     d.index = s_vpg_index;
-    d.nindex = 3 * t;
+    d.nindex = (s_gpu.prim >= 2 && s_gpu.prim <= 4) ? 2 * t : 3 * t;
     d.ax = (float)surface_aa_x() * 2.0f / W;
     d.ay = (float)surface_aa_y() * 2.0f / H;
     d.uv_scale[0] = tex_size_from_format(s_gpu.tex.color) ? (float)s_gpu.tex.width : 1.0f;
     d.uv_scale[1] = tex_size_from_format(s_gpu.tex.color) ? (float)s_gpu.tex.height : 1.0f;
     d.textured = textured;
-    d3d_batch_state(&st, 1, textured);
+    d.points = s_gpu.prim == 1;
+    d.lines = s_gpu.prim >= 2 && s_gpu.prim <= 4;
+    d3d_batch_state(&st, 1, textured, 1);
     s_vpg_eligible++;
     s_vpg_eligible_tris += t;
 
     if (mode == 2) {
+        if (d.points || d.lines)
+            return 0;                       /* nothing on the CPU path to check against */
         vp_gpu_check(&d, hash, t);
         return 0;
     }
@@ -4256,23 +4785,7 @@ static void raster_batch_program(void)
              * pattern in one and the matter that fills it in the other -- gets
              * the matter alone, spread over the whole quad. Printing what the
              * other stages hold says whether that is what is happening. */
-            fprintf(stderr, "  [VPF]   comb ctrl %08X final %08X %08X"
-                            "  s0 cicw %08X cocw %08X aicw %08X aocw %08X"
-                            "  f0 %08X f1 %08X\n",
-                    s_comb_ctrl, s_comb_fog0, s_comb_fog1,
-                    s_comb_color_icw[0], s_comb_color_ocw[0],
-                    s_comb_alpha_icw[0], s_comb_alpha_ocw[0],
-                    s_comb_factor0[0], s_comb_factor1[0]);
-            {
-                int st_i;
-                for (st_i = 1; st_i < 4; st_i++) {
-                    uint32_t o = (uint32_t)(0x1B00 + st_i * 0x40 - NV_TEX_FIRST) / 4;
-                    if (!s_tex_set[o] && !s_tex_set[o + 1])
-                        continue;
-                    fprintf(stderr, "  [VPF]   stage%d offset 0x%08X format 0x%08X\n",
-                            st_i, s_tex_reg[o], s_tex_reg[o + 1]);
-                }
-            }
+            vpf_fragment_state();
             {
                 /* Every constant the program could be reading, not just the
                  * dozen usually worth printing: a batch that comes out with
@@ -4286,7 +4799,7 @@ static void raster_batch_program(void)
                  * it a better vertex colour. */
                 {
                     uint32_t ii;
-                    for (ii = 0; ii < s_vp_code_len && ii < 24; ii++) {
+                    for (ii = 0; ii < s_vp_code_len; ii++) {
                         const VpInsn *d = &s_vp_code[ii];
                         char src[3][24];
                         uint32_t k;
