@@ -4,9 +4,11 @@ List or extract files from an Xbox disc image.
     py -3 -m tools.xiso ls      game.iso
     py -3 -m tools.xiso get     game.iso default.xbe -o game/
     py -3 -m tools.xiso unpack  game.iso -o extracted/
+    py -3 -m tools.xiso pack    extracted/ -o game.iso [--exclude PATTERN ...]
 """
 
 import argparse
+import fnmatch
 import os
 import sys
 
@@ -50,6 +52,25 @@ def cmd_unpack(args):
     return 0
 
 
+def cmd_pack(args):
+    from .xdvdfs_write import pack
+    patterns = args.exclude or []
+
+    def exclude(rel, name):
+        # A pattern with a slash matches the path from the image root, one
+        # without matches a name anywhere: "UDATA", "*.orig", "assets/*.bak".
+        return any(fnmatch.fnmatch(rel.lower() if "/" in p else name.lower(), p.lower())
+                   for p in patterns)
+
+    def progress(i, n, f):
+        if i == n or i % 200 == 0:
+            print("  %d/%d files" % (i, n))
+
+    files, data = pack(args.dir, args.output, exclude, progress)
+    print("packed %d files (%d bytes) into %s" % (files, data, args.output))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="tools.xiso", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -69,6 +90,13 @@ def main(argv=None):
     p.add_argument("iso")
     p.add_argument("-o", "--output", required=True)
     p.set_defaults(func=cmd_unpack)
+
+    p = sub.add_parser("pack", help="write an image of a directory")
+    p.add_argument("dir")
+    p.add_argument("-o", "--output", required=True)
+    p.add_argument("--exclude", action="append", metavar="PATTERN",
+                   help="leave out matching entries (repeatable)")
+    p.set_defaults(func=cmd_pack)
 
     args = ap.parse_args(argv)
     try:
