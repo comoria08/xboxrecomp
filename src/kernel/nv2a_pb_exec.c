@@ -2223,7 +2223,8 @@ static int ui_layer_on(void)
         const char *e = getenv("RECOMP_UI_LAYER");
         const char *ab = getenv("RECOMP_UI_LAYER_AB");
         const char *q = getenv("RECOMP_UI_43");       /* needs the layer (point 151) */
-        on = (e && atoi(e) != 0) || (q && atoi(q) != 0);
+        const char *dl = getenv("RECOMP_DLSS");       /* so does DLSS (point 155) */
+        on = (e && atoi(e) != 0) || (q && atoi(q) != 0) || (dl && atoi(dl) != 0);
         if (ab && atoi(ab) > 0) {
             s_ui_ab = (uint32_t)atoi(ab);
             on = 1;
@@ -4958,7 +4959,8 @@ static int motion_on(void)
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("RECOMP_MOTION");
-        on = e && atoi(e) != 0;
+        const char *dl = getenv("RECOMP_DLSS");       /* DLSS needs them (point 155) */
+        on = (e && atoi(e) != 0) || (dl && atoi(dl) != 0);
         if (on) {
             s_motion = (MotionObj *)calloc(MOTION_SLOTS, sizeof *s_motion);
             if (!s_motion)

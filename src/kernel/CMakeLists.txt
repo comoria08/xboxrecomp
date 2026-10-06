@@ -27,7 +27,29 @@ set(KERNEL_SOURCES
     nv2a_d3d11.c
 )
 
+# DLSS through NVIDIA Streamline (nv2a_dlss.h). Only with the SDK's folder in
+# RECOMP_STREAMLINE_DIR, and then the consuming project must have enabled CXX
+# (enable_language at its top level): the Streamline headers are C++. Without
+# it, a stub that says DLSS is not available.
+if(RECOMP_STREAMLINE_DIR AND EXISTS "${RECOMP_STREAMLINE_DIR}/include/sl.h")
+    list(APPEND KERNEL_SOURCES nv2a_dlss.cpp)
+    set(XBOX_KERNEL_STREAMLINE ON)
+else()
+    list(APPEND KERNEL_SOURCES nv2a_dlss_stub.c)
+    set(XBOX_KERNEL_STREAMLINE OFF)
+endif()
+
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
+
+if(XBOX_KERNEL_STREAMLINE)
+    file(TO_NATIVE_PATH "${RECOMP_STREAMLINE_DIR}/bin/x64" _sl_bin)
+    string(REPLACE "\\" "\\\\" _sl_bin "${_sl_bin}")
+    target_include_directories(xbox_kernel PRIVATE "${RECOMP_STREAMLINE_DIR}/include")
+    target_compile_definitions(xbox_kernel PRIVATE
+        RECOMP_STREAMLINE=1
+        "RECOMP_STREAMLINE_BIN_DEFAULT=L\"${_sl_bin}\"")
+    message(STATUS "xbox_kernel: DLSS through Streamline, ${RECOMP_STREAMLINE_DIR}")
+endif()
 
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
 # CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().

@@ -30,6 +30,7 @@
 #include <stdarg.h>
 
 #include "nv2a_d3d11.h"
+#include "nv2a_dlss.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void *xbox_FramebufferWindowHwnd(void);
@@ -51,7 +52,8 @@ static ID3D11Device         *s_dev;
 static ID3D11DeviceContext  *s_ctx;
 static ID3D11DeviceContext1 *s_ctx1;
 static ID3D11VertexShader   *s_vs, *s_vs_present;
-static ID3D11PixelShader    *s_ps, *s_ps_present, *s_ps_ui, *s_ps_depth, *s_ps_mv, *s_ps_mvview;
+static ID3D11PixelShader    *s_ps, *s_ps_present, *s_ps_ui, *s_ps_depth, *s_ps_mv, *s_ps_mvview,
+                            *s_ps_copy;
 static ID3D11DepthStencilState *s_ds_mv;          /* LESS_EQUAL, no write */
 static ID3D11Buffer         *s_cb_prev;           /* b4: the previous constants */
 static uint32_t              s_mv_batches;
@@ -246,6 +248,8 @@ static const char s_hlsl[] =
  * it, nothing (C 0, T 1). Bilinear on (C, T), which are premultiplied. */
 "cbuffer Ui : register(b0) { float4 uik; };\n"
 "Texture2D uil : register(t0);\n"
+/* DLSS step 4: the upscaler's output back into the target, pixel for pixel. */
+"float4 ps_copy(POut i) : SV_Target { return uil.Load(int3(i.pos.xy, 0)); }\n"
 /* RECOMP_DEPTH_VIEW, F7: the depth instead of the picture. D24 crowds a
  * perspective scene near 1, so it is spread on a log scale: near is white. */
 "Texture2D<float> dep : register(t0);\n"
@@ -325,12 +329,14 @@ static int init(void)
         S = (uint32_t)(v < 1 ? 1 : v > 8 ? 8 : v);
         xbox_FramebufferWindowScale(S);
     }
+    nvdlss_preinit();                   /* RECOMP_DLSS: Streamline before the device */
     hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags, levels, 2,
                            D3D11_SDK_VERSION, &s_dev, NULL, &s_ctx);
     if (FAILED(hr)) {
         fprintf(stderr, "  [D3D11] no device (0x%08lX), staying on the CPU\n", (unsigned long)hr);
         return 0;
     }
+    nvdlss_set_device(s_dev);
     if (FAILED(ID3D11DeviceContext_QueryInterface(s_ctx, &IID_ID3D11DeviceContext1, (void **)&s_ctx1)))
         s_ctx1 = NULL;
 
@@ -353,6 +359,12 @@ static int init(void)
         ID3DBlob *psd = compile("ps_depth", "ps_5_0");
         ID3DBlob *psm = compile("ps_mv", "ps_5_0");
         ID3DBlob *psv = compile("ps_mvview", "ps_5_0");
+        ID3DBlob *psc = compile("ps_copy", "ps_5_0");
+        if (psc) {
+            ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(psc),
+                                           ID3D10Blob_GetBufferSize(psc), NULL, &s_ps_copy);
+            ID3D10Blob_Release(psc);
+        }
         if (psm) {
             ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(psm),
                                            ID3D10Blob_GetBufferSize(psm), NULL, &s_ps_mv);
@@ -1499,7 +1511,8 @@ static float jitter_scale(void)
     if (on < 0.0f) {
         const char *e = getenv("RECOMP_JITTER");
         const char *s = getenv("RECOMP_JITTER_SCALE");
-        on = (e && atoi(e) != 0) ? (s ? (float)atof(s) : 1.0f) : 0.0f;
+        const char *d = getenv("RECOMP_DLSS");          /* DLSS needs it (point 155) */
+        on = ((e && atoi(e) != 0) || (d && atoi(d) != 0)) ? (s ? (float)atof(s) : 1.0f) : 0.0f;
         if (on > 0.0f)
             fprintf(stderr, "  [D3D11] jitter on: Halton (2,3), 16 frames, scale %g\n", on);
     }
@@ -2280,6 +2293,10 @@ static int swap_ready(void)
         ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice, (void **)&dxdev);
         IDXGIDevice_GetAdapter(dxdev, &ad);
         IDXGIAdapter_GetParent(ad, &IID_IDXGIFactory2, (void **)&fac);
+        /* DLSS (manual hooking): the swap chain from Streamline's factory
+         * proxy, so that each Present goes through Streamline. */
+        if (nvdlss_ready() && nvdlss_upgrade_factory((void **)&fac))
+            fprintf(stderr, "  [D3D11] swap chain through Streamline\n");
         memset(&sd, 0, sizeof sd);
         sd.Width = w; sd.Height = h;
         sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -2365,6 +2382,149 @@ static void framelog_check(const Target *t)
         fflush(stderr);
     }
     s_framelog_n = 0;
+}
+
+/* ── DLSS step 4: DLAA through Streamline (RECOMP_DLSS=1) ───────────────
+ *
+ * At the present, on the shown surface, when this frame drew 3D: the scene
+ * (the target before the interface layer goes on it), its depth copy, its
+ * motion vectors and the jitter go to Streamline, and what comes back --
+ * the same size, anti-aliased -- is copied over the target. The interface is
+ * then composited as always, never through the upscaler. F5 turns it off and
+ * on, to compare at the same spot. RECOMP_DLSS_JITTER_SIGN=-1 flips the
+ * jitter given to DLSS, should the measured convention turn out the other. */
+static ID3D11Texture2D          *s_dlss_out;
+static ID3D11ShaderResourceView *s_dlss_out_srv;
+static uint32_t                  s_dlss_w, s_dlss_h, s_dlss_ok, s_dlss_fail;
+static int                       s_dlss_live = 1, s_dlss_reset = 1;
+
+static void dlss_frame(Target *t, int scene)
+{
+    const uint32_t w = t->w * S, h = t->h * S;
+    ID3D11ShaderResourceView *none = NULL;
+    float sign = 1.0f;
+
+    if (!nvdlss_ready())
+        return;
+    if (GetAsyncKeyState(VK_F5) & 1) {
+        s_dlss_live = !s_dlss_live;
+        s_dlss_reset = 1;
+        fprintf(stderr, "  [DLSS] F5: %s\n", s_dlss_live ? "on" : "off");
+    }
+    if (!s_dlss_live || !scene || !s_sdepth || !t->mv_tex
+            || s_sdepth_w != w || s_sdepth_h != h) {
+        s_dlss_reset = 1;                       /* no history across a gap */
+        return;
+    }
+    if (!s_dlss_out || s_dlss_w != w || s_dlss_h != h) {
+        D3D11_TEXTURE2D_DESC td;
+        if (s_dlss_out_srv) ID3D11ShaderResourceView_Release(s_dlss_out_srv);
+        if (s_dlss_out) ID3D11Texture2D_Release(s_dlss_out);
+        s_dlss_out = NULL; s_dlss_out_srv = NULL;
+        memset(&td, 0, sizeof td);
+        td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;     /* a typed UAV everywhere */
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_dlss_out)))
+            return;
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_dlss_out, NULL,
+                                              &s_dlss_out_srv);
+        s_dlss_w = w; s_dlss_h = h;
+        s_dlss_reset = 1;
+        fprintf(stderr, "  [DLSS] DLAA at %ux%u\n", w, h);
+    }
+    {
+        const char *e = getenv("RECOMP_DLSS_JITTER_SIGN");
+        if (e && atoi(e) < 0)
+            sign = -1.0f;
+    }
+    /* Nothing of ours bound while Streamline works; it leaves the state to us. */
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+    s_bound_ui = -1;
+    if (!nvdlss_evaluate(s_ctx, t->tex, s_sdepth, t->mv_tex, s_dlss_out, w, h,
+                         sign * s_jit_px[0], sign * s_jit_px[1], s_dlss_reset)) {
+        s_dlss_fail++;
+        s_dlss_reset = 1;
+        return;
+    }
+    s_dlss_reset = 0;
+    s_dlss_ok++;
+    /* How much DLSS changed, measured: every 600 frames, the scene before and
+     * after on a 64 x 48 grid -- the mean difference per channel, and how many
+     * points moved by more than 8 levels (out of 255). */
+    if (s_dlss_ok % 600 == 1) {
+        static ID3D11Texture2D *sa, *sb;
+        static uint32_t sw, sh;
+        D3D11_MAPPED_SUBRESOURCE ma, mb;
+        if (!sa || sw != w || sh != h) {
+            D3D11_TEXTURE2D_DESC td;
+            if (sa) ID3D11Texture2D_Release(sa);
+            if (sb) ID3D11Texture2D_Release(sb);
+            sa = sb = NULL;
+            ID3D11Texture2D_GetDesc(t->tex, &td);
+            td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ; td.MiscFlags = 0;
+            ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &sa);
+            ID3D11Texture2D_GetDesc(s_dlss_out, &td);
+            td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ; td.MiscFlags = 0;
+            ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &sb);
+            sw = w; sh = h;
+        }
+        if (sa && sb) {
+            ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)sa, (ID3D11Resource *)t->tex);
+            ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)sb, (ID3D11Resource *)s_dlss_out);
+            if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)sa, 0, D3D11_MAP_READ, 0, &ma))) {
+                if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)sb, 0, D3D11_MAP_READ, 0, &mb))) {
+                    uint32_t x, y, n = 0, big = 0;
+                    double sum = 0.0;
+                    for (y = 0; y < 48; y++)
+                        for (x = 0; x < 64; x++) {
+                            const uint32_t px = (x * 2 + 1) * w / 128, py = (y * 2 + 1) * h / 96;
+                            const uint8_t *a = (const uint8_t *)ma.pData + (size_t)py * ma.RowPitch + px * 4;
+                            const uint8_t *b = (const uint8_t *)mb.pData + (size_t)py * mb.RowPitch + px * 4;
+                            /* BGRA in, RGBA out */
+                            const int d0 = abs((int)a[2] - (int)b[0]), d1 = abs((int)a[1] - (int)b[1]),
+                                      d2 = abs((int)a[0] - (int)b[2]);
+                            const int dm = d0 > d1 ? (d0 > d2 ? d0 : d2) : (d1 > d2 ? d1 : d2);
+                            sum += (d0 + d1 + d2) / 3.0;
+                            if (dm > 8) big++;
+                            n++;
+                        }
+                    fprintf(stderr, "  [DLSS] change: mean %.2f levels per channel, %u of %u points"
+                                    " by more than 8\n", sum / n, big, n);
+                    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)sb, 0);
+                }
+                ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)sa, 0);
+            }
+        }
+    }
+    {
+        D3D11_VIEWPORT vp;
+        D3D11_RECT sc;
+        vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (FLOAT)w; vp.Height = (FLOAT)h;
+        vp.MinDepth = 0; vp.MaxDepth = 1;
+        sc.left = 0; sc.top = 0; sc.right = (LONG)w; sc.bottom = (LONG)h;
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &t->rtv, NULL);
+        ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+        ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
+        ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+        ID3D11DeviceContext_OMSetBlendState(s_ctx, s_blend_off, NULL, 0xFFFFFFFFu);
+        ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_off, 0);
+        ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11DeviceContext_VSSetShader(s_ctx, s_vs_present, NULL, 0);
+        ID3D11DeviceContext_PSSetShader(s_ctx, s_ps_copy, NULL, 0);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s_dlss_out_srv);
+        ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+    }
+    if ((s_dlss_ok + s_dlss_fail) % 1200 == 1)
+        fprintf(stderr, "  [DLSS] frames %u through DLAA, %u refused; %s\n", s_dlss_ok,
+                s_dlss_fail, nvdlss_status());
 }
 
 static int cmp_u32(const void *a, const void *b)
@@ -2547,11 +2707,13 @@ void nvd3d_present(uint32_t base, const uint32_t rect[4],
     }
     if (src < 0 || !swap_ready())
         return;
-    ui_composite(&s_rt[src]);
     if (s_scene_drawn && s_rt[src].base == s_main_base) {
         scene_depth_capture(&s_rt[src]);        /* no depth clear after the 3D */
         s_sdepth_at_present++;
     }
+    /* DLSS on the scene alone, then the interface over what it gives back. */
+    dlss_frame(&s_rt[src], s_sdepth_this_frame > 0 && s_rt[src].base == s_main_base);
+    ui_composite(&s_rt[src]);
     s_sdepth_hist[s_sdepth_this_frame < 3 ? s_sdepth_this_frame : 3]++;
     s_sdepth_this_frame = 0;
     s_main_base = base;                 /* the surface the jitter applies to */
