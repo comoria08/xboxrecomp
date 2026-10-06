@@ -162,6 +162,21 @@ void xbox_FramebufferWindowExternal(void)
     InterlockedExchange(&s_external, 1);
 }
 
+/* A snapshot under a given name, asked for by another thread (the executor's
+ * RECOMP_SEP_CYCLE). Taken by the window loop like an F10 one; a request
+ * made while one is still pending replaces it. */
+static char          s_ask_path[512];
+static volatile LONG s_ask;
+
+void xbox_FramebufferSnapAsk(const char *path)
+{
+    if (InterlockedCompareExchange(&s_ask, 2, 0) == 0
+            || InterlockedCompareExchange(&s_ask, 2, 1) == 1) {
+        snprintf(s_ask_path, sizeof s_ask_path, "%s", path);
+        InterlockedExchange(&s_ask, 1);
+    }
+}
+
 int xbox_FramebufferWindowPixelsWanted(void)
 {
     if (InterlockedExchange(&s_want_pixels, 0)) {
@@ -506,6 +521,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 static int f10;
                 snprintf(path, sizeof path, "%sF10_%03d.bmp",
                          snap ? snap : "capture_", ++f10);
+            } else if (InterlockedCompareExchange(&s_ask, 2, 1) == 1) {
+                snprintf(path, sizeof path, "%s", s_ask_path);
+                InterlockedExchange(&s_ask, 0);
             } else if (snap && every && atoi(every) > 0 && frames % atoi(every) == 0) {
                 snprintf(path, sizeof path, "%s%03d.bmp", snap,
                          frames / atoi(every));
@@ -573,4 +591,5 @@ void *xbox_FramebufferWindowHwnd(void) { return 0; }
 void xbox_FramebufferWindowScale(uint32_t scale) { (void)scale; }
 void xbox_FramebufferWindowExternal(void) {}
 int xbox_FramebufferWindowPixelsWanted(void) { return 0; }
+void xbox_FramebufferSnapAsk(const char *path) { (void)path; }
 #endif
