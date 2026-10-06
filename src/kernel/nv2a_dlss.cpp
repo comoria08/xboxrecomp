@@ -77,6 +77,11 @@ template <typename T> bool take(T *&p, const char *name)
 
 } // namespace
 
+extern "C" int nvdlss_built(void)
+{
+    return 1;
+}
+
 extern "C" int nvdlss_preinit(void)
 {
     const char *e = getenv("RECOMP_DLSS");

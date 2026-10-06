@@ -26,6 +26,10 @@
 extern "C" {
 #endif
 
+/* 1 if this build carries the Streamline bridge (RECOMP_STREAMLINE_DIR), so
+ * that a launcher can offer DLSS at all. Says nothing about the GPU. */
+int  nvdlss_built(void);
+
 /* Before the D3D11 device: load and initialise Streamline. 1 if it is up. */
 int  nvdlss_preinit(void);
 

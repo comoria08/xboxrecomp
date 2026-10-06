@@ -4,6 +4,7 @@
  */
 #include "nv2a_dlss.h"
 
+int  nvdlss_built(void) { return 0; }
 int  nvdlss_preinit(void) { return 0; }
 int  nvdlss_set_device(void *d) { (void)d; return 0; }
 int  nvdlss_upgrade_factory(void **f) { (void)f; return 0; }
