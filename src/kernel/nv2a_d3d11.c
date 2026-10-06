@@ -140,11 +140,13 @@ typedef struct {
                                            * when a pack image stands in */
     int      mipped;                      /* carries a generated mip chain */
     int      rt;                          /* >= 0: really render target #rt */
+    uint32_t seen;                        /* present count when last bound */
     ID3D11Texture2D          *tex;
     ID3D11ShaderResourceView *srv;
 } Tex;
 static Tex  s_tex[MAX_TEXTURES];
 static int  s_tex_count;
+static uint32_t s_present_count;        /* presents so far, for the logs */
 
 /* ── Batch ──────────────────────────────────────────────────────────── */
 
@@ -1132,6 +1134,15 @@ static uint32_t *pack_lookup(uint64_t hash, uint32_t width, uint32_t height,
     return pix;
 }
 
+int nvd3d_texture_seen(uint64_t hash, uint32_t within)
+{
+    int i;
+    for (i = 0; i < s_tex_count; i++)
+        if (s_tex[i].hash == hash && s_present_count - s_tex[i].seen <= within)
+            return 1;
+    return 0;
+}
+
 int nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t width, uint32_t height,
                   uint32_t mem_base, uint32_t mem_bytes,
                   void (*decode)(uint32_t *dst, uint32_t width, uint32_t height))
@@ -1168,7 +1179,30 @@ int nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t width, uint32_t
     if (slot >= 0 && s_tex[slot].hash == hash && s_tex[slot].decl_w == width
             && s_tex[slot].decl_h == height) {
         s_tex[slot].used = s_use_clock;
+        s_tex[slot].seen = s_present_count;
         return slot;
+    }
+    /* RECOMP_TEX_NEWLOG=1: each fingerprint the first time it is uploaded,
+     * with the present count, in the same log as the pad's [PAD] lines -- to
+     * find which textures only one screen uses (the fighter select, for the
+     * random pick on Y). */
+    {
+        static int on = -1;
+        static uint64_t seen[8192];
+        static uint32_t nseen;
+        uint32_t k;
+        if (on < 0)
+            on = getenv("RECOMP_TEX_NEWLOG") != NULL;
+        if (on) {
+            for (k = 0; k < nseen && seen[k] != hash; k++)
+                ;
+            if (k == nseen && nseen < 8192) {
+                seen[nseen++] = hash;
+                fprintf(stderr, "  [TEXNEW] %016llX %ux%u fmt %02X at 0x%08X, present %u\n",
+                        (unsigned long long)hash, width, height, key[1], mem_base,
+                        s_present_count);
+            }
+        }
     }
     if (slot < 0) {
         if (s_tex_count < MAX_TEXTURES) {
@@ -1251,6 +1285,7 @@ int nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t width, uint32_t
     free(pack);
     memcpy(t->key, key, sizeof t->key);
     t->hash = hash;
+    t->seen = s_present_count;
     t->w = sw;
     t->h = sh;
     t->decl_w = width;
@@ -2691,6 +2726,7 @@ void nvd3d_present(uint32_t base, const uint32_t rect[4],
 {
     int i, src = -1, prev = s_cur;
 
+    s_present_count++;
     flush();
     for (i = 0; i < s_rt_count; i++)
         if (s_rt[i].base == base) {
@@ -2915,6 +2951,7 @@ void nvd3d_readback(uint32_t base, uint8_t *dst, uint32_t pitch, uint32_t rows)
 #include "nv2a_d3d11.h"
 int  nvd3d_active(void) { return 0; }
 uint32_t nvd3d_target(uint32_t b, uint32_t w, uint32_t h) { (void)b; (void)w; (void)h; return 0; }
+int  nvd3d_texture_seen(uint64_t hash, uint32_t within) { (void)hash; (void)within; return 0; }
 int  nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t w, uint32_t h,
                    uint32_t mb, uint32_t mn, void (*d)(uint32_t *, uint32_t, uint32_t))
 { (void)key; (void)hash; (void)w; (void)h; (void)mb; (void)mn; (void)d; return -1; }

@@ -84,6 +84,11 @@ int  nvd3d_texture(const uint32_t key[6], uint64_t hash,
 
 void nvd3d_triangle(const NvD3DVertex v[3], const NvD3DState *st);
 
+/* 1 if a texture of this fingerprint (the texture pack's) was bound within
+ * the last `within` presents: a way for game code to tell which screen is up
+ * by what it draws (the fighter select, for the random pick on Y). */
+int  nvd3d_texture_seen(uint64_t hash, uint32_t within);
+
 /* -- Vertex programs on the GPU (RECOMP_VP_GPU) ----------------------------
  *
  * The CPU path runs the title's NV2A vertex program in an interpreter, one
