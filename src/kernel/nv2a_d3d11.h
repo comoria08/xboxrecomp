@@ -131,8 +131,6 @@ typedef struct {
     int             motion;
     int             vs_motion;
     const float   (*prev_consts)[4];
-    uint64_t        prog_hash;          /* what drew it, for RECOMP_MOTION_PROBE */
-    uint32_t        pos_addr, pos_n;
 } NvD3DProgramDraw;
 
 /* The vertex shader for one translated program, compiled once and cached by

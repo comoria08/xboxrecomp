@@ -57,19 +57,6 @@ static ID3D11PixelShader    *s_ps, *s_ps_present, *s_ps_ui, *s_ps_depth, *s_ps_m
 static ID3D11DepthStencilState *s_ds_mv;          /* LESS_EQUAL, no write */
 static ID3D11Buffer         *s_cb_prev;           /* b4: the previous constants */
 static uint32_t              s_mv_batches;
-/* RECOMP_MOTION_PROBE: the frame's motion batches, by the id each pixel got. */
-#define MVTAB_MAX 8192
-static struct { uint64_t hash; uint32_t addr, n, nindex; } s_mvtab[MVTAB_MAX];
-static uint32_t              s_mvtab_n;
-static ID3D11Buffer         *s_cb_mvid;           /* b5 */
-
-static int motion_probe(void)
-{
-    static int on = -1;
-    if (on < 0)
-        on = getenv("RECOMP_MOTION_PROBE") != NULL;
-    return on;
-}
 static ID3D11BlendState     *s_blend_ui_comp;   /* C + dst * T */
 static ID3D11Buffer         *s_cb_ui;
 static int                   s_bound_ui;        /* the layer is what is bound */
@@ -111,9 +98,6 @@ typedef struct {
     ID3D11Texture2D        *mv_tex;
     ID3D11RenderTargetView *mv_rtv;
     ID3D11ShaderResourceView *mv_srv;
-    /* RECOMP_MOTION_PROBE: which motion batch of the frame drew each pixel. */
-    ID3D11Texture2D        *id_tex;
-    ID3D11RenderTargetView *id_rtv;
 } Target;
 static Target   s_rt[MAX_TARGETS];
 static int      s_rt_count;
@@ -263,20 +247,14 @@ static const char s_hlsl[] =
 "             float clip : SV_ClipDistance0; float4 col1 : COLOR1;\n"
 "             float4 uv1 : TEXCOORD1; float4 uv2 : TEXCOORD2; float4 uv3 : TEXCOORD3;\n"
 "             float4 pc : TEXCOORD4; float4 qc : TEXCOORD5; };\n"
-/* SV_Target1 (RECOMP_MOTION_PROBE only, unbound otherwise): which motion
- * batch of the frame drew the pixel, from mvid. */
-"cbuffer MvId : register(b5) { uint4 mvid; };\n"
-"struct MOut { float2 mv : SV_Target0; uint id : SV_Target1; };\n"
-"MOut ps_mv(MIn i) {\n"
-"  MOut o; o.id = mvid.x; o.mv = float2(0.0, 0.0);\n"
+"float2 ps_mv(MIn i) : SV_Target {\n"
 /* Where it was lay before the near plane (window z < 0, what the clip
  * distance cuts away now), or behind the eye: it was not drawn then, so it has
  * no previous position -- no vector, rather than one divided by almost
  * nothing (point 154: thousands of pixels on geometry near the camera). */
-"  if (i.pc.w <= 1e-4 || i.qc.w <= 1e-4 || i.pc.z < 0.0) return o;\n"
+"  if (i.pc.w <= 1e-4 || i.qc.w <= 1e-4 || i.pc.z < 0.0) return float2(0.0, 0.0);\n"
 "  float2 p = i.pc.xy / i.pc.w, q = i.qc.xy / i.qc.w;\n"
-"  o.mv = (p - q) * float2(0.5, -0.5);\n"
-"  return o;\n"
+"  return (p - q) * float2(0.5, -0.5);\n"
 "}\n"
 /* RECOMP_MOTION, F6: the motion vectors instead of the picture, grey where
  * nothing moves, x in red, y in green, 1/20 of the screen to full colour. */
@@ -482,8 +460,6 @@ static int init(void)
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb_prev);
-        bd.ByteWidth = 16;
-        ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb_mvid);
     }
     fprintf(stderr, "  [D3D11] device ready: triangles are filled on the GPU, scale %u\n", S);
     {
@@ -737,8 +713,6 @@ static ID3D11DepthStencilView *depth_for(uint32_t w, uint32_t h)
 
 static void target_release(Target *t)
 {
-    if (t->id_rtv)   ID3D11RenderTargetView_Release(t->id_rtv);
-    if (t->id_tex)   ID3D11Texture2D_Release(t->id_tex);
     if (t->mv_srv)   ID3D11ShaderResourceView_Release(t->mv_srv);
     if (t->mv_rtv)   ID3D11RenderTargetView_Release(t->mv_rtv);
     if (t->mv_tex)   ID3D11Texture2D_Release(t->mv_tex);
@@ -2096,16 +2070,6 @@ static int mv_ready(Target *t)
     if (!t->mv_rtv || !t->mv_srv)
         return 0;
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, t->mv_rtv, zero);
-    if (motion_probe()) {
-        static const FLOAT none[4] = { 65535.0f, 0, 0, 0 };   /* converted: id 65535, none */
-        td.Format = DXGI_FORMAT_R32_UINT;
-        td.BindFlags = D3D11_BIND_RENDER_TARGET;
-        if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &t->id_tex)))
-            ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)t->id_tex, NULL,
-                                                &t->id_rtv);
-        if (t->id_rtv)
-            ID3D11DeviceContext_ClearRenderTargetView(s_ctx, t->id_rtv, none);
-    }
     fprintf(stderr, "  [D3D11] motion vectors for 0x%08X (%ux%u)\n", t->base, td.Width, td.Height);
     return 1;
 }
@@ -2124,26 +2088,7 @@ static void motion_pass(Target *t, const NvD3DProgramDraw *d, UINT first)
     memcpy(m.pData, d->prev_consts, 192 * 16);
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_prev, 0);
     dsv = depth_for(t->w * S, t->h * S);
-    if (t->id_rtv && s_mvtab_n < MVTAB_MAX) {
-        ID3D11RenderTargetView *two[2];
-        uint32_t id[4] = { 0, 0, 0, 0 };
-        id[0] = s_mvtab_n;
-        s_mvtab[s_mvtab_n].hash = d->prog_hash;
-        s_mvtab[s_mvtab_n].addr = d->pos_addr;
-        s_mvtab[s_mvtab_n].n = d->pos_n;
-        s_mvtab[s_mvtab_n].nindex = d->nindex;
-        s_mvtab_n++;
-        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_mvid, 0,
-                                              D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-            memcpy(m.pData, id, sizeof id);
-            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_mvid, 0);
-        }
-        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 5, 1, &s_cb_mvid);
-        two[0] = t->mv_rtv; two[1] = t->id_rtv;
-        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 2, two, dsv);
-    } else {
-        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &t->mv_rtv, dsv);
-    }
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &t->mv_rtv, dsv);
     s_bound_ui = -1;                            /* the next batch binds again */
     ID3D11DeviceContext_OMSetBlendState(s_ctx, s_blend_off, NULL, 0xFFFFFFFFu);
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_mv, 0);
@@ -2285,11 +2230,6 @@ void nvd3d_clear(uint32_t what, uint32_t argb, float depth, uint8_t stencil,
         if (t->mv_rtv) {                        /* and its motion: none yet */
             static const FLOAT zero[4] = { 0, 0, 0, 0 };
             ID3D11DeviceContext_ClearRenderTargetView(s_ctx, t->mv_rtv, zero);
-        }
-        if (t->id_rtv) {
-            static const FLOAT none[4] = { 65535.0f, 0, 0, 0 };
-            ID3D11DeviceContext_ClearRenderTargetView(s_ctx, t->id_rtv, none);
-            s_mvtab_n = 0;
         }
         c[0] = (FLOAT)((argb >> 16) & 0xFF) / 255.0f;
         c[1] = (FLOAT)((argb >>  8) & 0xFF) / 255.0f;
@@ -2631,8 +2571,6 @@ static void mv_stats(const Target *t)
     D3D11_MAPPED_SUBRESOURCE m;
     float v[64 * 48];
     uint32_t n = 0, x, y, moving = 0, wild = 0;
-    uint32_t wx[8], wy[8];
-    float wmx[8], wmy[8];
     const uint32_t w = t->w * S, h = t->h * S;
 
     if (!stage || sw != w || sh != h) {
@@ -2659,54 +2597,10 @@ static void mv_stats(const Target *t)
             const float my = half_to_float(row[at * 2 + 1]) * (float)h;
             const float len = sqrtf(mx * mx + my * my);
             if (len > 0.01f) moving++;
-            if (len > 500.0f && wild < 8) {
-                wx[wild] = at; wy[wild] = (y * 2 + 1) * h / 96;
-                wmx[wild] = mx; wmy[wild] = my;
-            }
             if (len > 500.0f) wild++;
             v[n++] = len;
         }
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)stage, 0);
-    /* RECOMP_MOTION_PROBE: which batch drew each wild point. */
-    if (wild && t->id_tex) {
-        static ID3D11Texture2D *istage;
-        static uint32_t iw, ih;
-        if (!istage || iw != w || ih != h) {
-            D3D11_TEXTURE2D_DESC td;
-            if (istage) ID3D11Texture2D_Release(istage);
-            istage = NULL;
-            ID3D11Texture2D_GetDesc(t->id_tex, &td);
-            td.Usage = D3D11_USAGE_STAGING;
-            td.BindFlags = 0;
-            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &istage)))
-                istage = NULL;
-            iw = w; ih = h;
-        }
-        if (istage) {
-            ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)istage,
-                                             (ID3D11Resource *)t->id_tex);
-            if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)istage, 0,
-                                                  D3D11_MAP_READ, 0, &m))) {
-                uint32_t k;
-                for (k = 0; k < wild && k < 8; k++) {
-                    const uint32_t id = ((const uint32_t *)((const uint8_t *)m.pData
-                                         + (size_t)wy[k] * m.RowPitch))[wx[k]];
-                    if (id < s_mvtab_n)
-                        fprintf(stderr, "  [MOTION] wild at %u,%u (%.0f,%.0f px): batch %u of %u,"
-                                        " prog %016llX addr 0x%08X n %u (%u indices)\n",
-                                wx[k], wy[k], wmx[k], wmy[k], id, s_mvtab_n,
-                                (unsigned long long)s_mvtab[id].hash, s_mvtab[id].addr,
-                                s_mvtab[id].n, s_mvtab[id].nindex);
-                    else
-                        fprintf(stderr, "  [MOTION] wild at %u,%u (%.0f,%.0f px): id %u"
-                                        " (no batch of this frame)\n",
-                                wx[k], wy[k], wmx[k], wmy[k], id);
-                }
-                ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)istage, 0);
-            }
-        }
-    }
     {
         int i, j;                                       /* small: insertion sort */
         for (i = 1; i < (int)n; i++) {

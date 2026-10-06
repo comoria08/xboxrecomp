@@ -2205,63 +2205,16 @@ static void comb_state(NvD3DState *st);   /* the combiners, with the vertex prog
  * orthographic one. Set per batch by ui_classify, from draw_primitive. */
 static int s_batch_ui;
 
-/* RECOMP_UI_LAYER_AB=<swaps>: the check without a player. Phases of that many
- * swaps turn the layer off and on in turn, with a snapshot in the middle of
- * each (<RECOMP_FB_SNAP>NNN_off.bmp, NNN_on.bmp). Within one run, so the two
- * are the same screen: an "on" no further from its "off" neighbours than they
- * are from each other is the layer adding nothing. Two separate runs drift
- * apart (the attract mode moves on at its own pace) and cannot be compared. */
-static uint32_t s_ui_ab, s_ui_ab_phase, s_ui_ab_end, s_ui_ab_snap;
-/* F8, under RECOMP_UI_LAYER: the layer off and on again, for the player to
- * check by eye at the same spot that nothing changes. */
-static int      s_ui_f8_off;
-
 static int ui_layer_on(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("RECOMP_UI_LAYER");
-        const char *ab = getenv("RECOMP_UI_LAYER_AB");
         const char *q = getenv("RECOMP_UI_43");       /* needs the layer (point 151) */
         const char *dl = getenv("RECOMP_DLSS");       /* so does DLSS (point 155) */
         on = (e && atoi(e) != 0) || (q && atoi(q) != 0) || (dl && atoi(dl) != 0);
-        if (ab && atoi(ab) > 0) {
-            s_ui_ab = (uint32_t)atoi(ab);
-            on = 1;
-        }
     }
-    return on && !s_ui_f8_off && (!s_ui_ab || (s_ui_ab_phase & 1));
-}
-
-extern void xbox_FramebufferSnapAsk(const char *path);
-
-static void ui_ab_tick(void)
-{
-    static int env = -1;
-    if (env < 0) {
-        const char *e = getenv("RECOMP_UI_LAYER");
-        const char *q = getenv("RECOMP_UI_43");
-        env = (e && atoi(e) != 0) || (q && atoi(q) != 0);
-    }
-    if (env && (GetAsyncKeyState(VK_F8) & 1)) {
-        s_ui_f8_off = !s_ui_f8_off;
-        fprintf(stderr, "  [UI] F8 swap %u : interface layer %s\n", s_gpu.flips,
-                s_ui_f8_off ? "OFF" : "ON");
-    }
-    if (!s_ui_ab)
-        return;
-    if (s_gpu.flips == s_ui_ab_snap && s_ui_ab_phase) {
-        const char *pre = getenv("RECOMP_FB_SNAP");
-        char path[512];
-        snprintf(path, sizeof path, "%s%03u_%s.bmp", pre ? pre : "ab_", s_ui_ab_phase,
-                 (s_ui_ab_phase & 1) ? "on" : "off");
-        xbox_FramebufferSnapAsk(path);
-    }
-    if (s_gpu.flips < s_ui_ab_end)
-        return;
-    s_ui_ab_phase++;
-    s_ui_ab_end = s_gpu.flips + s_ui_ab;
-    s_ui_ab_snap = s_gpu.flips + s_ui_ab / 2;
+    return on;
 }
 
 /* Everything about a batch that is not its vertices. Constant across a
@@ -4439,89 +4392,6 @@ static uint64_t vp_program_hash(void)
     return h;
 }
 
-/* RECOMP_SEP=1: can the 3D of a frame be told from its interface? (DLSS,
- * step 0.) An upscaler wants the scene alone, then the interface drawn over
- * it at the output size, so the executor would have to know where one ends.
- * Nothing is decided here: each batch gets a signature from what could
- * classify it -- transform mode, vertex program, depth test and write,
- * blending, the clip w of its first vertex (1 for pretransformed 2D, as
- * point 87 supposed) -- and the frame's batches are kept in order with the
- * surface they went to. Every 600 swaps the sequence drawn into the shown
- * surface is printed as runs of signatures, and the other surfaces (render
- * to texture) by count. Over every frame it counts how often a depth-tested
- * batch comes back after the first batch with the depth test off: if never,
- * "the interface is what follows the 3D" is a usable boundary.
- *
- * w1 (DLSS step 1, the projection): 1 when the first and the last vertex
- * both come out of the vertex program with w == 1 exactly, as an orthographic
- * projection gives; 0 when either does not, as a perspective one gives (w is
- * then the depth); 2 not measured (no vertex program, or no vertex). Taken in
- * draw_primitive, where every route ends, with the same vp_transform the GPU
- * path already runs on the first vertex of every batch it sends. */
-typedef struct {
-    uint64_t prog;
-    uint32_t mode, dt, dw, blend, w1, prim;
-    uint32_t main_batches, other_batches, first_flip;
-    float    w_lo, w_hi;                        /* of the first vertex, over all batches */
-} SepSig;
-
-#define SEP_MAX_SIGS   512
-#define SEP_MAX_FRAME  8192
-static SepSig   s_sep[SEP_MAX_SIGS];
-static uint32_t s_sep_count, s_sep_lost;
-static uint16_t s_sep_frame_sig[SEP_MAX_FRAME];
-static uint32_t s_sep_frame_tgt[SEP_MAX_FRAME];
-static uint32_t s_sep_frame_n, s_sep_frame_over;
-static uint32_t s_sep_frames, s_sep_frames_back, s_sep_frames_no2d, s_sep_frames_back_w1;
-static uint32_t s_sep_next = 60;
-
-/* A fight once stayed stuck loading while the first version of this probe ran
- * the vertex program from the END handler (point 147). Not shown to be the
- * cause: the GPU path runs the same vp_transform on every batch it draws. */
-static int sep_on(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("RECOMP_SEP");
-        on = e ? atoi(e) : 0;
-    }
-    return on;
-}
-
-/* RECOMP_SEP_CYCLE=<swaps>: is w == 1 the interface? Phases of that many
- * swaps go round three ways of drawing -- everything, everything but the
- * w == 1 batches, only the w == 1 batches -- and a snapshot is asked for in
- * the middle of each, named <RECOMP_FB_SNAP>NNN_ref.bmp, NNN_sans2d.bmp and
- * NNN_sans3d.bmp. Batches whose w was not measured go with the 3D. */
-extern void xbox_FramebufferSnapAsk(const char *path);
-static uint32_t s_sep_skip_class;               /* 0 none, 1 the w == 1 ones, 2 the others */
-static uint32_t s_sep_cycle, s_sep_phase, s_sep_phase_end, s_sep_snap_at;
-static uint32_t s_sep_w = 2;                    /* this batch's w1, from sep_w_probe */
-static float    s_sep_w0;
-
-/* From draw_primitive: measure w1, and say whether the cycle leaves it out. */
-static int sep_w_probe(void)
-{
-    VpVertex v;
-    uint32_t runs;
-
-    if (!sep_on() || !vp_active() || !s_gpu.idx_count)
-        return 0;
-    runs = s_vp.runs;
-    vp_transform(s_gpu.idx[0], &v);
-    if (v.ok) {
-        s_sep_w0 = v.w;
-        s_sep_w = v.w == 1.0f;
-        if (s_sep_w && s_gpu.idx_count > 1) {
-            vp_transform(s_gpu.idx[s_gpu.idx_count - 1], &v);
-            s_sep_w = v.ok && v.w == 1.0f;
-        }
-    }
-    s_vp.runs = runs;                           /* a probe, not vertices drawn */
-    return s_sep_skip_class == 1 ? s_sep_w == 1
-         : s_sep_skip_class == 2 ? s_sep_w != 1 : 0;
-}
-
 /* RECOMP_UI_LAYER: is this batch the interface? See s_batch_ui. */
 static void ui_classify(void)
 {
@@ -4583,161 +4453,6 @@ static void ui_classify(void)
         }
     }
     s_vp.runs = runs;                           /* not vertices drawn */
-}
-
-/* After the batch was drawn (or left out): its signature, and the frame list. */
-static int sep_batch(uint32_t route)
-{
-    SepSig s;
-    uint32_t i;
-
-    (void)route;
-    if (!sep_on())
-        return -1;
-    memset(&s, 0, sizeof s);
-    s.mode  = s_vp.mode;
-    s.prog  = vp_active() ? vp_program_hash() : 0;
-    s.dt    = s_gpu.depth_test != 0;
-    s.dw    = s_gpu.depth_mask != 0;
-    s.blend = s_gpu.blend_enable != 0;
-    s.prim  = s_gpu.prim;
-    s.w1    = s_sep_w;
-    s.w_lo  = s.w_hi = s_sep_w0;
-    for (i = 0; i < s_sep_count; i++) {
-        SepSig *e = &s_sep[i];
-        if (e->prog == s.prog && e->mode == s.mode && e->dt == s.dt && e->dw == s.dw
-                && e->blend == s.blend && e->w1 == s.w1 && e->prim == s.prim) {
-            if (s.w1 != 2) {
-                if (s_sep_w0 < e->w_lo) e->w_lo = s_sep_w0;
-                if (s_sep_w0 > e->w_hi) e->w_hi = s_sep_w0;
-            }
-            break;
-        }
-    }
-    if (i == s_sep_count) {
-        if (s_sep_count == SEP_MAX_SIGS) {
-            s_sep_lost++;
-            return -1;
-        }
-        s.first_flip = s_gpu.flips;
-        s_sep[s_sep_count++] = s;
-        fprintf(stderr, "  [SEP] new #%u swap %u  mode %u prog %016llX  depth test %u write %u"
-                        "  blend %u  w1 %u (w %g)  prim %u  surface 0x%08X  tex 0x%08X %ux%u\n",
-                i, s.first_flip, s.mode, (unsigned long long)s.prog, s.dt, s.dw, s.blend,
-                s.w1, s.w1 == 2 ? 0.0 : (double)s_sep_w0, s.prim,
-                dma_resolve(s_gpu.color_offset), s_gpu.tex.offset, s_gpu.tex.width,
-                s_gpu.tex.height);
-    }
-    if (s_sep_frame_n < SEP_MAX_FRAME) {
-        s_sep_frame_sig[s_sep_frame_n] = (uint16_t)i;
-        s_sep_frame_tgt[s_sep_frame_n] = dma_resolve(s_gpu.color_offset);
-        s_sep_frame_n++;
-    } else {
-        s_sep_frame_over++;
-    }
-    return (int)i;
-}
-
-static void sep_cycle(uint32_t shown)
-{
-    static const char *const name[3] = { "ref", "sans2d", "sans3d" };
-
-    (void)shown;
-    if (!s_sep_cycle) {
-        const char *e = getenv("RECOMP_SEP_CYCLE");
-        s_sep_cycle = e && atoi(e) > 0 ? (uint32_t)atoi(e) : 0xFFFFFFFFu;
-        s_sep_phase_end = s_gpu.flips + s_sep_cycle;
-    }
-    if (s_sep_cycle == 0xFFFFFFFFu)
-        return;
-    if (s_gpu.flips == s_sep_snap_at) {
-        const char *pre = getenv("RECOMP_FB_SNAP");
-        char path[512];
-        snprintf(path, sizeof path, "%s%03u_%s.bmp", pre ? pre : "sep_", s_sep_phase,
-                 name[s_sep_skip_class]);
-        xbox_FramebufferSnapAsk(path);
-        fprintf(stderr, "  [SEP] cycle phase %u swap %u : %s\n", s_sep_phase, s_gpu.flips, path);
-    }
-    if (s_gpu.flips < s_sep_phase_end)
-        return;
-    s_sep_phase++;
-    s_sep_phase_end = s_gpu.flips + s_sep_cycle;
-    s_sep_snap_at = s_gpu.flips + s_sep_cycle / 2;
-    s_sep_skip_class = s_sep_phase % 3;
-}
-
-/* At the swap: the shown surface is known now (the last one cleared). */
-static void sep_frame(uint32_t shown)
-{
-    uint32_t i, seen_2d = 0, back = 0, seen_w1 = 0, back_w1 = 0;
-
-    if (!sep_on())
-        return;
-    sep_cycle(shown);
-    for (i = 0; i < s_sep_frame_n; i++) {
-        SepSig *e = &s_sep[s_sep_frame_sig[i]];
-        if (s_sep_frame_tgt[i] != shown) {
-            e->other_batches++;
-            continue;
-        }
-        e->main_batches++;
-        if (!e->dt)
-            seen_2d = 1;
-        else if (seen_2d)
-            back = 1;
-        if (e->w1 == 1)
-            seen_w1 = 1;
-        else if (e->w1 == 0 && seen_w1)
-            back_w1 = 1;
-    }
-    s_sep_frames++;
-    s_sep_frames_back += back;
-    s_sep_frames_back_w1 += back_w1;
-    s_sep_frames_no2d += !seen_2d;
-
-    if (s_gpu.flips >= s_sep_next) {
-        static char line[8192];
-        size_t len = 0;
-        uint32_t run = 0, prev = 0xFFFFFFFFu, others = 0;
-        s_sep_next = s_gpu.flips + 600;
-        for (i = 0; i <= s_sep_frame_n; i++) {
-            uint32_t sig = 0xFFFFFFFEu;
-            if (i < s_sep_frame_n) {
-                if (s_sep_frame_tgt[i] != shown) { others++; continue; }
-                sig = s_sep_frame_sig[i];
-            }
-            if (sig == prev) { run++; continue; }
-            if (run && len + 24 < sizeof line) {
-                SepSig *e = &s_sep[prev];
-                len += (size_t)snprintf(line + len, sizeof line - len, " %s#%u x%u",
-                                        e->w1 == 1 ? "o" : e->w1 == 2 ? "?" : "", prev, run);
-            }
-            prev = sig;
-            run = 1;
-        }
-        line[len] = 0;
-        fprintf(stderr, "  [SEP] swap %u shown 0x%08X disp %ux%u  %u batches, %u to other"
-                        " surfaces%s  (o = w == 1, ? = w not measured):%s\n",
-                s_gpu.flips, shown, s_d3d_show_disp[0], s_d3d_show_disp[1], s_sep_frame_n,
-                others, s_sep_frame_over ? " TRUNCATED" : "", line);
-        fprintf(stderr, "  [SEP] %u frames: depth-tested batch after the first untested one in"
-                        " %u, no untested batch in %u; w!=1 after w==1 in %u; %u signatures,"
-                        " %u lost\n",
-                s_sep_frames, s_sep_frames_back, s_sep_frames_no2d, s_sep_frames_back_w1,
-                s_sep_count, s_sep_lost);
-        {
-            static char wl[SEP_MAX_SIGS * 40];
-            size_t wn = 0;
-            for (i = 0; i < s_sep_count && wn + 40 < sizeof wl; i++)
-                if (s_sep[i].w1 != 2)
-                    wn += (size_t)snprintf(wl + wn, sizeof wl - wn, " #%u:%g..%g", i,
-                                           (double)s_sep[i].w_lo, (double)s_sep[i].w_hi);
-            wl[wn] = 0;
-            fprintf(stderr, "  [SEP] w of the first vertex per signature:%s\n", wl);
-        }
-    }
-    s_sep_frame_n = 0;
-    s_sep_frame_over = 0;
 }
 
 static uint8_t *s_vpg_data;
@@ -4950,9 +4665,6 @@ typedef struct {
 static MotionObj *s_motion;
 static float      s_motion_prev[VP_CONSTANTS][4];
 static uint32_t   s_motion_found, s_motion_new, s_motion_full;
-/* For RECOMP_MOTION_PROBE: what the last motion_prev decided. */
-static uint32_t   s_mp_candidates, s_mp_matched;
-static float      s_mp_best;
 
 static int motion_on(void)
 {
@@ -4989,7 +4701,6 @@ static const float (*motion_prev(uint64_t prog))[4]
      * a fight (point 154): matched by rank alone, a few points moved by
      * thousands of pixels while the scene stood still -- the crowd draws one
      * mesh many times, in an order that changes from frame to frame. */
-    s_mp_candidates = 0;
     {
         float best = 3.4e38f;
         MotionObj *stale = NULL;
@@ -5004,7 +4715,6 @@ static const float (*motion_prev(uint64_t prog))[4]
                 if (e->frame + 1 == frame) {
                     float dsum = 0.0f;
                     uint32_t i;
-                    s_mp_candidates++;
                     const float *a = &e->c[0][0], *b = &s_vp.c[0][0];
                     for (i = 0; i < VP_CONSTANTS * 4 && dsum < best; i++)
                         dsum += fabsf(a[i] - b[i]);
@@ -5021,9 +4731,7 @@ static const float (*motion_prev(uint64_t prog))[4]
         }
         if (!o)
             o = stale;
-        s_mp_best = best;
     }
-    s_mp_matched = o && o->frame + 1 == frame;
     if (o && o->frame + 1 == frame) {
         memcpy(s_motion_prev, o->c, sizeof s_motion_prev);
         s_motion_found++;
@@ -5041,21 +4749,6 @@ static const float (*motion_prev(uint64_t prog))[4]
     }
     memcpy(o->c, s_vp.c, sizeof o->c);
     o->frame = frame;
-    {
-        /* RECOMP_MOTION_SELFTEST=1: the previous constants scaled by 1.01, so
-         * that every batch "moves" -- the check, without a player, that the
-         * motion pass gives something other than zero. Diagnosis only. */
-        static int self = -1;
-        if (self < 0)
-            self = getenv("RECOMP_MOTION_SELFTEST") != NULL;
-        if (self) {
-            uint32_t i, j;
-            for (i = 0; i < VP_CONSTANTS; i++)
-                if (i != 59)                            /* the viewport stays */
-                    for (j = 0; j < 4; j++)
-                        s_motion_prev[i][j] *= 1.01f;
-        }
-    }
     {
         static uint32_t said_at;
         if (s_gpu.flips >= said_at) {
@@ -5239,51 +4932,6 @@ static int vp_gpu_batch(int textured_src)
             d.motion = 1;
             d.vs_motion = vm;
             d.prev_consts = motion_prev(hash);
-            d.prog_hash = hash;
-            d.pos_addr = s_gpu.attr[0].offset;
-            d.pos_n = s_gpu.idx_count;
-            /* RECOMP_MOTION_PROBE=1: the first vertex run on the CPU with
-             * these constants and with the previous ones; a batch whose
-             * vertex jumps by more than 60 displayed pixels is described
-             * (point 154: about 1% of the points moved by thousands). */
-            {
-                static int probe = -1;
-                static uint32_t said;
-                if (probe < 0)
-                    probe = getenv("RECOMP_MOTION_PROBE") != NULL;
-                if (probe && said < 80) {
-                    static float save[VP_CONSTANTS][4];
-                    VpVertex cur, prv;
-                    const uint32_t runs = s_vp.runs;
-                    vp_transform(s_gpu.idx[0], &cur);
-                    memcpy(save, s_vp.c, sizeof save);
-                    memcpy(s_vp.c, d.prev_consts, sizeof save);
-                    vp_transform(s_gpu.idx[0], &prv);
-                    memcpy(s_vp.c, save, sizeof save);
-                    s_vp.runs = runs;
-                    if (cur.ok && prv.ok) {
-                        const float dx = prv.xy[0] - cur.xy[0], dy = prv.xy[1] - cur.xy[1];
-                        const float len = sqrtf(dx * dx + dy * dy);
-                        if (len > 60.0f) {
-                            uint32_t ci, ndiff = 0, first = 0xFFFFFFFFu;
-                            for (ci = 0; ci < VP_CONSTANTS; ci++)
-                                if (memcmp(save[ci], d.prev_consts[ci], 16)) {
-                                    if (first == 0xFFFFFFFFu) first = ci;
-                                    ndiff++;
-                                }
-                            said++;
-                            fprintf(stderr, "  [MOTION] jump swap %u prog %016llX n %u addr 0x%08X:"
-                                            " %.0f px (%.0f,%.0f -> %.0f,%.0f) w %.2f -> %.2f;"
-                                            " candidates %u matched %u distance %.1f;"
-                                            " constants differing %u from c%u\n",
-                                    s_gpu.flips, (unsigned long long)hash, s_gpu.idx_count,
-                                    s_gpu.attr[0].offset, len, prv.xy[0], prv.xy[1],
-                                    cur.xy[0], cur.xy[1], prv.w, cur.w, s_mp_candidates,
-                                    s_mp_matched, s_mp_best, ndiff, first);
-                        }
-                    }
-                }
-            }
         }
     }
     nvd3d_draw_program(&d, &st);
@@ -5676,72 +5324,6 @@ static void raster_batch(void)
  * question is what space attribute 0 arrives in: a title running a vertex
  * program hands over object-space positions that mean nothing without running
  * it, while pre-transformed screen-space coordinates can be drawn directly. */
-/* RECOMP_SEP: the quads of program 55F6628D2D8CC1F8 (point 147: a full-screen
- * one after the 3D darkens the corners -- but the same program also draws the
- * 3D effects, additively). Each new texture, vertex count and blend is
- * described once -- texture address, format, size, the
- * range of the raw positions -- and with RECOMP_SEP_DUMP=<prefix> the texture
- * is written out (<prefix>NN_<address>_fmtFF.bmp). Read only: positions are fetched, the
- * program is not run. */
-static void sep_quad_probe(void)
-{
-    /* Keyed by texture and blend only: the particle systems of the effects
-     * atlas (point 147) change their vertex count and extent every frame, and
-     * with either in the key they filled the table by themselves, twice. */
-    static struct { uint32_t tex, n, src, dst, batches; } seen[128];
-    static uint32_t nseen, next_report = 600;
-    float p[4], lo[2] = { 1e30f, 1e30f }, hi[2] = { -1e30f, -1e30f };
-    uint32_t i;
-
-    if (!sep_on() || s_gpu.prim != 8 || !vp_active()
-            || vp_program_hash() != 0x55F6628D2D8CC1F8ull)
-        return;
-    for (i = 0; i < s_gpu.idx_count; i++) {
-        if (!fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], p))
-            continue;
-        if (p[0] < lo[0]) lo[0] = p[0];
-        if (p[1] < lo[1]) lo[1] = p[1];
-        if (p[0] > hi[0]) hi[0] = p[0];
-        if (p[1] > hi[1]) hi[1] = p[1];
-    }
-    if (s_gpu.flips >= next_report && nseen) {
-        static char line[128 * 32];
-        size_t len = 0;
-        next_report = s_gpu.flips + 1200;
-        for (i = 0; i < nseen && len + 32 < sizeof line; i++)
-            len += (size_t)snprintf(line + len, sizeof line - len, " #%u:%u(max %u v)", i,
-                                    seen[i].batches, seen[i].n);
-        fprintf(stderr, "  [SEP] quads swap %u, batches per entry:%s\n", s_gpu.flips, line);
-    }
-    for (i = 0; i < nseen; i++)
-        if (seen[i].tex == s_gpu.tex.offset
-                && seen[i].src == s_gpu.blend_sfactor && seen[i].dst == s_gpu.blend_dfactor) {
-            seen[i].batches++;
-            if (s_gpu.idx_count > seen[i].n)
-                seen[i].n = s_gpu.idx_count;    /* the most vertices seen */
-            return;
-        }
-    if (nseen == 128)
-        return;
-    seen[nseen].tex = s_gpu.tex.offset;
-    seen[nseen].n = s_gpu.idx_count;
-    seen[nseen].src = s_gpu.blend_sfactor;
-    seen[nseen].dst = s_gpu.blend_dfactor;
-    seen[nseen].batches = 1;
-    nseen++;
-    fprintf(stderr, "  [SEP] quad #%u swap %u  tex 0x%08X fmt 0x%02X %ux%u  %u vertices"
-                    "  x %.1f..%.1f  y %.1f..%.1f  blend %u src 0x%X dst 0x%X  surface 0x%08X\n",
-            nseen - 1, s_gpu.flips, s_gpu.tex.offset, s_gpu.tex.color, s_gpu.tex.width,
-            s_gpu.tex.height, s_gpu.idx_count, lo[0], hi[0], lo[1], hi[1],
-            s_gpu.blend_enable, s_gpu.blend_sfactor, s_gpu.blend_dfactor,
-            dma_resolve(s_gpu.color_offset));
-    {
-        const char *pre = getenv("RECOMP_SEP_DUMP");
-        if (pre)
-            dump_texture_bmp_to(pre, nseen - 1);
-    }
-}
-
 static void draw_primitive(void)
 {
     float v[4];
@@ -5749,9 +5331,6 @@ static void draw_primitive(void)
 
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
-    sep_quad_probe();
-    if (sep_w_probe())
-        return;                                 /* RECOMP_SEP_CYCLE leaves it out */
     ui_classify();
     s_gpu.draws++;
     if ((s_gpu.draws % 200) == 0)
@@ -6198,11 +5777,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 invent_batch(1, s_gpu.inline_count);
             else
                 invent_batch(s_gpu.idx_count ? 0 : 3, s_gpu.idx_count);
-            {
-                uint32_t route = s_gpu.imm_count ? 2 : s_gpu.inline_count ? 1
-                               : s_gpu.idx_count ? 0 : 3;
-                s_sep_w = 2;                    /* set by draw_primitive, if it runs */
-                s_batch_ui = 0;                 /* likewise */
+            s_batch_ui = 0;                     /* set by draw_primitive, if it runs */
             if (s_gpu.imm_count)
                 draw_immediate();
             else if (s_gpu.inline_count)
@@ -6213,8 +5788,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 /* Opened, closed, and nothing in between: the title asked for
                  * a batch by a route this executor did not understand. */
                 s_gpu.begins_empty++;
-                sep_batch(route);
-            }
             s_gpu.prim = 0;
             s_gpu.inline_count = 0;
             s_gpu.imm_count = 0;
@@ -6347,9 +5920,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
-        sep_frame(s_d3d_show_base);
-        ui_layer_on();                          /* reads RECOMP_UI_LAYER_AB once */
-        ui_ab_tick();
         if (nvd3d_active() && s_d3d_show_base) {
             nvd3d_present(s_d3d_show_base, s_d3d_show_rect,
                           s_d3d_show_disp[0], s_d3d_show_disp[1]);
