@@ -51,7 +51,27 @@ static ID3D11Device         *s_dev;
 static ID3D11DeviceContext  *s_ctx;
 static ID3D11DeviceContext1 *s_ctx1;
 static ID3D11VertexShader   *s_vs, *s_vs_present;
-static ID3D11PixelShader    *s_ps, *s_ps_present;
+static ID3D11PixelShader    *s_ps, *s_ps_present, *s_ps_ui, *s_ps_depth, *s_ps_mv, *s_ps_mvview;
+static ID3D11DepthStencilState *s_ds_mv;          /* LESS_EQUAL, no write */
+static ID3D11Buffer         *s_cb_prev;           /* b4: the previous constants */
+static uint32_t              s_mv_batches;
+/* RECOMP_MOTION_PROBE: the frame's motion batches, by the id each pixel got. */
+#define MVTAB_MAX 8192
+static struct { uint64_t hash; uint32_t addr, n, nindex; } s_mvtab[MVTAB_MAX];
+static uint32_t              s_mvtab_n;
+static ID3D11Buffer         *s_cb_mvid;           /* b5 */
+
+static int motion_probe(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_MOTION_PROBE") != NULL;
+    return on;
+}
+static ID3D11BlendState     *s_blend_ui_comp;   /* C + dst * T */
+static ID3D11Buffer         *s_cb_ui;
+static int                   s_bound_ui;        /* the layer is what is bound */
+static uint32_t              s_ui_batches, s_ui_fallback, s_ui_composites;
 static ID3D11InputLayout    *s_layout;
 static ID3D11Buffer         *s_vb, *s_cb, *s_cb_present;
 static ID3D11RasterizerState *s_rs;
@@ -77,6 +97,21 @@ typedef struct {
     ID3D11Texture2D        *copy;         /* for sampling it as a texture */
     ID3D11ShaderResourceView *copy_srv;
     uint32_t                used;
+    /* The interface layer (NvD3DState.layer): colour C and the scene's
+     * transmittance T, so that the target seen by anyone is scene * T + C.
+     * ui_dirty: something was drawn into it since the last composite. */
+    ID3D11Texture2D        *ui_tex;
+    ID3D11RenderTargetView *ui_rtv;
+    ID3D11ShaderResourceView *ui_srv;
+    int                     ui_dirty;
+    /* DLSS step 3: where each pixel of the 3D was in the previous frame,
+     * in uv (R16G16), written by the motion pass. */
+    ID3D11Texture2D        *mv_tex;
+    ID3D11RenderTargetView *mv_rtv;
+    ID3D11ShaderResourceView *mv_srv;
+    /* RECOMP_MOTION_PROBE: which motion batch of the frame drew each pixel. */
+    ID3D11Texture2D        *id_tex;
+    ID3D11RenderTargetView *id_rtv;
 } Target;
 static Target   s_rt[MAX_TARGETS];
 static int      s_rt_count;
@@ -87,6 +122,7 @@ typedef struct {
     uint32_t w, h;
     ID3D11Texture2D        *tex;
     ID3D11DepthStencilView *dsv;
+    ID3D11ShaderResourceView *srv;       /* the depth, readable (DLSS step 2) */
 } Depth;
 static Depth s_depth[4];
 static int   s_depth_count;
@@ -128,8 +164,11 @@ static const char s_hlsl[] =
 "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; float4 col : COLOR0; };\n"
 "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; float4 col : COLOR0;\n"
 "               float clip : SV_ClipDistance0; };\n"
+/* vextra.zw: the frame's jitter in NDC (DLSS step 2), 0 unless RECOMP_JITTER. */
+"cbuffer DrawV : register(b0) { float4 vtex; float4 vatest; float4 vextra; };\n"
 "VSOut vs_main(VSIn i) {\n"
 "  VSOut o; o.pos = i.pos; o.uv = i.uv; o.col = i.col;\n"
+"  o.pos.xy += vextra.zw * i.pos.w;\n"
 "  o.clip = i.pos.z;   /* the near plane: window z >= 0; no far plane */\n"
 "  return o;\n"
 "}\n"
@@ -199,6 +238,60 @@ static const char s_hlsl[] =
 "      acc += pow(max(src.SampleLevel(lin, uv + o, 0).rgb, 0.0), 2.2);\n"
 "    }\n"
 "  return float4(pow(acc / (float)(n.x * n.y), 1.0 / 2.2), 1.0);\n"
+"}\n"
+/* The interface layer onto its target: (C, T) out, blended as C + dst * T
+ * (see ui_composite). uik.x 1: pixel for pixel. Below 1 (RECOMP_UI_43): the
+ * layer squeezed that much across the middle, so that a picture presented
+ * stretched to 16:9 shows the interface at its own 4:3 proportions; outside
+ * it, nothing (C 0, T 1). Bilinear on (C, T), which are premultiplied. */
+"cbuffer Ui : register(b0) { float4 uik; };\n"
+"Texture2D uil : register(t0);\n"
+/* RECOMP_DEPTH_VIEW, F7: the depth instead of the picture. D24 crowds a
+ * perspective scene near 1, so it is spread on a log scale: near is white. */
+"Texture2D<float> dep : register(t0);\n"
+/* DLSS step 3: the motion pass. Its vertex shader is a translated program's
+ * motion variant (VSOutM), which gives where the vertex was (pc) and where it
+ * is (qc), both unjittered, in clip space. Written in uv, pointing from the
+ * current pixel to the previous one. */
+"struct MIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; float4 col : COLOR0;\n"
+"             float clip : SV_ClipDistance0; float4 col1 : COLOR1;\n"
+"             float4 uv1 : TEXCOORD1; float4 uv2 : TEXCOORD2; float4 uv3 : TEXCOORD3;\n"
+"             float4 pc : TEXCOORD4; float4 qc : TEXCOORD5; };\n"
+/* SV_Target1 (RECOMP_MOTION_PROBE only, unbound otherwise): which motion
+ * batch of the frame drew the pixel, from mvid. */
+"cbuffer MvId : register(b5) { uint4 mvid; };\n"
+"struct MOut { float2 mv : SV_Target0; uint id : SV_Target1; };\n"
+"MOut ps_mv(MIn i) {\n"
+"  MOut o; o.id = mvid.x; o.mv = float2(0.0, 0.0);\n"
+/* Where it was lay before the near plane (window z < 0, what the clip
+ * distance cuts away now), or behind the eye: it was not drawn then, so it has
+ * no previous position -- no vector, rather than one divided by almost
+ * nothing (point 154: thousands of pixels on geometry near the camera). */
+"  if (i.pc.w <= 1e-4 || i.qc.w <= 1e-4 || i.pc.z < 0.0) return o;\n"
+"  float2 p = i.pc.xy / i.pc.w, q = i.qc.xy / i.qc.w;\n"
+"  o.mv = (p - q) * float2(0.5, -0.5);\n"
+"  return o;\n"
+"}\n"
+/* RECOMP_MOTION, F6: the motion vectors instead of the picture, grey where
+ * nothing moves, x in red, y in green, 1/20 of the screen to full colour. */
+"Texture2D<float2> mvt : register(t0);\n"
+"float4 ps_mvview(POut i) : SV_Target {\n"
+"  float2 uv = rect.xy + i.uv * rect.zw;\n"
+"  float2 m = mvt.SampleLevel(lin, uv, 0);\n"
+"  return float4(saturate(0.5 + m * 10.0), 0.5, 1.0);\n"
+"}\n"
+"float4 ps_depth(POut i) : SV_Target {\n"
+"  float2 uv = rect.xy + i.uv * rect.zw;\n"
+"  float d = dep.SampleLevel(lin, uv, 0);\n"
+"  float v = saturate(-log2(max(1.0 - d, 1e-7)) / 23.0);\n"
+"  return float4(1.0 - v, 1.0 - v, 1.0 - v, 1.0);\n"
+"}\n"
+"float4 ps_ui(POut i) : SV_Target {\n"
+"  if (uik.x >= 1.0) return uil.Load(int3(i.pos.xy, 0));\n"
+"  float2 uv = i.pos.xy / uik.yz;\n"
+"  uv.x = 0.5 + (uv.x - 0.5) / uik.x;\n"
+"  if (uv.x < 0.0 || uv.x > 1.0) return float4(0, 0, 0, 1);\n"
+"  return uil.SampleLevel(lin, uv, 0);\n"
 "}\n";
 
 static ID3DBlob *compile(const char *entry, const char *target)
@@ -256,6 +349,32 @@ static int init(void)
     ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(psp),
                                    ID3D10Blob_GetBufferSize(psp), NULL, &s_ps_present);
     {
+        ID3DBlob *psu = compile("ps_ui", "ps_5_0");
+        ID3DBlob *psd = compile("ps_depth", "ps_5_0");
+        ID3DBlob *psm = compile("ps_mv", "ps_5_0");
+        ID3DBlob *psv = compile("ps_mvview", "ps_5_0");
+        if (psm) {
+            ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(psm),
+                                           ID3D10Blob_GetBufferSize(psm), NULL, &s_ps_mv);
+            ID3D10Blob_Release(psm);
+        }
+        if (psv) {
+            ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(psv),
+                                           ID3D10Blob_GetBufferSize(psv), NULL, &s_ps_mvview);
+            ID3D10Blob_Release(psv);
+        }
+        if (psu) {
+            ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(psu),
+                                           ID3D10Blob_GetBufferSize(psu), NULL, &s_ps_ui);
+            ID3D10Blob_Release(psu);
+        }
+        if (psd) {
+            ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(psd),
+                                           ID3D10Blob_GetBufferSize(psd), NULL, &s_ps_depth);
+            ID3D10Blob_Release(psd);
+        }
+    }
+    {
         const D3D11_INPUT_ELEMENT_DESC el[] = {
             { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
             { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
@@ -279,6 +398,7 @@ static int init(void)
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb);
         ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb_present);
+        ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb_ui);
     }
     {
         D3D11_RASTERIZER_DESC rd;
@@ -326,9 +446,30 @@ static int init(void)
         bd.RenderTarget[0].BlendOp = bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
         bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
         ID3D11Device_CreateBlendState(s_dev, &bd, &s_blend_off);
+        bd.RenderTarget[0].BlendEnable = TRUE;
+        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;          /* C */
+        bd.RenderTarget[0].DestBlend = D3D11_BLEND_SRC_ALPHA;   /* + dst * T */
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;    /* the target's alpha */
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;    /* is left as it is */
+        ID3D11Device_CreateBlendState(s_dev, &bd, &s_blend_ui_comp);
         memset(&dd, 0, sizeof dd);
         dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
         ID3D11Device_CreateDepthStencilState(s_dev, &dd, &s_ds_off);
+        dd.DepthEnable = TRUE;                          /* the motion pass */
+        dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+        dd.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+        ID3D11Device_CreateDepthStencilState(s_dev, &dd, &s_ds_mv);
+    }
+    {
+        D3D11_BUFFER_DESC bd;
+        memset(&bd, 0, sizeof bd);
+        bd.ByteWidth = 192 * 16;
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb_prev);
+        bd.ByteWidth = 16;
+        ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb_mvid);
     }
     fprintf(stderr, "  [D3D11] device ready: triangles are filled on the GPU, scale %u\n", S);
     {
@@ -404,12 +545,39 @@ static D3D11_BLEND blend_factor(uint32_t f, int alpha)
     }
 }
 
+/* The interface layer holds (C, T) and the target is read as scene * T + C.
+ * A blend dst' = src * Fs + dst * Fd keeps that exact when Fd is the same
+ * scalar for every channel and Fs does not read the destination: then
+ * C' = src * Fs + C * Fd and T' = T * Fd. This gives the factor T is
+ * multiplied by (as a D3D11 alpha factor), or 0 when the blend cannot be
+ * layered -- a destination read, or a per-channel Fd -- and the batch is
+ * then drawn into the target itself, as before. Blending off is Fd = 0. */
+static D3D11_BLEND ui_t_factor(const NvD3DState *st)
+{
+    if (!st->blend_enable)
+        return D3D11_BLEND_ZERO;
+    switch (st->blend_src) {
+    case 0x0304: case 0x0305: case 0x0306: case 0x0307: case 0x0308:
+        return (D3D11_BLEND)0;                  /* Fs reads the destination */
+    default: break;
+    }
+    switch (st->blend_dst) {
+    case 0x0000: return D3D11_BLEND_ZERO;
+    case 0x0001: return D3D11_BLEND_ONE;
+    case 0x0302: return D3D11_BLEND_SRC_ALPHA;
+    case 0x0303: return D3D11_BLEND_INV_SRC_ALPHA;
+    case 0x8003: return D3D11_BLEND_BLEND_FACTOR;      /* constant alpha: bf is */
+    case 0x8004: return D3D11_BLEND_INV_BLEND_FACTOR;  /* that alpha everywhere */
+    default:     return (D3D11_BLEND)0;
+    }
+}
+
 static ID3D11BlendState *blend_state(const NvD3DState *st)
 {
     uint32_t k[7];
     int i;
     k[0] = st->blend_enable; k[1] = st->blend_src; k[2] = st->blend_dst;
-    k[3] = st->blend_eq; k[4] = st->color_mask; k[5] = 0; k[6] = 0;
+    k[3] = st->blend_eq; k[4] = st->color_mask; k[5] = st->layer != 0; k[6] = 0;
     if (!st->blend_enable)
         k[1] = k[2] = k[3] = 0;
     for (i = 0; i < s_nblends; i++)
@@ -445,6 +613,21 @@ static ID3D11BlendState *blend_state(const NvD3DState *st)
         if (st->color_mask & 0x00000100u) mask |= D3D11_COLOR_WRITE_ENABLE_GREEN;
         if (st->color_mask & 0x00000001u) mask |= D3D11_COLOR_WRITE_ENABLE_BLUE;
         if (st->color_mask & 0x01000000u) mask |= D3D11_COLOR_WRITE_ENABLE_ALPHA;
+        if (st->layer) {
+            /* Colour as the title asked, in C; alpha carries T. A batch that
+             * writes no colour (depth or stencil only) leaves both alone. */
+            t->BlendEnable = TRUE;
+            if (!st->blend_enable) {
+                t->SrcBlend = D3D11_BLEND_ONE;
+                t->DestBlend = D3D11_BLEND_ZERO;
+                t->BlendOp = D3D11_BLEND_OP_ADD;
+            }
+            t->SrcBlendAlpha = D3D11_BLEND_ZERO;
+            t->DestBlendAlpha = ui_t_factor(st);
+            t->BlendOpAlpha = D3D11_BLEND_OP_ADD;
+            mask = (mask & D3D11_COLOR_WRITE_ENABLE_ALL & ~D3D11_COLOR_WRITE_ENABLE_ALPHA)
+                 ? (UINT8)(mask | D3D11_COLOR_WRITE_ENABLE_ALPHA) : (UINT8)0;
+        }
         t->RenderTargetWriteMask = mask;
         ID3D11Device_CreateBlendState(s_dev, &bd, &o);
         if (s_nblends < MAX_STATES) {
@@ -509,13 +692,27 @@ static ID3D11DepthStencilView *depth_for(uint32_t w, uint32_t h)
         Depth *d = &s_depth[s_depth_count];
         memset(&td, 0, sizeof td);
         td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        /* Typeless, so that the same depth can also be read by a shader:
+         * an upscaler wants it (DLSS step 2), and RECOMP_DEPTH_VIEW shows it. */
+        td.Format = DXGI_FORMAT_R24G8_TYPELESS;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &d->tex)))
             return NULL;
-        ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)d->tex, NULL, &d->dsv);
+        {
+            D3D11_DEPTH_STENCIL_VIEW_DESC dv;
+            D3D11_SHADER_RESOURCE_VIEW_DESC sv;
+            memset(&dv, 0, sizeof dv);
+            dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+            ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)d->tex, &dv, &d->dsv);
+            memset(&sv, 0, sizeof sv);
+            sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+            sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            sv.Texture2D.MipLevels = 1;
+            ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)d->tex, &sv, &d->srv);
+        }
         d->w = w; d->h = h;
         ID3D11DeviceContext_ClearDepthStencilView(s_ctx, d->dsv,
             D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
@@ -526,6 +723,14 @@ static ID3D11DepthStencilView *depth_for(uint32_t w, uint32_t h)
 
 static void target_release(Target *t)
 {
+    if (t->id_rtv)   ID3D11RenderTargetView_Release(t->id_rtv);
+    if (t->id_tex)   ID3D11Texture2D_Release(t->id_tex);
+    if (t->mv_srv)   ID3D11ShaderResourceView_Release(t->mv_srv);
+    if (t->mv_rtv)   ID3D11RenderTargetView_Release(t->mv_rtv);
+    if (t->mv_tex)   ID3D11Texture2D_Release(t->mv_tex);
+    if (t->ui_srv)   ID3D11ShaderResourceView_Release(t->ui_srv);
+    if (t->ui_rtv)   ID3D11RenderTargetView_Release(t->ui_rtv);
+    if (t->ui_tex)   ID3D11Texture2D_Release(t->ui_tex);
     if (t->copy_srv) ID3D11ShaderResourceView_Release(t->copy_srv);
     if (t->copy)     ID3D11Texture2D_Release(t->copy);
     if (t->srv)      ID3D11ShaderResourceView_Release(t->srv);
@@ -623,6 +828,7 @@ uint32_t nvd3d_target(uint32_t base, uint32_t width, uint32_t height)
     {
         ID3D11DepthStencilView *dsv = depth_for(s_rt[i].w * S, s_rt[i].h * S);
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_rt[i].rtv, dsv);
+        s_bound_ui = 0;
     }
     return s_rt[i].h;
 }
@@ -1186,13 +1392,283 @@ static void bind_combiners(const NvD3DState *st)
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 3, 1, &s_cb_comb);
 }
 
+/* ── The interface layer (DLSS step 1) ───────────────────────────────────
+ *
+ * Batches the executor marks as interface (NvD3DState.layer) go into a layer
+ * of their target's size, with the target's own depth buffer -- so depth and
+ * stencil tests come out exactly as before -- holding (C, T): what they drew,
+ * and how much of the scene still shows through. Anything that reads the
+ * target composites the layer first (ui_composite): the present, a readback,
+ * the target sampled as a texture, a colour clear. What it reads is then
+ * scene * T + C, which is the sequential result for every blend ui_t_factor
+ * accepts, since the interface comes after all the 3D (point 149). Half-float,
+ * so C and T do not add a rounding of their own to the title's 8 bits. */
+static int ui_layer_ready(Target *t)
+{
+    D3D11_TEXTURE2D_DESC td;
+    static const FLOAT clear[4] = { 0, 0, 0, 1 };
+
+    if (t->ui_rtv)
+        return 1;
+    memset(&td, 0, sizeof td);
+    td.Width = t->w * S; td.Height = t->h * S; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &t->ui_tex)))
+        return 0;
+    ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)t->ui_tex, NULL, &t->ui_rtv);
+    ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t->ui_tex, NULL, &t->ui_srv);
+    if (!t->ui_rtv || !t->ui_srv)
+        return 0;
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, t->ui_rtv, clear);
+    fprintf(stderr, "  [D3D11] interface layer for 0x%08X (%ux%u)\n", t->base, td.Width, td.Height);
+    return 1;
+}
+
+/* ── DLSS step 2: the jitter ─────────────────────────────────────────────
+ *
+ * RECOMP_JITTER=1: the 3D of the shown surface moves by a sub-pixel offset
+ * that changes every frame, the Halton (2, 3) sequence over 16 frames, as an
+ * upscaler wants. Never the interface (layer 1): it is drawn after the
+ * upscale and must stay still. In pixels of the target as drawn (w * S),
+ * given to the vertex shaders in NDC. RECOMP_JITTER_SCALE=<n> multiplies it,
+ * so that it can be seen with the eye: the 3D shakes, the interface does not. */
+/* The scene's depth, kept for the upscaler. Measured in a fight (point 152):
+ * at the present the depth buffer is entirely cleared -- the title clears it
+ * after the 3D, before the interface. So it is copied when a depth clear
+ * comes after 3D was drawn on the shown surface, or at the present if none
+ * did. */
+static ID3D11Texture2D          *s_sdepth;
+static ID3D11ShaderResourceView *s_sdepth_srv;
+static uint32_t                  s_sdepth_w, s_sdepth_h;
+static int                       s_scene_drawn;     /* 3D on the shown surface since */
+static uint32_t                  s_sdepth_at_clear, s_sdepth_at_present, s_sdepth_this_frame;
+static uint32_t                  s_sdepth_hist[4];  /* frames by copies: 0, 1, 2, more */
+
+static void scene_depth_capture(const Target *t)
+{
+    int k;
+    for (k = 0; k < s_depth_count; k++)
+        if (s_depth[k].w == t->w * S && s_depth[k].h == t->h * S)
+            break;
+    if (k == s_depth_count)
+        return;
+    if (!s_sdepth || s_sdepth_w != s_depth[k].w || s_sdepth_h != s_depth[k].h) {
+        D3D11_TEXTURE2D_DESC td;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv;
+        if (s_sdepth_srv) ID3D11ShaderResourceView_Release(s_sdepth_srv);
+        if (s_sdepth) ID3D11Texture2D_Release(s_sdepth);
+        s_sdepth = NULL; s_sdepth_srv = NULL;
+        ID3D11Texture2D_GetDesc(s_depth[k].tex, &td);
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_sdepth)))
+            return;
+        memset(&sv, 0, sizeof sv);
+        sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = 1;
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_sdepth, &sv, &s_sdepth_srv);
+        s_sdepth_w = s_depth[k].w; s_sdepth_h = s_depth[k].h;
+    }
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_sdepth,
+                                     (ID3D11Resource *)s_depth[k].tex);
+    s_scene_drawn = 0;
+    s_sdepth_this_frame++;
+}
+
+static float    s_jit[2];               /* this batch's, in NDC */
+static float    s_jit_px[2];            /* this frame's, in target pixels */
+static uint32_t s_jit_frame, s_main_base;
+
+static float halton(uint32_t i, uint32_t b)
+{
+    float f = 1.0f, r = 0.0f;
+    while (i) {
+        f /= (float)b;
+        r += f * (float)(i % b);
+        i /= b;
+    }
+    return r;
+}
+
+static float jitter_scale(void)
+{
+    static float on = -1.0f;
+    if (on < 0.0f) {
+        const char *e = getenv("RECOMP_JITTER");
+        const char *s = getenv("RECOMP_JITTER_SCALE");
+        on = (e && atoi(e) != 0) ? (s ? (float)atof(s) : 1.0f) : 0.0f;
+        if (on > 0.0f)
+            fprintf(stderr, "  [D3D11] jitter on: Halton (2,3), 16 frames, scale %g\n", on);
+    }
+    return on;
+}
+
+/* At each present: the next offset of the sequence. */
+static void jitter_next(void)
+{
+    const uint32_t i = (s_jit_frame++ % 16u) + 1u;
+    s_jit_px[0] = (halton(i, 2) - 0.5f) * jitter_scale();
+    s_jit_px[1] = (halton(i, 3) - 0.5f) * jitter_scale();
+}
+
+static void jitter_for(const Target *t, const NvD3DState *st)
+{
+    s_jit[0] = s_jit[1] = 0.0f;
+    if (jitter_scale() <= 0.0f || st->layer == 1 || t->base != s_main_base || !t->w || !t->h)
+        return;
+    s_jit[0] =  2.0f * s_jit_px[0] / (float)(t->w * S);
+    s_jit[1] = -2.0f * s_jit_px[1] / (float)(t->h * S);
+}
+
+/* Bind the target or its layer, whichever this batch goes to. */
+static void bind_target_for(Target *t, int ui)
+{
+    ID3D11DepthStencilView *dsv;
+    if (ui == s_bound_ui)
+        return;
+    dsv = depth_for(t->w * S, t->h * S);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, ui ? &t->ui_rtv : &t->rtv, dsv);
+    s_bound_ui = ui;
+}
+
+/* RECOMP_UI_43=1: how much the layer is squeezed across, so that the
+ * interface keeps its 4:3 proportions in a picture presented wider (point
+ * 151). 1 when the picture is not widescreen or the option is off. */
+static float ui_squeeze(void)
+{
+    static int on = -1;
+    float ws;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_UI_43");
+        on = e && atoi(e) != 0;
+    }
+    ws = xbox_WidescreenAspect();
+    return (on && ws > 4.0f / 3.0f) ? (4.0f / 3.0f) / ws : 1.0f;
+}
+
+/* The layer onto its target, then emptied. Leaves the target bound. */
+static void ui_composite(Target *t)
+{
+    static const FLOAT clear[4] = { 0, 0, 0, 1 };
+    ID3D11ShaderResourceView *none = NULL;
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_VIEWPORT vp;
+    D3D11_RECT sc;
+
+    if (!t->ui_dirty || !s_ps_ui)
+        return;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_ui, 0,
+                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        float cb[4];
+        cb[0] = ui_squeeze();
+        cb[1] = (float)(t->w * S);
+        cb[2] = (float)(t->h * S);
+        cb[3] = 0.0f;
+        memcpy(m.pData, cb, sizeof cb);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_ui, 0);
+    }
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &t->rtv, NULL);
+    s_bound_ui = -1;                            /* bound without its depth */
+    vp.TopLeftX = 0; vp.TopLeftY = 0;
+    vp.Width = (FLOAT)(t->w * S); vp.Height = (FLOAT)(t->h * S);
+    vp.MinDepth = 0; vp.MaxDepth = 1;
+    sc.left = 0; sc.top = 0; sc.right = (LONG)(t->w * S); sc.bottom = (LONG)(t->h * S);
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_blend_ui_comp, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_off, 0);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_vs_present, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_ps_ui, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb_ui);
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_lin);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &t->ui_srv);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, t->ui_rtv, clear);
+    t->ui_dirty = 0;
+    s_ui_composites++;
+    if (s_cur >= 0 && &s_rt[s_cur] == t)
+        bind_target_for(t, 0);
+}
+
 /* Everything a batch needs besides its vertices: the pixel shader constants,
  * the texture and its sampler, viewport, scissor, blend and depth. Shared by
  * the CPU path's flush and by a translated program's draw, so the two can
  * never disagree on what a state means. */
-static void bind_state(const NvD3DState *st)
+static void bind_state(const NvD3DState *st_in)
 {
     D3D11_MAPPED_SUBRESOURCE m;
+    NvD3DState layered;
+    const NvD3DState *st = st_in;
+
+    /* A target this batch samples is read: its layer goes onto it first.
+     * Done before anything is bound, since compositing binds its own. */
+    {
+        int k;
+        if (st_in->texture >= 0x10000)
+            ui_composite(&s_rt[st_in->texture - 0x10000]);
+        for (k = 0; k < 3; k++)
+            if (st_in->stage_tex[k] >= 0x10000)
+                ui_composite(&s_rt[st_in->stage_tex[k] - 0x10000]);
+    }
+    /* The target or its interface layer. A blend the layer cannot hold
+     * exactly is drawn into the target, as before, and counted. */
+    {
+        Target *t = &s_rt[s_cur];
+        int ui = 0;
+        if (st_in->layer) {
+            /* Every blend the interface uses, said once: the layer is exact
+             * only for the ones ui_t_factor accepts. */
+            static uint32_t seen[64][5];
+            static int nseen;
+            int k;
+            for (k = 0; k < nseen; k++)
+                if (seen[k][0] == st_in->blend_enable && seen[k][1] == st_in->blend_src
+                        && seen[k][2] == st_in->blend_dst && seen[k][3] == st_in->blend_eq
+                        && seen[k][4] == st_in->color_mask)
+                    break;
+            if (k == nseen && nseen < 64) {
+                seen[nseen][0] = st_in->blend_enable; seen[nseen][1] = st_in->blend_src;
+                seen[nseen][2] = st_in->blend_dst; seen[nseen][3] = st_in->blend_eq;
+                seen[nseen][4] = st_in->color_mask;
+                nseen++;
+                fprintf(stderr, "  [D3D11] interface blend #%d: on %u src 0x%X dst 0x%X eq 0x%X"
+                                " mask %08X  alpha test %u  %s\n", nseen - 1,
+                        st_in->blend_enable, st_in->blend_src, st_in->blend_dst,
+                        st_in->blend_eq, st_in->color_mask, st_in->alpha_test,
+                        (ui_t_factor(st_in) != 0 || !st_in->blend_enable)
+                            ? "layered" : "LEFT IN THE SCENE");
+            }
+            if (st_in->layer == 1 && (ui_t_factor(st_in) != 0 || !st_in->blend_enable)) {
+                ui = ui_layer_ready(t);
+            } else {
+                /* A full-width fade (layer 2), or a blend the layer cannot
+                 * hold: what the interface drew so far goes onto the target
+                 * first, then this is drawn there -- the order the title
+                 * drew them in, so the result is exact again. */
+                if (st_in->layer == 1)
+                    s_ui_fallback++;
+                ui_composite(t);
+            }
+            if (!ui) {
+                layered = *st_in;
+                layered.layer = 0;
+                st = &layered;
+            } else {
+                s_ui_batches++;
+                t->ui_dirty = 1;
+            }
+        }
+        if (!st_in->layer && t->base == s_main_base)
+            s_scene_drawn = 1;                  /* 3D: its depth is worth keeping */
+        bind_target_for(t, ui);
+    }
     {
         float cb[12];
         int textured = st->texture >= 0;
@@ -1215,7 +1691,9 @@ static void bind_state(const NvD3DState *st)
             s_filter_on = !(e && atoi(e) == 0);
         }
         cb[9] = (s_filter_on && st->texture < 0x10000) ? 1.0f : 0.0f;
-        cb[10] = cb[11] = 0.0f;
+        jitter_for(&s_rt[s_cur], st);
+        cb[10] = s_jit[0];
+        cb[11] = s_jit[1];
         if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb, 0,
                                               D3D11_MAP_WRITE_DISCARD, 0, &m))) {
             memcpy(m.pData, cb, sizeof cb);
@@ -1278,6 +1756,7 @@ static void flush(void)
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride, &offset);
     ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb);   /* the jitter */
     ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
     ID3D11DeviceContext_Draw(s_ctx, s_nverts, 0);
@@ -1518,7 +1997,8 @@ static int vp_setup(const NvD3DProgramDraw *d, UINT *first_index)
         xf[0] = d->ax; xf[1] = d->ay; xf[2] = d->uv_scale[0]; xf[3] = d->uv_scale[1];
         xf[4] = d->textured ? 1.0f : 0.0f;
         xf[5] = d->points ? 1.0f : 0.0f;     /* xf1.y: indices carry a sprite corner */
-        xf[6] = xf[7] = 0.0f;
+        xf[6] = s_jit[0];                     /* xf1.zw: the jitter, set by bind_state */
+        xf[7] = s_jit[1];
         memcpy(cba + 512, xf, sizeof xf);
         if (!vp_upload(s_vp_cba, cba, sizeof cba))
             return 0;
@@ -1540,6 +2020,90 @@ static void vp_unbind(void)
 {
     ID3D11ShaderResourceView *none = NULL;
     ID3D11DeviceContext_VSSetShaderResources(s_ctx, 1, 1, &none);
+}
+
+/* ── DLSS step 3: the motion pass ───────────────────────────────────────
+ *
+ * The batch just drawn, once more, into the motion vector target: same
+ * indices, same jitter, its motion variant as vertex shader (the program run
+ * on the previous frame's constants, then on these), ps_mv, the target's own
+ * depth tested LESS_EQUAL without writing -- so only what the colour pass left
+ * in front gets a vector. Cleared to 0 (no motion) with the target's colour. */
+static int mv_ready(Target *t)
+{
+    D3D11_TEXTURE2D_DESC td;
+    static const FLOAT zero[4] = { 0, 0, 0, 0 };
+    if (t->mv_rtv)
+        return 1;
+    memset(&td, 0, sizeof td);
+    td.Width = t->w * S; td.Height = t->h * S; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R16G16_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &t->mv_tex)))
+        return 0;
+    ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)t->mv_tex, NULL, &t->mv_rtv);
+    ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t->mv_tex, NULL, &t->mv_srv);
+    if (!t->mv_rtv || !t->mv_srv)
+        return 0;
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, t->mv_rtv, zero);
+    if (motion_probe()) {
+        static const FLOAT none[4] = { 65535.0f, 0, 0, 0 };   /* converted: id 65535, none */
+        td.Format = DXGI_FORMAT_R32_UINT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &t->id_tex)))
+            ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)t->id_tex, NULL,
+                                                &t->id_rtv);
+        if (t->id_rtv)
+            ID3D11DeviceContext_ClearRenderTargetView(s_ctx, t->id_rtv, none);
+    }
+    fprintf(stderr, "  [D3D11] motion vectors for 0x%08X (%ux%u)\n", t->base, td.Width, td.Height);
+    return 1;
+}
+
+static void motion_pass(Target *t, const NvD3DProgramDraw *d, UINT first)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    ID3D11DepthStencilView *dsv;
+
+    if (!s_ps_mv || d->vs_motion < 0 || d->vs_motion >= s_nvsp || !s_vsp[d->vs_motion].vs
+            || !d->prev_consts || !mv_ready(t))
+        return;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_prev, 0,
+                                       D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return;
+    memcpy(m.pData, d->prev_consts, 192 * 16);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_prev, 0);
+    dsv = depth_for(t->w * S, t->h * S);
+    if (t->id_rtv && s_mvtab_n < MVTAB_MAX) {
+        ID3D11RenderTargetView *two[2];
+        uint32_t id[4] = { 0, 0, 0, 0 };
+        id[0] = s_mvtab_n;
+        s_mvtab[s_mvtab_n].hash = d->prog_hash;
+        s_mvtab[s_mvtab_n].addr = d->pos_addr;
+        s_mvtab[s_mvtab_n].n = d->pos_n;
+        s_mvtab[s_mvtab_n].nindex = d->nindex;
+        s_mvtab_n++;
+        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_mvid, 0,
+                                              D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            memcpy(m.pData, id, sizeof id);
+            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_mvid, 0);
+        }
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 5, 1, &s_cb_mvid);
+        two[0] = t->mv_rtv; two[1] = t->id_rtv;
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 2, two, dsv);
+    } else {
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &t->mv_rtv, dsv);
+    }
+    s_bound_ui = -1;                            /* the next batch binds again */
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_blend_off, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_mv, 0);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_vsp[d->vs_motion].vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 4, 1, &s_cb_prev);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_ps_mv, NULL, 0);
+    ID3D11DeviceContext_DrawIndexed(s_ctx, d->nindex, first, 0);
+    s_mv_batches++;
 }
 
 void nvd3d_draw_program(const NvD3DProgramDraw *d, const NvD3DState *st)
@@ -1564,6 +2128,8 @@ void nvd3d_draw_program(const NvD3DProgramDraw *d, const NvD3DState *st)
     ID3D11DeviceContext_DrawIndexed(s_ctx, d->nindex, first, 0);
     if (d->lines)
         ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    if (d->motion && !st->layer)
+        motion_pass(&s_rt[s_cur], d, first);
     vp_unbind();
     framelog("prog %5u i  vs %d  tex %d %ux%u  z%u%u f%X  bl%u %X/%X  cm%08X  at%u f%X r%u",
              d->nindex, d->vs, st->texture, st->tex_w, st->tex_h,
@@ -1653,6 +2219,10 @@ void nvd3d_clear(uint32_t what, uint32_t argb, float depth, uint8_t stencil,
     t = &s_rt[s_cur];
     framelog("clear what %u argb %08X depth %.4f stencil %u rect %u,%u %ux%u",
              what, argb, depth, stencil, rect[0], rect[1], rect[2], rect[3]);
+    if ((what & 1) && s_scene_drawn && t->base == s_main_base) {
+        scene_depth_capture(t);                 /* the 3D's depth, before it goes */
+        s_sdepth_at_clear++;
+    }
     if (what & 3) {
         ID3D11DepthStencilView *dsv = depth_for(t->w * S, t->h * S);
         UINT f = ((what & 1) ? D3D11_CLEAR_DEPTH : 0) | ((what & 2) ? D3D11_CLEAR_STENCIL : 0);
@@ -1661,6 +2231,18 @@ void nvd3d_clear(uint32_t what, uint32_t argb, float depth, uint8_t stencil,
     }
     if (what & 4) {
         FLOAT c[4];
+        /* What the clear covers loses its interface too: composited, then
+         * cleared, is the same as cleared. */
+        ui_composite(&s_rt[s_cur]);
+        if (t->mv_rtv) {                        /* and its motion: none yet */
+            static const FLOAT zero[4] = { 0, 0, 0, 0 };
+            ID3D11DeviceContext_ClearRenderTargetView(s_ctx, t->mv_rtv, zero);
+        }
+        if (t->id_rtv) {
+            static const FLOAT none[4] = { 65535.0f, 0, 0, 0 };
+            ID3D11DeviceContext_ClearRenderTargetView(s_ctx, t->id_rtv, none);
+            s_mvtab_n = 0;
+        }
         c[0] = (FLOAT)((argb >> 16) & 0xFF) / 255.0f;
         c[1] = (FLOAT)((argb >>  8) & 0xFF) / 255.0f;
         c[2] = (FLOAT)( argb        & 0xFF) / 255.0f;
@@ -1731,6 +2313,7 @@ static int swap_ready(void)
         ID3D11Texture2D_Release(bb);
         s_back_w = w; s_back_h = h;
         s_cur = -1;   /* targets were unbound */
+        s_bound_ui = -1;
     }
     return 1;
 }
@@ -1784,6 +2367,165 @@ static void framelog_check(const Target *t)
     s_framelog_n = 0;
 }
 
+static int cmp_u32(const void *a, const void *b)
+{
+    const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* RECOMP_DEPTH_VIEW: the distribution of a depth texture's 24-bit values. */
+static void depth_stats(ID3D11Texture2D *tex, uint32_t w, uint32_t h)
+{
+    static ID3D11Texture2D *stage;
+    static uint32_t sw, sh;
+    D3D11_MAPPED_SUBRESOURCE m;
+    uint32_t v[64 * 48], n = 0, x, y, cleared = 0;
+    struct { uint32_t w, h; ID3D11Texture2D *tex; } dd, *d = &dd;
+
+    dd.w = w; dd.h = h; dd.tex = tex;
+    if (!stage || sw != d->w || sh != d->h) {
+        D3D11_TEXTURE2D_DESC td;
+        if (stage) ID3D11Texture2D_Release(stage);
+        stage = NULL;
+        ID3D11Texture2D_GetDesc(d->tex, &td);
+        td.Usage = D3D11_USAGE_STAGING;
+        td.BindFlags = 0;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &stage)))
+            return;
+        sw = d->w; sh = d->h;
+    }
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)stage, (ID3D11Resource *)d->tex);
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)stage, 0, D3D11_MAP_READ, 0, &m)))
+        return;
+    for (y = 0; y < 48; y++)
+        for (x = 0; x < 64; x++) {
+            const uint32_t *row = (const uint32_t *)((const uint8_t *)m.pData
+                                  + (size_t)((y * 2 + 1) * d->h / 96) * m.RowPitch);
+            uint32_t z = row[(x * 2 + 1) * d->w / 128] & 0xFFFFFFu;
+            if (z == 0xFFFFFFu) cleared++;
+            v[n++] = z;
+        }
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)stage, 0);
+    qsort(v, n, sizeof v[0], cmp_u32);
+    fprintf(stderr, "  [DEPTH] %ux%u: min %06X  p10 %06X  p50 %06X  p90 %06X  max %06X"
+                    "  cleared (FFFFFF) %u of %u\n", d->w, d->h, v[0], v[n / 10], v[n / 2],
+            v[n * 9 / 10], v[n - 1], cleared, n);
+}
+
+static float half_to_float(uint16_t h)
+{
+    const uint32_t s = (uint32_t)(h >> 15) << 31, e = (h >> 10) & 0x1F, m = h & 0x3FF;
+    uint32_t f;
+    float out;
+    if (e == 0)
+        return (s ? -1.0f : 1.0f) * (float)m / 16777216.0f;     /* subnormal */
+    f = s | ((e + 112u) << 23) | (m << 13);
+    if (e == 31)
+        f = s | 0x7F800000u | (m << 13);
+    memcpy(&out, &f, 4);
+    return out;
+}
+
+/* RECOMP_MOTION: what the motion vectors hold, on a 64 x 48 grid, in pixels
+ * of the target: how many move, and how far. */
+static void mv_stats(const Target *t)
+{
+    static ID3D11Texture2D *stage;
+    static uint32_t sw, sh;
+    D3D11_MAPPED_SUBRESOURCE m;
+    float v[64 * 48];
+    uint32_t n = 0, x, y, moving = 0, wild = 0;
+    uint32_t wx[8], wy[8];
+    float wmx[8], wmy[8];
+    const uint32_t w = t->w * S, h = t->h * S;
+
+    if (!stage || sw != w || sh != h) {
+        D3D11_TEXTURE2D_DESC td;
+        if (stage) ID3D11Texture2D_Release(stage);
+        stage = NULL;
+        ID3D11Texture2D_GetDesc(t->mv_tex, &td);
+        td.Usage = D3D11_USAGE_STAGING;
+        td.BindFlags = 0;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &stage)))
+            return;
+        sw = w; sh = h;
+    }
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)stage, (ID3D11Resource *)t->mv_tex);
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)stage, 0, D3D11_MAP_READ, 0, &m)))
+        return;
+    for (y = 0; y < 48; y++)
+        for (x = 0; x < 64; x++) {
+            const uint16_t *row = (const uint16_t *)((const uint8_t *)m.pData
+                                  + (size_t)((y * 2 + 1) * h / 96) * m.RowPitch);
+            const uint32_t at = (x * 2 + 1) * w / 128;
+            const float mx = half_to_float(row[at * 2]) * (float)w;
+            const float my = half_to_float(row[at * 2 + 1]) * (float)h;
+            const float len = sqrtf(mx * mx + my * my);
+            if (len > 0.01f) moving++;
+            if (len > 500.0f && wild < 8) {
+                wx[wild] = at; wy[wild] = (y * 2 + 1) * h / 96;
+                wmx[wild] = mx; wmy[wild] = my;
+            }
+            if (len > 500.0f) wild++;
+            v[n++] = len;
+        }
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)stage, 0);
+    /* RECOMP_MOTION_PROBE: which batch drew each wild point. */
+    if (wild && t->id_tex) {
+        static ID3D11Texture2D *istage;
+        static uint32_t iw, ih;
+        if (!istage || iw != w || ih != h) {
+            D3D11_TEXTURE2D_DESC td;
+            if (istage) ID3D11Texture2D_Release(istage);
+            istage = NULL;
+            ID3D11Texture2D_GetDesc(t->id_tex, &td);
+            td.Usage = D3D11_USAGE_STAGING;
+            td.BindFlags = 0;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &istage)))
+                istage = NULL;
+            iw = w; ih = h;
+        }
+        if (istage) {
+            ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)istage,
+                                             (ID3D11Resource *)t->id_tex);
+            if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)istage, 0,
+                                                  D3D11_MAP_READ, 0, &m))) {
+                uint32_t k;
+                for (k = 0; k < wild && k < 8; k++) {
+                    const uint32_t id = ((const uint32_t *)((const uint8_t *)m.pData
+                                         + (size_t)wy[k] * m.RowPitch))[wx[k]];
+                    if (id < s_mvtab_n)
+                        fprintf(stderr, "  [MOTION] wild at %u,%u (%.0f,%.0f px): batch %u of %u,"
+                                        " prog %016llX addr 0x%08X n %u (%u indices)\n",
+                                wx[k], wy[k], wmx[k], wmy[k], id, s_mvtab_n,
+                                (unsigned long long)s_mvtab[id].hash, s_mvtab[id].addr,
+                                s_mvtab[id].n, s_mvtab[id].nindex);
+                    else
+                        fprintf(stderr, "  [MOTION] wild at %u,%u (%.0f,%.0f px): id %u"
+                                        " (no batch of this frame)\n",
+                                wx[k], wy[k], wmx[k], wmy[k], id);
+                }
+                ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)istage, 0);
+            }
+        }
+    }
+    {
+        int i, j;                                       /* small: insertion sort */
+        for (i = 1; i < (int)n; i++) {
+            float k = v[i];
+            for (j = i - 1; j >= 0 && v[j] > k; j--)
+                v[j + 1] = v[j];
+            v[j + 1] = k;
+        }
+    }
+    fprintf(stderr, "  [MOTION] %ux%u: %u of %u points move, %u by more than 500 px; length in"
+                    " pixels p50 %.2f  p90 %.2f  max %.2f; motion batches %u\n", w, h, moving,
+            n, wild, v[n / 2], v[n * 9 / 10], v[n - 1], s_mv_batches);
+}
+
 void nvd3d_present(uint32_t base, const uint32_t rect[4],
                    uint32_t disp_w, uint32_t disp_h)
 {
@@ -1805,6 +2547,25 @@ void nvd3d_present(uint32_t base, const uint32_t rect[4],
     }
     if (src < 0 || !swap_ready())
         return;
+    ui_composite(&s_rt[src]);
+    if (s_scene_drawn && s_rt[src].base == s_main_base) {
+        scene_depth_capture(&s_rt[src]);        /* no depth clear after the 3D */
+        s_sdepth_at_present++;
+    }
+    s_sdepth_hist[s_sdepth_this_frame < 3 ? s_sdepth_this_frame : 3]++;
+    s_sdepth_this_frame = 0;
+    s_main_base = base;                 /* the surface the jitter applies to */
+    if (jitter_scale() > 0.0f)
+        jitter_next();
+    {
+        static uint32_t said_at;
+        if (s_ui_batches && s_ui_composites >= said_at) {
+            said_at = s_ui_composites + 7200;
+            fprintf(stderr, "  [D3D11] interface layer: %u batches, %u composites, %u left in the"
+                            " scene (a blend that reads the destination)\n",
+                    s_ui_batches, s_ui_composites, s_ui_fallback);
+        }
+    }
     {
         const Target *t = &s_rt[src];
         D3D11_MAPPED_SUBRESOURCE m;
@@ -1817,6 +2578,7 @@ void nvd3d_present(uint32_t base, const uint32_t rect[4],
         cb[3] = (float)rect[3] / (float)t->h;
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back_rtv, NULL);
+        s_bound_ui = -1;
         /* The title's picture keeps its aspect (disp_w:disp_h, 4:3 here);
          * whatever the window adds becomes black bars. Under
          * RECOMP_WIDESCREEN the picture is anamorphic instead -- the
@@ -1865,9 +2627,65 @@ void nvd3d_present(uint32_t base, const uint32_t rect[4],
         ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
         ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ID3D11DeviceContext_VSSetShader(s_ctx, s_vs_present, NULL, 0);
-        ID3D11DeviceContext_PSSetShader(s_ctx, s_ps_present, NULL, 0);
-        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb_present);
-        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &t->srv);
+        {
+            /* RECOMP_DEPTH_VIEW=1: F7 shows the target's depth instead. */
+            static int allow = -1, show;
+            ID3D11ShaderResourceView *dsrv = NULL;
+            int k;
+            if (allow < 0) {
+                const char *e = getenv("RECOMP_DEPTH_VIEW");
+                allow = e != NULL;
+                show = e && atoi(e) == 2;               /* 2: from the start */
+            }
+            if (allow && (GetAsyncKeyState(VK_F7) & 1)) {
+                show = !show;
+                fprintf(stderr, "  [D3D11] F7: %s\n", show ? "depth" : "picture");
+            }
+            (void)k;
+            if (show && s_sdepth_w == t->w * S && s_sdepth_h == t->h * S)
+                dsrv = s_sdepth_srv;
+            /* What the scene's depth holds, measured rather than guessed:
+             * every 300 frames, a 64 x 48 grid of it read back, sorted. */
+            if (allow) {
+                static uint32_t frames;
+                if (++frames % 300 == 0 && s_sdepth) {
+                    depth_stats(s_sdepth, s_sdepth_w, s_sdepth_h);
+                    fprintf(stderr, "  [DEPTH] copies: %u at a depth clear, %u at the present;"
+                                    " frames with 0/1/2/more: %u/%u/%u/%u\n",
+                            s_sdepth_at_clear, s_sdepth_at_present, s_sdepth_hist[0],
+                            s_sdepth_hist[1], s_sdepth_hist[2], s_sdepth_hist[3]);
+                }
+            }
+            {
+                /* RECOMP_MOTION=1: F6 shows the motion vectors instead, and
+                 * every 300 frames they are measured. */
+                static int mallow = -1, mshow;
+                static uint32_t mframes;
+                if (mallow < 0) {
+                    const char *e = getenv("RECOMP_MOTION");
+                    mallow = e && atoi(e) != 0;
+                }
+                if (mallow && (GetAsyncKeyState(VK_F6) & 1)) {
+                    mshow = !mshow;
+                    fprintf(stderr, "  [D3D11] F6: %s\n", mshow ? "motion vectors" : "picture");
+                }
+                if (mallow && t->mv_srv && ++mframes % 300 == 0)
+                    mv_stats(t);
+                if (mshow && t->mv_srv && s_ps_mvview) {
+                    ID3D11DeviceContext_PSSetShader(s_ctx, s_ps_mvview, NULL, 0);
+                    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb_present);
+                    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &t->mv_srv);
+                    dsrv = NULL;
+                    goto shaders_set;
+                }
+            }
+            ID3D11DeviceContext_PSSetShader(s_ctx, dsrv && s_ps_depth ? s_ps_depth : s_ps_present,
+                                            NULL, 0);
+            ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb_present);
+            ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1,
+                                                     dsrv && s_ps_depth ? &dsrv : &t->srv);
+        shaders_set:;
+        }
         ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_lin);
         ID3D11DeviceContext_Draw(s_ctx, 3, 0);
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
@@ -1897,6 +2715,7 @@ void nvd3d_readback(uint32_t base, uint8_t *dst, uint32_t pitch, uint32_t rows)
             src = i;
     if (src < 0)
         return;
+    ui_composite(&s_rt[src]);
     ID3D11Texture2D_GetDesc(s_rt[src].tex, &td);
     td.Usage = D3D11_USAGE_STAGING;
     td.BindFlags = 0;

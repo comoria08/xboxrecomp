@@ -52,6 +52,14 @@ typedef struct {
     uint32_t stage_addr[3];             /* addr_u | addr_v << 4, as addr_u/addr_v */
     uint32_t stage_linear[3];           /* 1: a linear image, coordinates in texels */
     uint32_t factor0[8], factor1[8];    /* combiner constants per stage, ARGB */
+    /* 1: the interface (DLSS step 1, point 149: an orthographic projection,
+     * w == 1 out of the vertex program, on the shown surface). Drawn into a
+     * layer of its own instead of the target, and composited onto it before
+     * anything reads the target -- so that an upscaler can later take the
+     * scene alone. See ui_layer in nv2a_d3d11.c. 2: orthographic too, but
+     * across the whole width (a fade, point 151): the layer is composited
+     * first and this is drawn into the target, never squeezed. */
+    uint32_t layer;
 } NvD3DState;
 
 /* Non-zero once RECOMP_D3D11 is set and the device came up. */
@@ -112,6 +120,14 @@ typedef struct {
     /* Lines (primitives 2-4, point 140): the index list is pairs, drawn as a
      * D3D11 line list, one sample wide as the NV2A draws them. */
     int             lines;
+    /* DLSS step 3 (RECOMP_MOTION): drawn a second time into the motion vector
+     * target, through vs_motion (the program run on prev_consts, then on
+     * consts), when motion is set. */
+    int             motion;
+    int             vs_motion;
+    const float   (*prev_consts)[4];
+    uint64_t        prog_hash;          /* what drew it, for RECOMP_MOTION_PROBE */
+    uint32_t        pos_addr, pos_n;
 } NvD3DProgramDraw;
 
 /* The vertex shader for one translated program, compiled once and cached by

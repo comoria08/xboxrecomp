@@ -2197,6 +2197,72 @@ static void d3d_clip_pos(const float clip[4], const float c59[3],
 
 static void comb_state(NvD3DState *st);   /* the combiners, with the vertex programs */
 
+/* RECOMP_UI_LAYER=1 (DLSS step 1): the interface goes into a layer of its
+ * own (NvD3DState.layer). A batch is interface when it is drawn into the shown
+ * surface and its first and last vertex come out of the vertex program with
+ * w == 1 exactly -- an orthographic projection. Point 149 measured that rule
+ * on 15 060 frames of a fight: no perspective batch ever came after the first
+ * orthographic one. Set per batch by ui_classify, from draw_primitive. */
+static int s_batch_ui;
+
+/* RECOMP_UI_LAYER_AB=<swaps>: the check without a player. Phases of that many
+ * swaps turn the layer off and on in turn, with a snapshot in the middle of
+ * each (<RECOMP_FB_SNAP>NNN_off.bmp, NNN_on.bmp). Within one run, so the two
+ * are the same screen: an "on" no further from its "off" neighbours than they
+ * are from each other is the layer adding nothing. Two separate runs drift
+ * apart (the attract mode moves on at its own pace) and cannot be compared. */
+static uint32_t s_ui_ab, s_ui_ab_phase, s_ui_ab_end, s_ui_ab_snap;
+/* F8, under RECOMP_UI_LAYER: the layer off and on again, for the player to
+ * check by eye at the same spot that nothing changes. */
+static int      s_ui_f8_off;
+
+static int ui_layer_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_UI_LAYER");
+        const char *ab = getenv("RECOMP_UI_LAYER_AB");
+        const char *q = getenv("RECOMP_UI_43");       /* needs the layer (point 151) */
+        on = (e && atoi(e) != 0) || (q && atoi(q) != 0);
+        if (ab && atoi(ab) > 0) {
+            s_ui_ab = (uint32_t)atoi(ab);
+            on = 1;
+        }
+    }
+    return on && !s_ui_f8_off && (!s_ui_ab || (s_ui_ab_phase & 1));
+}
+
+extern void xbox_FramebufferSnapAsk(const char *path);
+
+static void ui_ab_tick(void)
+{
+    static int env = -1;
+    if (env < 0) {
+        const char *e = getenv("RECOMP_UI_LAYER");
+        const char *q = getenv("RECOMP_UI_43");
+        env = (e && atoi(e) != 0) || (q && atoi(q) != 0);
+    }
+    if (env && (GetAsyncKeyState(VK_F8) & 1)) {
+        s_ui_f8_off = !s_ui_f8_off;
+        fprintf(stderr, "  [UI] F8 swap %u : interface layer %s\n", s_gpu.flips,
+                s_ui_f8_off ? "OFF" : "ON");
+    }
+    if (!s_ui_ab)
+        return;
+    if (s_gpu.flips == s_ui_ab_snap && s_ui_ab_phase) {
+        const char *pre = getenv("RECOMP_FB_SNAP");
+        char path[512];
+        snprintf(path, sizeof path, "%s%03u_%s.bmp", pre ? pre : "ab_", s_ui_ab_phase,
+                 (s_ui_ab_phase & 1) ? "on" : "off");
+        xbox_FramebufferSnapAsk(path);
+    }
+    if (s_gpu.flips < s_ui_ab_end)
+        return;
+    s_ui_ab_phase++;
+    s_ui_ab_end = s_gpu.flips + s_ui_ab;
+    s_ui_ab_snap = s_gpu.flips + s_ui_ab / 2;
+}
+
 /* Everything about a batch that is not its vertices. Constant across a
  * batch, so the GPU vertex path computes it once for the whole draw. program:
  * drawn through a translated vertex program, the only path that carries what
@@ -2206,6 +2272,7 @@ static void d3d_batch_state(NvD3DState *st, int has_z, int textured, int program
     memset(st, 0, sizeof *st);
     st->ps = -1;
     st->stage_tex[0] = st->stage_tex[1] = st->stage_tex[2] = -1;
+    st->layer = (uint32_t)s_batch_ui;
     if (s_depth_on) {
         if (has_z) {
             st->depth_enable = s_gpu.depth_test != 0;
@@ -3764,6 +3831,21 @@ static const char s_vp_hlsl_head[] =
 "  return float4(1.0, nl, v.x > 0.0 ? p : 0.0, 1.0);\n"
 "}\n";
 
+/* DLSS step 3 (RECOMP_MOTION): the same program run twice in one shader,
+ * first on the constants of the previous frame (cp, b4), then on the current
+ * ones, so that the vertex knows where it was. cc() picks between the two.
+ * Only for the motion vector pass; the ordinary shader is untouched. */
+static const char s_vp_hlsl_motion_head[] =
+"cbuffer VpP : register(b4) { float4 cp[192]; };\n"
+"static bool g_prev = false;\n"
+"float4 cc(int i) { return g_prev ? cp[i] : c[i]; }\n"
+"float4 ccr(int i) { return (i >= 0 && i < 192) ? cc(clamp(i, 0, 191)) : Z4; }\n"
+"struct VSOutM { float4 pos : SV_Position; float2 uv : TEXCOORD0; float4 col : COLOR0;\n"
+"                float clip : SV_ClipDistance0; float4 col1 : COLOR1;\n"
+"                float4 uv1 : TEXCOORD1; float4 uv2 : TEXCOORD2; float4 uv3 : TEXCOORD3;\n"
+"                float4 pc : TEXCOORD4; float4 qc : TEXCOORD5; };\n";
+static int s_vh_motion;                 /* vh_src: read constants through cc() */
+
 typedef struct { char *p; size_t n, cap; int over; } VpHlsl;
 
 static void vh(VpHlsl *b, const char *fmt, ...)
@@ -3810,9 +3892,10 @@ static void vh_src(char *out, size_t cap, const VpInsn *d, uint32_t k)
     case 2: snprintf(base, sizeof base, "V%u", d->input); break;
     case 3:
         if (d->rel)
-            snprintf(base, sizeof base, "cr(%d + a0)", (int)d->cidx);
+            snprintf(base, sizeof base, s_vh_motion ? "ccr(%d + a0)" : "cr(%d + a0)",
+                     (int)d->cidx);
         else if (d->cidx < VP_CONSTANTS)
-            snprintf(base, sizeof base, "c[%u]", d->cidx);
+            snprintf(base, sizeof base, s_vh_motion ? "cc(%u)" : "c[%u]", d->cidx);
         else
             snprintf(base, sizeof base, "Z4");
         break;
@@ -3859,24 +3942,11 @@ static const char *vh_ilu(uint32_t ilu)
     }
 }
 
-/* The current program as HLSL. 0 if it does not fit. */
-static int vp_hlsl(VpHlsl *b)
+/* The program's instructions, in order. */
+static void vp_hlsl_body(VpHlsl *b)
 {
-    uint32_t pc, a, k;
+    uint32_t pc, k;
     char mask[5], dst[16];
-
-    vh(b, "%s", s_vp_hlsl_head);
-    vh(b, "VSOut vp_main(uint vid : SV_VertexID) {\n");
-    for (a = 0; a < 12; a++)
-        vh(b, "  float4 R%u = Z4;\n", a);
-    for (a = 0; a < 16; a++)
-        vh(b, "  float4 O%u = Z4;\n", a);
-    vh(b, "  O%u.w = 1.0;\n  int a0 = 0;\n", VP_OUT_D0);
-    /* A point sprite's indices carry the corner in their low two bits. */
-    vh(b, "  uint vi = xf1.y > 0.5 ? (vid >> 2) : vid;\n");
-    for (a = 0; a < NV_VERTEX_ATTRS; a++)
-        if ((s_vp_inputs >> a) & 1)
-            vh(b, "  float4 V%u = vfetch(%uu, vi);\n", a, a);
 
     for (pc = 0; pc < s_vp_code_len; pc++) {
         const VpInsn *d = &s_vp_code[pc];
@@ -3913,6 +3983,55 @@ static int vp_hlsl(VpHlsl *b)
         }
         vh(b, "  }\n");
     }
+}
+
+/* The registers, cleared as vp_run starts them. */
+static void vp_hlsl_regs(VpHlsl *b, int declare)
+{
+    uint32_t a;
+    for (a = 0; a < 12; a++)
+        vh(b, declare ? "  float4 R%u = Z4;\n" : "  R%u = Z4;\n", a);
+    for (a = 0; a < 16; a++)
+        vh(b, declare ? "  float4 O%u = Z4;\n" : "  O%u = Z4;\n", a);
+    vh(b, declare ? "  O%u.w = 1.0;\n  int a0 = 0;\n" : "  O%u.w = 1.0;\n  a0 = 0;\n", VP_OUT_D0);
+}
+
+/* The current program as HLSL. 0 if it does not fit. motion: the variant for
+ * the motion vector pass (DLSS step 3) -- the program first run on the
+ * previous frame's constants, its position kept, then as always. */
+static int vp_hlsl_any(VpHlsl *b, int motion)
+{
+    uint32_t a;
+
+    vh(b, "%s", s_vp_hlsl_head);
+    if (motion)
+        vh(b, "%s", s_vp_hlsl_motion_head);
+    vh(b, motion ? "VSOutM vp_main(uint vid : SV_VertexID) {\n"
+                 : "VSOut vp_main(uint vid : SV_VertexID) {\n");
+    vp_hlsl_regs(b, 1);
+    /* A point sprite's indices carry the corner in their low two bits. */
+    vh(b, "  uint vi = xf1.y > 0.5 ? (vid >> 2) : vid;\n");
+    for (a = 0; a < NV_VERTEX_ATTRS; a++)
+        if ((s_vp_inputs >> a) & 1)
+            vh(b, "  float4 V%u = vfetch(%uu, vi);\n", a, a);
+
+    if (motion) {
+        s_vh_motion = 1;
+        vh(b, "  g_prev = true;\n");
+        vp_hlsl_body(b);
+        /* Where it was, in clip space, as below but unjittered. */
+        vh(b, "  float pw = O%u.w;\n  float prc = rcc_(pw);\n", VP_OUT_POS);
+        vh(b, "  float3 PX = (O%u.xyz - c[59].xyz) / prc;\n", VP_OUT_POS);
+        /* z: the window depth it had, as o.pos.z below. Under 0 it was in
+         * front of the near plane -- clipped then, so no history (point 154). */
+        vh(b, "  float4 pc = float4(PX.x * xf0.x + (c[59].x * xf0.x - 1.0) * pw,\n"
+              "                     -PX.y * xf0.y + (1.0 - c[59].y * xf0.y) * pw,\n"
+              "                     (PX.z + c[59].z * pw) / 16777215.0, pw);\n");
+        vp_hlsl_regs(b, 0);
+        vh(b, "  g_prev = false;\n");
+    }
+    vp_hlsl_body(b);
+    s_vh_motion = 0;
 
     /* vp_transform's rcc and clip, then d3d_clip_pos. */
     vh(b, "  float w = O%u.w;\n", VP_OUT_POS);
@@ -3923,6 +4042,9 @@ static int vp_hlsl(VpHlsl *b)
     vh(b, "  o.pos.y = -X.y * xf0.y + (1.0 - c[59].y * xf0.y) * w;\n");
     vh(b, "  o.pos.z = (X.z + c[59].z * w) / 16777215.0;\n");
     vh(b, "  o.pos.w = w;\n");
+    /* DLSS step 2: the frame's sub-pixel jitter, in NDC (xf1.zw, 0 unless
+     * RECOMP_JITTER and only for the 3D of the shown surface). */
+    vh(b, "  o.pos.xy += xf1.zw * w;\n");
     vh(b, "  o.uv = xf1.x > 0.5 ? O%u.xy * xf0.zw : float2(0.0, 0.0);\n", VP_OUT_T0);
     vh(b, "  o.col = floor(saturate(O%u) * 255.0 + 0.5) / 255.0;\n", VP_OUT_D0);
     vh(b, "  o.col1 = floor(saturate(O%u) * 255.0 + 0.5) / 255.0;\n", VP_OUT_D1);
@@ -3939,8 +4061,23 @@ static int vp_hlsl(VpHlsl *b)
           "    o.pos.y -= cs.y * ps * xf0.y * o.pos.w;\n"
           "    o.uv3 = float4((corner & 1u) ? 1.0 : 0.0, (corner & 2u) ? 1.0 : 0.0, 0.0, 1.0);\n"
           "  }\n", VP_OUT_PTS);
-    vh(b, "  o.clip = o.pos.z;\n  return o;\n}\n");
+    vh(b, "  o.clip = o.pos.z;\n");
+    if (motion) {
+        vh(b, "  VSOutM m;\n"
+              "  m.pos = o.pos; m.uv = o.uv; m.col = o.col; m.clip = o.clip; m.col1 = o.col1;\n"
+              "  m.uv1 = o.uv1; m.uv2 = o.uv2; m.uv3 = o.uv3;\n"
+              "  m.pc = pc;\n"
+              "  m.qc = float4(o.pos.xy - xf1.zw * w, 0.0, w);   /* where it is, unjittered */\n"
+              "  return m;\n}\n");
+    } else {
+        vh(b, "  return o;\n}\n");
+    }
     return !b->over;
+}
+
+static int vp_hlsl(VpHlsl *b)
+{
+    return vp_hlsl_any(b, 0);
 }
 
 /* ── Register combiners on the GPU (point 140) ──────────────────────────
@@ -4384,6 +4521,69 @@ static int sep_w_probe(void)
          : s_sep_skip_class == 2 ? s_sep_w != 1 : 0;
 }
 
+/* RECOMP_UI_LAYER: is this batch the interface? See s_batch_ui. */
+static void ui_classify(void)
+{
+    VpVertex v;
+    uint32_t runs;
+
+    s_batch_ui = 0;
+    if (!ui_layer_on() || !nvd3d_active() || !vp_active() || !s_gpu.idx_count
+            || dma_resolve(s_gpu.color_offset) != s_d3d_show_base)
+        return;
+    runs = s_vp.runs;
+    vp_transform(s_gpu.idx[0], &v);
+    if (v.ok && v.w == 1.0f) {
+        vp_transform(s_gpu.idx[s_gpu.idx_count - 1], &v);
+        s_batch_ui = v.ok && v.w == 1.0f;
+    }
+    /* A few untextured vertices across the whole width: a fade over the
+     * picture (black, alpha 00 to FF, at the start and the end of a fight,
+     * point 151), not a piece of the interface. Layer 2: the backend
+     * composites what the interface drew so far, then draws this into the
+     * target itself -- so it is not squeezed by RECOMP_UI_43, and still
+     * darkens what came before it. A textured one stays interface: measured,
+     * those are the menu's bar, the videos, a banner wider than the screen. */
+    if (s_batch_ui && s_gpu.idx_count <= 16 && s_gpu.clip_w && !tex_stage0_enabled()) {
+        float lo = 1e30f, hi = -1e30f;
+        uint32_t i;
+        for (i = 0; i < s_gpu.idx_count; i++) {
+            vp_transform(s_gpu.idx[i], &v);
+            if (!v.ok)
+                break;
+            if (v.xy[0] < lo) lo = v.xy[0];
+            if (v.xy[0] > hi) hi = v.xy[0];
+        }
+        if (i == s_gpu.idx_count && lo <= (float)s_gpu.clip_x + 1.0f
+                && hi >= (float)(s_gpu.clip_x + s_gpu.clip_w) - 1.0f)
+            s_batch_ui = 2;
+        if (s_batch_ui == 2) {
+            /* Each kind once: what a full-width batch is, to tell a fade
+             * from a background. */
+            static struct { uint32_t n, tex, argb; } seen[32];
+            static uint32_t nseen;
+            uint32_t k;
+            for (k = 0; k < nseen; k++)
+                if (seen[k].n == s_gpu.idx_count && seen[k].tex == s_gpu.tex.offset
+                        && seen[k].argb == v.argb)
+                    break;
+            if (k == nseen && nseen < 32) {
+                seen[nseen].n = s_gpu.idx_count;
+                seen[nseen].tex = s_gpu.tex.offset;
+                seen[nseen].argb = v.argb;
+                nseen++;
+                fprintf(stderr, "  [UI] full width #%u swap %u: %u vertices x %.1f..%.1f  colour"
+                                " %08X  stage 0 %s tex 0x%08X %ux%u  blend %u %X/%X\n",
+                        nseen - 1, s_gpu.flips, s_gpu.idx_count, lo, hi, v.argb,
+                        tex_stage0_enabled() ? "on" : "off", s_gpu.tex.offset,
+                        s_gpu.tex.width, s_gpu.tex.height, s_gpu.blend_enable,
+                        s_gpu.blend_sfactor, s_gpu.blend_dfactor);
+            }
+        }
+    }
+    s_vp.runs = runs;                           /* not vertices drawn */
+}
+
 /* After the batch was drawn (or left out): its signature, and the frame list. */
 static int sep_batch(uint32_t route)
 {
@@ -4729,6 +4929,142 @@ static void vp_gpu_summary(void)
     fflush(stderr);
 }
 
+/* ── DLSS step 3: motion vectors (RECOMP_MOTION=1) ──────────────────────
+ *
+ * The title gives no motion vectors, so they are made: each batch of 3D on
+ * the shown surface is recognised from one frame to the next and its
+ * vertex-program constants of the previous frame are kept -- the camera, and
+ * the bone matrices if the program skins. The motion pass then runs the
+ * program on both. A batch is known by its program, the address of its
+ * positions, its index count, and its rank among the batches that share those
+ * three in the frame (a crowd draws the same mesh several times with other
+ * matrices). A batch seen for the first time has no motion: its own current
+ * constants stand in for the previous ones. */
+#define MOTION_SLOTS 2048
+typedef struct {
+    uint64_t prog;
+    uint32_t addr, n, frame;            /* frame: last drawn in; 0 empty */
+    float    c[VP_CONSTANTS][4];        /* its constants then */
+} MotionObj;
+static MotionObj *s_motion;
+static float      s_motion_prev[VP_CONSTANTS][4];
+static uint32_t   s_motion_found, s_motion_new, s_motion_full;
+/* For RECOMP_MOTION_PROBE: what the last motion_prev decided. */
+static uint32_t   s_mp_candidates, s_mp_matched;
+static float      s_mp_best;
+
+static int motion_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_MOTION");
+        on = e && atoi(e) != 0;
+        if (on) {
+            s_motion = (MotionObj *)calloc(MOTION_SLOTS, sizeof *s_motion);
+            if (!s_motion)
+                on = 0;
+        }
+    }
+    return on;
+}
+
+/* The previous constants of this batch (s_motion_prev), and the current ones
+ * kept for the next frame. */
+static const float (*motion_prev(uint64_t prog))[4]
+{
+    /* Not keyed by the address of the positions (point 154): the crowd's
+     * meshes are written each frame into slots handed out anew, so one address
+     * is another spectator a frame later. Among those of the same program and
+     * size, the nearest constants -- the place in the world -- decide. */
+    const uint32_t addr = 0, n = s_gpu.idx_count;
+    const uint32_t frame = s_gpu.flips + 1;     /* never 0 */
+    uint32_t h = (uint32_t)(prog ^ (prog >> 32)) * 2654435761u ^ n;
+    uint32_t k, free_at = 0xFFFFFFFFu;
+    MotionObj *o = NULL;
+
+    /* Among those of its kind drawn in the previous frame and not yet taken
+     * in this one, the one whose constants are nearest to these. Measured in
+     * a fight (point 154): matched by rank alone, a few points moved by
+     * thousands of pixels while the scene stood still -- the crowd draws one
+     * mesh many times, in an order that changes from frame to frame. */
+    s_mp_candidates = 0;
+    {
+        float best = 3.4e38f;
+        MotionObj *stale = NULL;
+        for (k = 0; k < MOTION_SLOTS; k++) {
+            MotionObj *e = &s_motion[(h + k) % MOTION_SLOTS];
+            if (!e->frame) {
+                if (free_at == 0xFFFFFFFFu)
+                    free_at = (h + k) % MOTION_SLOTS;
+                break;
+            }
+            if (e->prog == prog && e->addr == addr && e->n == n && e->frame != frame) {
+                if (e->frame + 1 == frame) {
+                    float dsum = 0.0f;
+                    uint32_t i;
+                    s_mp_candidates++;
+                    const float *a = &e->c[0][0], *b = &s_vp.c[0][0];
+                    for (i = 0; i < VP_CONSTANTS * 4 && dsum < best; i++)
+                        dsum += fabsf(a[i] - b[i]);
+                    if (dsum < best) {
+                        best = dsum;
+                        o = e;
+                    }
+                } else if (!stale) {
+                    stale = e;                  /* of its kind, but not seen lately */
+                }
+            }
+            if (free_at == 0xFFFFFFFFu && e->frame + 2 < frame)
+                free_at = (h + k) % MOTION_SLOTS;   /* gone for a while: reusable */
+        }
+        if (!o)
+            o = stale;
+        s_mp_best = best;
+    }
+    s_mp_matched = o && o->frame + 1 == frame;
+    if (o && o->frame + 1 == frame) {
+        memcpy(s_motion_prev, o->c, sizeof s_motion_prev);
+        s_motion_found++;
+    } else {
+        memcpy(s_motion_prev, s_vp.c, sizeof s_motion_prev);
+        s_motion_new++;
+        if (!o) {
+            if (free_at == 0xFFFFFFFFu) {
+                s_motion_full++;
+                return (const float (*)[4])s_motion_prev;
+            }
+            o = &s_motion[free_at];
+            o->prog = prog; o->addr = addr; o->n = n;
+        }
+    }
+    memcpy(o->c, s_vp.c, sizeof o->c);
+    o->frame = frame;
+    {
+        /* RECOMP_MOTION_SELFTEST=1: the previous constants scaled by 1.01, so
+         * that every batch "moves" -- the check, without a player, that the
+         * motion pass gives something other than zero. Diagnosis only. */
+        static int self = -1;
+        if (self < 0)
+            self = getenv("RECOMP_MOTION_SELFTEST") != NULL;
+        if (self) {
+            uint32_t i, j;
+            for (i = 0; i < VP_CONSTANTS; i++)
+                if (i != 59)                            /* the viewport stays */
+                    for (j = 0; j < 4; j++)
+                        s_motion_prev[i][j] *= 1.01f;
+        }
+    }
+    {
+        static uint32_t said_at;
+        if (s_gpu.flips >= said_at) {
+            said_at = s_gpu.flips + 1200;
+            fprintf(stderr, "  [MOTION] batches matched to the previous frame %u, new %u,"
+                            " table full %u\n", s_motion_found, s_motion_new, s_motion_full);
+        }
+    }
+    return (const float (*)[4])s_motion_prev;
+}
+
 /* Draw the current batch through its translated program. 1 if it was drawn
  * (or, under RECOMP_VP_GPU=2, never: the CPU path then draws it as always). */
 static int vp_gpu_batch(int textured_src)
@@ -4883,6 +5219,70 @@ static int vp_gpu_batch(int textured_src)
             return 0;                       /* nothing on the CPU path to check against */
         vp_gpu_check(&d, hash, t);
         return 0;
+    }
+    /* The motion pass: 3D of the shown surface that writes depth (what is
+     * seen through particles is what moves under them), points and lines
+     * aside. */
+    if (motion_on() && !s_batch_ui && !d.points && !d.lines && st.depth_write
+            && dma_resolve(s_gpu.color_offset) == s_d3d_show_base) {
+        const uint64_t mh = hash ^ 0x6D6F74696F6E5633ull;     /* "motionV3" */
+        int vm = nvd3d_vs_program(mh, NULL, 0);
+        if (vm == -2) {
+            static char mtext[192 * 1024];
+            VpHlsl b;
+            b.p = mtext; b.n = 0; b.cap = sizeof mtext; b.over = 0;
+            vm = vp_hlsl_any(&b, 1) ? nvd3d_vs_program(mh, mtext, b.n) : -1;
+        }
+        if (vm >= 0) {
+            d.motion = 1;
+            d.vs_motion = vm;
+            d.prev_consts = motion_prev(hash);
+            d.prog_hash = hash;
+            d.pos_addr = s_gpu.attr[0].offset;
+            d.pos_n = s_gpu.idx_count;
+            /* RECOMP_MOTION_PROBE=1: the first vertex run on the CPU with
+             * these constants and with the previous ones; a batch whose
+             * vertex jumps by more than 60 displayed pixels is described
+             * (point 154: about 1% of the points moved by thousands). */
+            {
+                static int probe = -1;
+                static uint32_t said;
+                if (probe < 0)
+                    probe = getenv("RECOMP_MOTION_PROBE") != NULL;
+                if (probe && said < 80) {
+                    static float save[VP_CONSTANTS][4];
+                    VpVertex cur, prv;
+                    const uint32_t runs = s_vp.runs;
+                    vp_transform(s_gpu.idx[0], &cur);
+                    memcpy(save, s_vp.c, sizeof save);
+                    memcpy(s_vp.c, d.prev_consts, sizeof save);
+                    vp_transform(s_gpu.idx[0], &prv);
+                    memcpy(s_vp.c, save, sizeof save);
+                    s_vp.runs = runs;
+                    if (cur.ok && prv.ok) {
+                        const float dx = prv.xy[0] - cur.xy[0], dy = prv.xy[1] - cur.xy[1];
+                        const float len = sqrtf(dx * dx + dy * dy);
+                        if (len > 60.0f) {
+                            uint32_t ci, ndiff = 0, first = 0xFFFFFFFFu;
+                            for (ci = 0; ci < VP_CONSTANTS; ci++)
+                                if (memcmp(save[ci], d.prev_consts[ci], 16)) {
+                                    if (first == 0xFFFFFFFFu) first = ci;
+                                    ndiff++;
+                                }
+                            said++;
+                            fprintf(stderr, "  [MOTION] jump swap %u prog %016llX n %u addr 0x%08X:"
+                                            " %.0f px (%.0f,%.0f -> %.0f,%.0f) w %.2f -> %.2f;"
+                                            " candidates %u matched %u distance %.1f;"
+                                            " constants differing %u from c%u\n",
+                                    s_gpu.flips, (unsigned long long)hash, s_gpu.idx_count,
+                                    s_gpu.attr[0].offset, len, prv.xy[0], prv.xy[1],
+                                    cur.xy[0], cur.xy[1], prv.w, cur.w, s_mp_candidates,
+                                    s_mp_matched, s_mp_best, ndiff, first);
+                        }
+                    }
+                }
+            }
+        }
     }
     nvd3d_draw_program(&d, &st);
     s_gpu.tris_drawn += t;
@@ -5350,6 +5750,7 @@ static void draw_primitive(void)
     sep_quad_probe();
     if (sep_w_probe())
         return;                                 /* RECOMP_SEP_CYCLE leaves it out */
+    ui_classify();
     s_gpu.draws++;
     if ((s_gpu.draws % 200) == 0)
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
@@ -5799,6 +6200,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 uint32_t route = s_gpu.imm_count ? 2 : s_gpu.inline_count ? 1
                                : s_gpu.idx_count ? 0 : 3;
                 s_sep_w = 2;                    /* set by draw_primitive, if it runs */
+                s_batch_ui = 0;                 /* likewise */
             if (s_gpu.imm_count)
                 draw_immediate();
             else if (s_gpu.inline_count)
@@ -5944,6 +6346,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
         sep_frame(s_d3d_show_base);
+        ui_layer_on();                          /* reads RECOMP_UI_LAYER_AB once */
+        ui_ab_tick();
         if (nvd3d_active() && s_d3d_show_base) {
             nvd3d_present(s_d3d_show_base, s_d3d_show_rect,
                           s_d3d_show_disp[0], s_d3d_show_disp[1]);
