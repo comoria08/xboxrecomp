@@ -125,6 +125,8 @@ typedef struct {
     int      mipped;                      /* carries a generated mip chain */
     int      rt;                          /* >= 0: really render target #rt */
     uint32_t seen;                        /* present count when last bound */
+    uint64_t pack_hash;                   /* the pack image shown whole, 0 none:
+                                           * what a face pasted in is pasted onto */
     ID3D11Texture2D          *tex;
     ID3D11ShaderResourceView *srv;
 } Tex;
@@ -1108,6 +1110,68 @@ static uint32_t *pack_lookup(uint64_t hash, uint32_t width, uint32_t height,
     return pix;
 }
 
+/* A fighter taking hits: the title copies its battered face (br01, then
+ * br02, from the same .xsh) over the top-right quarter of the atlas in place
+ * -- measured on Magic (point 158): the atlas changes fingerprint twice at
+ * the same address, the quarter equal to br01 then br02 pixel for pixel, the
+ * rest untouched. In the Xbox's swizzled order that quarter is the atlas's
+ * second quarter of bytes, laid out exactly as a texture of half the size,
+ * and the palette is the atlas's: so its fingerprint is br01's or br02's own.
+ * The pack holds the atlas and the faces under those; the battered atlas is
+ * built here, the face's pack image over the atlas's. Without the face's,
+ * the title's face is enlarged into the quarter, rather than the whole
+ * fighter going back to the original. d3d_hash of nv2a_pb_exec.c, the same. */
+static uint64_t face_hash(const uint8_t *p, size_t n, uint64_t h)
+{
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t v;
+        memcpy(&v, p + i, 8);
+        h = (h ^ v) * 0x100000001B3ull;
+        h ^= h >> 29;
+    }
+    for (; i < n; i++)
+        h = (h ^ p[i]) * 0x100000001B3ull;
+    return h;
+}
+
+static uint32_t *pack_battered(const uint32_t key[6], uint64_t hash, uint64_t base,
+                               uint32_t width, uint32_t height, uint32_t mem_bytes,
+                               const uint32_t *decoded, uint32_t *pw, uint32_t *ph)
+{
+    const uint8_t *mem = (const uint8_t *)(uintptr_t)xbox_GetMemoryOffset();
+    uint32_t *atlas, *face = NULL, aw, ah, fw = 0, fh = 0, q, x, y;
+    uint64_t fhash;
+
+    if (!base || key[1] != 0x0B || !key[4] || width != height || width < 64
+            || mem_bytes != width * height)
+        return NULL;
+    fhash = face_hash(mem + key[0] + mem_bytes / 4, mem_bytes / 4, 1469598103934665603ull);
+    fhash = face_hash(mem + key[4], 1024, fhash);
+    atlas = pack_lookup(base, width, height, &aw, &ah);
+    if (!atlas)
+        return NULL;
+    q = aw / 2;
+    face = pack_lookup(fhash, width / 2, height / 2, &fw, &fh);
+    /* Nearest, from whichever is there: a face at another enlargement than
+     * the atlas still lands on its quarter. */
+    for (y = 0; y < q; y++)
+        for (x = 0; x < q; x++)
+            atlas[(size_t)y * aw + q + x] = face
+                ? face[(size_t)(y * fh / q) * fw + x * fw / q]
+                : decoded[(size_t)(y * height / ah) * width + width / 2 + x * width / aw];
+    {
+        static int said;
+        if (said++ < 64)
+            fprintf(stderr, "  [TEXPACK] %016llX : atlas %016llX, face %016llX %s\n",
+                    (unsigned long long)hash, (unsigned long long)base,
+                    (unsigned long long)fhash, face ? "from the pack" : "of the title, enlarged");
+    }
+    free(face);
+    *pw = aw; *ph = ah;
+    return atlas;
+}
+
 int nvd3d_texture_seen(uint64_t hash, uint32_t within)
 {
     int i;
@@ -1125,6 +1189,7 @@ int nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t width, uint32_t
     Tex *t;
     uint32_t *pack = NULL, *src;
     uint32_t sw, sh;
+    uint64_t base = 0;                    /* the pack image this binding showed */
 
     if (!width || !height || width > 4096 || height > 4096)
         return -1;
@@ -1156,6 +1221,8 @@ int nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t width, uint32_t
         s_tex[slot].seen = s_present_count;
         return slot;
     }
+    if (slot >= 0)
+        base = s_tex[slot].pack_hash;
     /* RECOMP_TEX_NEWLOG=1: each fingerprint the first time it is uploaded,
      * with the present count, in the same log as the pad's [PAD] lines -- to
      * find which textures only one screen uses (the fighter select, for the
@@ -1204,6 +1271,11 @@ int nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t width, uint32_t
      * declared size is what the shader divides by, so only the ratio has to
      * match -- see the comment on pack_lookup. */
     pack = pack_lookup(hash, width, height, &sw, &sh);
+    if (pack)
+        base = hash;
+    else if ((pack = pack_battered(key, hash, base, width, height, mem_bytes,
+                                   s_decode_buf, &sw, &sh)) == NULL)
+        base = 0;
     if (pack) {
         src = pack;
     } else {
@@ -1259,6 +1331,7 @@ int nvd3d_texture(const uint32_t key[6], uint64_t hash, uint32_t width, uint32_t
     free(pack);
     memcpy(t->key, key, sizeof t->key);
     t->hash = hash;
+    t->pack_hash = base;
     t->seen = s_present_count;
     t->w = sw;
     t->h = sh;
