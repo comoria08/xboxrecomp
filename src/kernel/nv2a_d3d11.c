@@ -24,6 +24,7 @@
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
 #include <wincodec.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
