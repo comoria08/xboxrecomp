@@ -1,5 +1,10 @@
 # xboxrecomp
 
+> **This is a fork.** The original project is [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp), by sp00nz and its contributors.
+> The `defjam-bringup` branch adds the toolkit fixes needed by the [Def Jam: Fight for NY port](https://github.com/comoria08/defjam_recomp) (NV2A D3D11 renderer, MCPX DSP audio from xemu, lifter fixes, MinGW build, optional DLSS). The `main` branch follows upstream.
+>
+> **Ceci est un fork** de [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp). La branche `defjam-bringup` contient les correctifs du toolkit pour le [portage de Def Jam: Fight for NY](https://github.com/comoria08/defjam_recomp).
+
 ```
  #   #  ####    ###   #   #         #####   ###    ###   #       ###
  #   #  #   #  #   #  #   #           #    #   #  #   #  #      #
