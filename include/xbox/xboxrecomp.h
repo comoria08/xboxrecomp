@@ -46,9 +46,12 @@
 #include "kernel.h"             /* Xbox kernel types and functions */
 #include "xbox_memory_layout.h" /* Memory layout API */
 #include "d3d8_xbox.h"          /* D3D8 compatibility interface */
-#include "dsound_xbox.h"        /* DirectSound compatibility */
 #include "xinput_xbox.h"        /* XInput compatibility */
+#ifndef XBOXRECOMP_SANS_APU     /* XBOXRECOMP_APU=OFF : ni APU ni xbox_dsound */
+#include "dsound_xbox.h"        /* DirectSound compatibility */
 #include "apu.h"                /* MCPX APU public API */
+#endif
+#include "dsound_hle.h"         /* DirectSound en haut niveau, sans APU */
 
 /* NV2A headers */
 #include "nv2a_state.h"         /* NV2A GPU state */

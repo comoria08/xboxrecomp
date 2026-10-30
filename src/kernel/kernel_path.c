@@ -194,6 +194,7 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
 #include <shlobj.h>
 #include <winioctl.h>
 
+volatile unsigned long g_xbox_speech_character_tick[1024];
 static WCHAR s_game_dir[MAX_PATH];
 static WCHAR s_save_dir[MAX_PATH];
 static WCHAR s_mods_dir[MAX_PATH];      /* vide : pas de calque */
@@ -487,6 +488,19 @@ translate:
     fprintf(stderr, "  [PATH] %s  (appel %u)\n", xbox_path,
             g_xbox_current_ordinal);
     fflush(stderr);
+    /* L'heure de la derniere ouverture d'une banque de repliques Character
+     * (speech\Character\...\<voix>.DAT), par voix : un projet s'en sert pour
+     * savoir qu'une replique demandee est vraiment partie (Def Jam : le cri
+     * d'activation du Blazin). */
+    {
+        const char *c = strstr(xbox_path, "\\Character\\");
+        const char *d = c ? strrchr(xbox_path, '\\') : NULL;
+        if (d && _strnicmp(d + strcspn(d, "."), ".DAT", 4) == 0) {
+            int v = atoi(d + 1);
+            if (v >= 0 && v < 1024)
+                g_xbox_speech_character_tick[v] = GetTickCount();
+        }
+    }
     {
         WCHAR remainder_wide[MAX_PATH];
         MultiByteToWideChar(CP_ACP, 0, remainder, -1, remainder_wide, MAX_PATH);

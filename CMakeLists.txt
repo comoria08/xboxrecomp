@@ -43,11 +43,22 @@ add_subdirectory(src/kernel)
 # Graphics: D3D8 → D3D11 compatibility layer
 add_subdirectory(src/d3d)
 
-# Audio: DirectSound → software mixer compatibility
-add_subdirectory(src/audio)
+# L'emulation de l'APU (xemu ; son coeur DSP, src/apu/dsp, est sous GPL) et la
+# couche xbox_dsound qui s'appuie sur son mixeur. Un titre servi par
+# src/dsound_hle (DirectSound en haut niveau) n'en a pas besoin : il pose
+# XBOXRECOMP_APU a OFF avant add_subdirectory, et rien de GPL n'est lie.
+option(XBOXRECOMP_APU "Emulation de l'APU (xbox_apu, xbox_dsound)" ON)
 
-# Audio: MCPX APU hardware emulation (voice processor, DSP)
-add_subdirectory(src/apu)
+if(XBOXRECOMP_APU)
+    # Audio: DirectSound → software mixer compatibility
+    add_subdirectory(src/audio)
+
+    # Audio: MCPX APU hardware emulation (voice processor, DSP)
+    add_subdirectory(src/apu)
+endif()
+
+# DirectSound de l'XDK en haut niveau, sans APU
+add_subdirectory(src/dsound_hle)
 
 # GPU: NV2A hardware emulation (register handlers, MMIO, push buffer)
 add_subdirectory(src/nv2a)
@@ -69,11 +80,15 @@ add_library(xboxrecomp INTERFACE)
 target_link_libraries(xboxrecomp INTERFACE
     xbox_kernel
     xbox_d3d8
-    xbox_dsound
     xbox_input
     xbox_usb
-    xbox_apu
+    xbox_dsound_hle
     xbox_nv2a
     xbox_video
 )
+if(XBOXRECOMP_APU)
+    target_link_libraries(xboxrecomp INTERFACE xbox_dsound xbox_apu)
+else()
+    target_compile_definitions(xboxrecomp INTERFACE XBOXRECOMP_SANS_APU)
+endif()
 
